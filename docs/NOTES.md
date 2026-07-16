@@ -25,9 +25,9 @@ after every simulator event.
 
 Leader retry uses the paper's linear fallback: each rejected AppendEntries
 decrements that follower's `nextIndex` by one and retries the suffix. The
-conflict-index optimization was intentionally skipped because the frozen
-`AppendEntriesResp` contract carries only `term` and `success`, not a conflict
-term/index hint. The implementation keeps one logical request in flight per
-follower and deterministically resends that same request on a heartbeat until a
-response arrives. This keeps the Phase 2 implementation simple, at the cost of
-O(log length) retries for a severely divergent follower.
+conflict-index optimization was intentionally skipped because rejections carry
+no conflict term/index hint; `matchIndex` identifies only the range covered by
+a successful request. The implementation keeps one logical request in flight
+per follower and deterministically resends that same request on a heartbeat
+until a response arrives. This keeps the Phase 2 implementation simple, at the
+cost of O(log length) retries for a severely divergent follower.

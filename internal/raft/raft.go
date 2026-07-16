@@ -401,17 +401,22 @@ func (n *Node) handleAppendEntries(m *raftpb.Message, req *raftpb.AppendEntriesR
 		n.becomeFollowerSameTerm()
 	}
 	n.electionElapsed = 0
+	requestLastIndex, valid := appendRequestLastIndex(req)
+	if !valid {
+		n.sendAppendEntriesResponse(NodeID(m.From), false, 0)
+		return
+	}
 	if !n.log.matches(req.PrevLogIndex, req.PrevLogTerm) {
-		n.sendAppendEntriesResponse(NodeID(m.From), false)
+		n.sendAppendEntriesResponse(NodeID(m.From), false, 0)
 		return
 	}
 	if changed := n.log.appendFromLeader(req.Entries); changed != 0 && changed < n.unstableIndex {
 		n.unstableIndex = changed
 	}
 	if req.LeaderCommit > n.commitIndex {
-		n.commitIndex = min(req.LeaderCommit, n.log.lastIndex())
+		n.commitIndex = min(req.LeaderCommit, requestLastIndex)
 	}
-	n.sendAppendEntriesResponse(NodeID(m.From), true)
+	n.sendAppendEntriesResponse(NodeID(m.From), true, requestLastIndex)
 }
 
 func (n *Node) handleAppendEntriesResponse(m *raftpb.Message, resp *raftpb.AppendEntriesResp) {
@@ -423,23 +428,38 @@ func (n *Node) handleAppendEntriesResponse(m *raftpb.Message, resp *raftpb.Appen
 	if pending == nil {
 		return
 	}
-	n.inflight[peer] = nil
-	if !resp.Success {
-		if n.nextIndex[peer] > n.log.firstIndex() {
-			n.nextIndex[peer]--
+	if resp.Success {
+		acknowledged := resp.MatchIndex
+		// Success identifies the exact request by its covered index. A lower
+		// acknowledgement belongs to an older request, while a higher one is
+		// impossible for the request currently outstanding. Neither may disturb
+		// that request or manufacture progress.
+		if acknowledged != pending.lastIndex || acknowledged < n.matchIndex[peer] ||
+			acknowledged > n.log.lastIndex() || acknowledged == ^uint64(0) {
+			return
 		}
-		n.sendAppend(peer, false)
+
+		n.inflight[peer] = nil
+		if acknowledged > n.matchIndex[peer] {
+			n.matchIndex[peer] = acknowledged
+		}
+		n.nextIndex[peer] = n.matchIndex[peer] + 1
+		commitAdvanced := n.advanceCommit()
+		if n.nextIndex[peer] <= n.log.lastIndex() || commitAdvanced {
+			n.sendAppend(peer, false)
+		}
 		return
 	}
 
-	if pending.lastIndex > n.matchIndex[peer] {
-		n.matchIndex[peer] = pending.lastIndex
+	n.inflight[peer] = nil
+	retryFloor := n.log.firstIndex()
+	if matched := n.matchIndex[peer]; matched != ^uint64(0) && matched+1 > retryFloor {
+		retryFloor = matched + 1
 	}
-	n.nextIndex[peer] = n.matchIndex[peer] + 1
-	commitAdvanced := n.advanceCommit()
-	if n.nextIndex[peer] <= n.log.lastIndex() || commitAdvanced {
-		n.sendAppend(peer, false)
+	if n.nextIndex[peer] > retryFloor {
+		n.nextIndex[peer]--
 	}
+	n.sendAppend(peer, false)
 }
 
 func (n *Node) rejectLowerTermRequest(m *raftpb.Message) {
@@ -447,7 +467,7 @@ func (n *Node) rejectLowerTermRequest(m *raftpb.Message) {
 	case m.GetRequestVote() != nil:
 		n.sendRequestVoteResponse(NodeID(m.From), false)
 	case m.GetAppendEntries() != nil:
-		n.sendAppendEntriesResponse(NodeID(m.From), false)
+		n.sendAppendEntriesResponse(NodeID(m.From), false, 0)
 	}
 }
 
@@ -463,16 +483,30 @@ func (n *Node) sendRequestVoteResponse(to NodeID, granted bool) {
 	})
 }
 
-func (n *Node) sendAppendEntriesResponse(to NodeID, success bool) {
+func (n *Node) sendAppendEntriesResponse(to NodeID, success bool, matchIndex uint64) {
 	n.messages = append(n.messages, &raftpb.Message{
 		From: uint64(n.config.ID),
 		To:   uint64(to),
 		Term: n.hardState.Term,
 		Body: &raftpb.Message_AppendEntriesResp{AppendEntriesResp: &raftpb.AppendEntriesResp{
-			Term:    n.hardState.Term,
-			Success: success,
+			Term:       n.hardState.Term,
+			Success:    success,
+			MatchIndex: matchIndex,
 		}},
 	})
+}
+
+func appendRequestLastIndex(req *raftpb.AppendEntriesReq) (uint64, bool) {
+	if req == nil || uint64(len(req.Entries)) > ^uint64(0)-req.PrevLogIndex {
+		return 0, false
+	}
+	lastIndex := req.PrevLogIndex + uint64(len(req.Entries))
+	for i, entry := range req.Entries {
+		if entry == nil || entry.Index != req.PrevLogIndex+uint64(i)+1 {
+			return 0, false
+		}
+	}
+	return lastIndex, true
 }
 
 func (n *Node) sendHeartbeats() {
@@ -502,8 +536,7 @@ func (n *Node) broadcastAppend(probe bool) {
 
 // broadcastAvailableAppend starts one logical AppendEntries request per idle
 // follower. A follower that already has an in-flight request will receive the
-// newly appended suffix as soon as that request resolves; emitting another
-// copy here would make its uncorrelated success response ambiguous.
+// newly appended suffix as soon as that request resolves.
 func (n *Node) broadcastAvailableAppend() {
 	for _, peer := range n.peers {
 		if peer == n.config.ID || n.inflight[peer] != nil {

@@ -448,6 +448,7 @@ type AppendEntriesResp struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
 	Success       bool                   `protobuf:"varint,2,opt,name=success,proto3" json:"success,omitempty"`
+	MatchIndex    uint64                 `protobuf:"varint,3,opt,name=matchIndex,proto3" json:"matchIndex,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -494,6 +495,13 @@ func (x *AppendEntriesResp) GetSuccess() bool {
 		return x.Success
 	}
 	return false
+}
+
+func (x *AppendEntriesResp) GetMatchIndex() uint64 {
+	if x != nil {
+		return x.MatchIndex
+	}
+	return 0
 }
 
 type InstallSnapshotChunk struct {
@@ -767,10 +775,13 @@ const file_proto_raft_proto_rawDesc = "" +
 	"\fprevLogIndex\x18\x03 \x01(\x04R\fprevLogIndex\x12 \n" +
 	"\vprevLogTerm\x18\x04 \x01(\x04R\vprevLogTerm\x12+\n" +
 	"\aentries\x18\x05 \x03(\v2\x11.miniquorum.EntryR\aentries\x12\"\n" +
-	"\fleaderCommit\x18\x06 \x01(\x04R\fleaderCommit\"A\n" +
+	"\fleaderCommit\x18\x06 \x01(\x04R\fleaderCommit\"a\n" +
 	"\x11AppendEntriesResp\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess\"\xe0\x01\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\x12\x1e\n" +
+	"\n" +
+	"matchIndex\x18\x03 \x01(\x04R\n" +
+	"matchIndex\"\xe0\x01\n" +
 	"\x14InstallSnapshotChunk\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x1a\n" +
 	"\bleaderId\x18\x02 \x01(\x04R\bleaderId\x12,\n" +

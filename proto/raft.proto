@@ -42,6 +42,7 @@ message AppendEntriesReq {
 message AppendEntriesResp {
   uint64 term = 1;
   bool success = 2;
+  uint64 matchIndex = 3;
 }
 
 message InstallSnapshotChunk {

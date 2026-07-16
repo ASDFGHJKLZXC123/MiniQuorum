@@ -99,6 +99,32 @@ func TestFollowerAppendConsistencyAndConflictReplacement(t *testing.T) {
 	})
 }
 
+func TestFollowerSuccessReportsAndCommitsOnlyRequestCoverage(t *testing.T) {
+	node := replicationFollower([]raftpb.Entry{
+		{Index: 1, Term: 1, Type: raftpb.EntryType_NORMAL, Data: []byte("one")},
+		{Index: 2, Term: 2, Type: raftpb.EntryType_NORMAL, Data: []byte("two")},
+		{Index: 3, Term: 2, Type: raftpb.EntryType_NORMAL, Data: []byte("three")},
+	})
+
+	// The follower already has later entries, but this empty request proves
+	// agreement only through prevLogIndex=1.
+	node.Step(replicationAppendRequest(2, 1, 3, 1, 1, 3))
+	ready := node.Ready()
+	if len(ready.Messages) != 1 || ready.Messages[0].GetAppendEntriesResp() == nil {
+		t.Fatalf("Ready messages = %v, want one AppendEntriesResp", ready.Messages)
+	}
+	response := ready.Messages[0].GetAppendEntriesResp()
+	if !response.Success || response.MatchIndex != 1 {
+		t.Fatalf("AppendEntriesResp = %v, want success covering exactly index 1", response)
+	}
+	if node.commitIndex != 1 {
+		t.Fatalf("commitIndex = %d, want request-covered index 1", node.commitIndex)
+	}
+	if len(ready.CommittedEntries) != 1 || !replicationEntry(&ready.CommittedEntries[0], 1, 1, []byte("one")) {
+		t.Fatalf("committed entries = %s, want only request-covered entry 1", replicationEntries(ready.CommittedEntries))
+	}
+}
+
 func TestLeaderProposeAppendsAndFansOut(t *testing.T) {
 	node := NewNode(
 		Config{ID: 1, Peers: []NodeID{1, 2, 3}},
@@ -163,7 +189,7 @@ func TestLeaderRejectionDecrementsNextIndexAndRetries(t *testing.T) {
 	}
 	node.Advance()
 
-	node.Step(replicationAppendResponse(2, 1, 2, false))
+	node.Step(replicationAppendResponse(2, 1, 2, false, 0))
 	ready := node.Ready()
 	if node.nextIndex[2] != 2 {
 		t.Fatalf("nextIndex[2] = %d, want 2 after linear decrement", node.nextIndex[2])
@@ -174,9 +200,171 @@ func TestLeaderRejectionDecrementsNextIndexAndRetries(t *testing.T) {
 	}
 	node.Advance()
 
-	node.Step(replicationAppendResponse(2, 1, 2, true))
+	node.Step(replicationAppendResponse(2, 1, 2, true, 2))
 	if node.matchIndex[2] != 2 || node.nextIndex[2] != 3 {
 		t.Fatalf("successful retry progress = match %d next %d, want match 2 next 3", node.matchIndex[2], node.nextIndex[2])
+	}
+}
+
+func TestLeaderDelayedDuplicateProbeResponseDoesNotCreditInflightSuffix(t *testing.T) {
+	leaderNode := NewNode(
+		Config{
+			ID:              1,
+			Peers:           []NodeID{1, 2, 3},
+			ElectionTickMin: 1,
+			ElectionTickMax: 2,
+			HeartbeatTicks:  1,
+		},
+		InitialState{},
+		fixedTestRand{},
+	)
+	followerNode := NewNode(
+		Config{ID: 2, Peers: []NodeID{1, 2, 3}},
+		InitialState{},
+		fixedTestRand{},
+	)
+
+	// Node 1 wins term 1 and sends the pre-NOOP empty probe to node 2.
+	leaderNode.Tick()
+	campaign := leaderNode.Ready()
+	if len(campaign.Messages) != 2 {
+		t.Fatalf("campaign messages = %d, want two RequestVote requests", len(campaign.Messages))
+	}
+	leaderNode.Advance()
+	leaderNode.Step(requestVoteResponse(2, 1, 1, true))
+	leadership := leaderNode.Ready()
+	if len(leadership.Entries) != 1 || !replicationTypedEntry(&leadership.Entries[0], 1, 1, raftpb.EntryType_NOOP, nil) {
+		t.Fatalf("leadership entries = %s, want NOOP@1", replicationEntries(leadership.Entries))
+	}
+	probe := replicationMessageTo(t, leadership.Messages, 2)
+	probeRequest := probe.GetAppendEntries()
+	if probeRequest.PrevLogIndex != 0 || len(probeRequest.Entries) != 0 {
+		t.Fatalf("initial request to node 2 = %v, want empty probe at index 0", probeRequest)
+	}
+	leaderNode.Advance()
+
+	// While that probe is in flight, append a normal proposal at index 2.
+	index, term, ok := leaderNode.Propose([]byte("proposal"))
+	if !ok || index != 2 || term != 1 {
+		t.Fatalf("Propose = (%d,%d,%v), want (2,1,true)", index, term, ok)
+	}
+	proposal := leaderNode.Ready()
+	if len(proposal.Entries) != 1 || !replicationEntry(&proposal.Entries[0], 2, 1, []byte("proposal")) {
+		t.Fatalf("proposal entries = %s, want normal proposal@2", replicationEntries(proposal.Entries))
+	}
+	leaderNode.Advance()
+
+	// Node 2's real probe response covers only index 0. Consuming it starts the
+	// newer suffix request for NOOP@1 and the proposal@2.
+	followerNode.Step(probe)
+	probeResult := followerNode.Ready()
+	if len(probeResult.Messages) != 1 || probeResult.Messages[0].GetAppendEntriesResp() == nil {
+		t.Fatalf("probe result messages = %v, want one AppendEntriesResp", probeResult.Messages)
+	}
+	probeResponse := probeResult.Messages[0]
+	if response := probeResponse.GetAppendEntriesResp(); !response.Success || response.MatchIndex != 0 {
+		t.Fatalf("probe response = %v, want success acknowledging index 0", response)
+	}
+	followerNode.Advance()
+
+	leaderNode.Step(probeResponse)
+	suffixResult := leaderNode.Ready()
+	suffix := replicationMessageTo(t, suffixResult.Messages, 2)
+	suffixRequest := suffix.GetAppendEntries()
+	if suffixRequest.PrevLogIndex != 0 || len(suffixRequest.Entries) != 2 ||
+		!replicationTypedEntry(suffixRequest.Entries[0], 1, 1, raftpb.EntryType_NOOP, nil) ||
+		!replicationEntry(suffixRequest.Entries[1], 2, 1, []byte("proposal")) {
+		t.Fatalf("suffix request = %v, want entries 1..2", suffixRequest)
+	}
+	outstanding := leaderNode.inflight[2]
+	if outstanding == nil || outstanding.lastIndex != 2 {
+		t.Fatalf("inflight[2] = %v, want suffix through index 2", outstanding)
+	}
+	leaderNode.Advance()
+
+	// Deliver a delayed duplicate of the old index-0 success before node 2
+	// receives the suffix. It must be completely inert.
+	leaderNode.Step(probeResponse)
+	staleResult := leaderNode.Ready()
+	if leaderNode.matchIndex[2] != 0 || leaderNode.nextIndex[2] != 1 || leaderNode.commitIndex != 0 {
+		t.Fatalf("stale probe progress = match %d next %d commit %d, want 0,1,0", leaderNode.matchIndex[2], leaderNode.nextIndex[2], leaderNode.commitIndex)
+	}
+	if len(staleResult.CommittedEntries) != 0 {
+		t.Fatalf("stale probe emitted committed entries: %s", replicationEntries(staleResult.CommittedEntries))
+	}
+	if len(staleResult.Messages) != 0 {
+		t.Fatalf("stale probe replaced the suffix with %d messages", len(staleResult.Messages))
+	}
+	if leaderNode.inflight[2] != outstanding {
+		t.Fatalf("stale probe changed inflight[2] from %p to %p", outstanding, leaderNode.inflight[2])
+	}
+	leaderNode.Advance()
+
+	// A heartbeat tick retries the exact outstanding suffix, proving the stale
+	// response did not strand it.
+	leaderNode.Tick()
+	retryResult := leaderNode.Ready()
+	retry := replicationMessageTo(t, retryResult.Messages, 2).GetAppendEntries()
+	if retry.PrevLogIndex != 0 || len(retry.Entries) != 2 || retry.Entries[1].Index != 2 {
+		t.Fatalf("retried suffix = %v, want outstanding entries 1..2", retry)
+	}
+	leaderNode.Advance()
+
+	// The real suffix acknowledgement still makes normal progress and commits
+	// both current-term entries with the leader and node 2 as a majority.
+	followerNode.Step(suffix)
+	realSuffixResult := followerNode.Ready()
+	if len(realSuffixResult.Messages) != 1 || realSuffixResult.Messages[0].GetAppendEntriesResp() == nil {
+		t.Fatalf("suffix result messages = %v, want one AppendEntriesResp", realSuffixResult.Messages)
+	}
+	suffixResponse := realSuffixResult.Messages[0]
+	if response := suffixResponse.GetAppendEntriesResp(); !response.Success || response.MatchIndex != 2 {
+		t.Fatalf("suffix response = %v, want success acknowledging index 2", response)
+	}
+	followerNode.Advance()
+
+	leaderNode.Step(suffixResponse)
+	committed := leaderNode.Ready()
+	if leaderNode.matchIndex[2] != 2 || leaderNode.nextIndex[2] != 3 || leaderNode.commitIndex != 2 {
+		t.Fatalf("real suffix progress = match %d next %d commit %d, want 2,3,2", leaderNode.matchIndex[2], leaderNode.nextIndex[2], leaderNode.commitIndex)
+	}
+	if len(committed.CommittedEntries) != 2 ||
+		!replicationTypedEntry(&committed.CommittedEntries[0], 1, 1, raftpb.EntryType_NOOP, nil) ||
+		!replicationEntry(&committed.CommittedEntries[1], 2, 1, []byte("proposal")) {
+		t.Fatalf("committed entries = %s, want [NOOP@1, proposal@2]", replicationEntries(committed.CommittedEntries))
+	}
+}
+
+func TestLeaderIgnoresOutOfRangeSuccessAcknowledgement(t *testing.T) {
+	node := NewNode(
+		Config{ID: 1, Peers: []NodeID{1, 2, 3}},
+		InitialState{
+			HardState: HardState{Term: 2},
+			Entries: []raftpb.Entry{
+				{Index: 1, Term: 2, Type: raftpb.EntryType_NOOP},
+				{Index: 2, Term: 2, Type: raftpb.EntryType_NORMAL},
+			},
+		},
+		fixedTestRand{},
+	)
+	node.role = leader
+	node.nextIndex = map[NodeID]uint64{1: 3, 2: 1, 3: 1}
+	node.matchIndex = map[NodeID]uint64{1: 2, 2: 0, 3: 0}
+	node.inflight = make(map[NodeID]*appendInflight)
+	node.sendAppend(2, false)
+	outstanding := node.inflight[2]
+	node.Advance()
+
+	node.Step(replicationAppendResponse(2, 1, 2, true, 3))
+	ready := node.Ready()
+	if node.matchIndex[2] != 0 || node.nextIndex[2] != 1 || node.commitIndex != 0 {
+		t.Fatalf("out-of-range progress = match %d next %d commit %d, want 0,1,0", node.matchIndex[2], node.nextIndex[2], node.commitIndex)
+	}
+	if node.inflight[2] != outstanding {
+		t.Fatalf("out-of-range acknowledgement changed inflight[2] from %p to %p", outstanding, node.inflight[2])
+	}
+	if len(ready.Messages) != 0 || len(ready.CommittedEntries) != 0 {
+		t.Fatalf("out-of-range acknowledgement emitted messages=%d committed=%s", len(ready.Messages), replicationEntries(ready.CommittedEntries))
 	}
 }
 
@@ -310,14 +498,15 @@ func replicationAppendRequest(from, to, term, prevIndex, prevTerm, leaderCommit 
 	}
 }
 
-func replicationAppendResponse(from, to, term uint64, success bool) *raftpb.Message {
+func replicationAppendResponse(from, to, term uint64, success bool, matchIndex uint64) *raftpb.Message {
 	return &raftpb.Message{
 		From: from,
 		To:   to,
 		Term: term,
 		Body: &raftpb.Message_AppendEntriesResp{AppendEntriesResp: &raftpb.AppendEntriesResp{
-			Term:    term,
-			Success: success,
+			Term:       term,
+			Success:    success,
+			MatchIndex: matchIndex,
 		}},
 	}
 }
