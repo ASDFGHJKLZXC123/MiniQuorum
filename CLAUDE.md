@@ -1,7 +1,7 @@
 # MiniQuorum contributor guide
 
-- Go module: `miniquorum`. Phase 0’s complete build contract is
-  [`phases/phase-0-scaffold.md`](phases/phase-0-scaffold.md).
+- Go module: `miniquorum`. The current phase’s complete build contract is
+  [`phases/phase-1-leader-election.md`](phases/phase-1-leader-election.md).
 - `internal/raft` is a synchronous, deterministic event-driven state machine.
   It never reads wall time or performs I/O, networking, randomness directly,
   goroutines, locks, or gRPC work. The host supplies ticks, messages, and a
