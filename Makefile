@@ -9,8 +9,10 @@ test:
 boundary:
 	go test ./internal/boundary -run '^TestRaftBoundary$$' -count=1
 
+SEED ?= 1
+
 sim:
-	go test ./sim
+	go test ./sim -run '^TestSim$$' -seed=$(SEED) -count=1
 
 corpus:
 	go test ./checker
