@@ -86,9 +86,17 @@ func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 		s.observeLeader(m)
 		s.scheduleMessage(m)
 	}
-	// Phase 1 sim v0 has no state machine to apply into (Phase 2); the loop
-	// exists to preserve the mandated Save -> send -> apply -> Advance order.
-	for range rd.CommittedEntries {
+	// Packet 2A has no map state machine yet, but the simulator records the
+	// exact ordered apply stream synchronously so replication scenarios can
+	// assert commit/apply behavior without crossing the deterministic boundary.
+	for i := range rd.CommittedEntries {
+		sn.applied = append(sn.applied, raftpb.Entry{
+			Index: rd.CommittedEntries[i].Index,
+			Term:  rd.CommittedEntries[i].Term,
+			Type:  rd.CommittedEntries[i].Type,
+			Data:  append([]byte(nil), rd.CommittedEntries[i].Data...),
+		})
+		sn.lastApplied = rd.CommittedEntries[i].Index
 	}
 	sn.node.Advance()
 	s.record("node=%d ready hardstate=%v msgs=%d committed=%d", sn.id, rd.HardState != nil, len(rd.Messages), len(rd.CommittedEntries))

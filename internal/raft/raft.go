@@ -59,6 +59,25 @@ const (
 	leader
 )
 
+type appendInflight struct {
+	prevIndex    uint64
+	prevTerm     uint64
+	lastIndex    uint64
+	leaderCommit uint64
+	hasEntries   bool
+}
+
+type readyAck struct {
+	valid        bool
+	hardState    bool
+	hard         HardState
+	messageCount int
+	entries      bool
+	stableTo     uint64
+	committed    bool
+	appliedTo    uint64
+}
+
 // Node is a deterministic, synchronous Raft state machine.
 type Node struct {
 	config Config
@@ -73,8 +92,18 @@ type Node struct {
 	electionTimeout  int
 	votes            map[NodeID]struct{}
 
+	log           raftLog
+	unstableIndex uint64
+	commitIndex   uint64
+	lastApplied   uint64
+
+	nextIndex  map[NodeID]uint64
+	matchIndex map[NodeID]uint64
+	inflight   map[NodeID]*appendInflight
+
 	hardStateDirty bool
 	messages       []*raftpb.Message
+	readyAck       readyAck
 }
 
 // NewNode constructs a node, applying the pinned tick defaults when omitted.
@@ -89,12 +118,16 @@ func NewNode(cfg Config, init InitialState, rnd Rand) *Node {
 		cfg.HeartbeatTicks = 2
 	}
 	n := &Node{
-		config:    cfg,
-		peers:     orderedPeers(cfg.Peers),
-		rnd:       rnd,
-		hardState: init.HardState,
-		role:      follower,
+		config:      cfg,
+		peers:       orderedPeers(cfg.Peers),
+		rnd:         rnd,
+		hardState:   init.HardState,
+		role:        follower,
+		log:         newRaftLog(init.Snapshot, init.Entries),
+		commitIndex: init.Snapshot.Index,
+		lastApplied: init.Snapshot.Index,
 	}
+	n.unstableIndex = n.log.lastIndex() + 1
 	n.resetElectionTimeout()
 	return n
 }
@@ -138,13 +171,20 @@ func (n *Node) Step(m *raftpb.Message) {
 	case m.GetRequestVoteResp() != nil:
 		n.handleRequestVoteResponse(m, m.GetRequestVoteResp())
 	case m.GetAppendEntriesResp() != nil:
-		// Replication response processing begins in Phase 2.
+		n.handleAppendEntriesResponse(m, m.GetAppendEntriesResp())
 	}
 }
 
-// Propose is reserved for Phase 2.
+// Propose appends a normal entry when this node is leader. The core remains
+// synchronous: persistence and transport happen only through the next Ready.
 func (n *Node) Propose(data []byte) (index, term uint64, isLeader bool) {
-	return 0, 0, false
+	if n.role != leader {
+		return 0, n.hardState.Term, false
+	}
+	index = n.appendLocal(raftpb.EntryType_NORMAL, data)
+	n.advanceCommit()
+	n.broadcastAvailableAppend()
+	return index, n.hardState.Term, true
 }
 
 // Ready reports pending output without discarding it.
@@ -154,13 +194,76 @@ func (n *Node) Ready() Ready {
 		hardState := n.hardState
 		ready.HardState = &hardState
 	}
+	lastIndex := n.log.lastIndex()
+	if n.unstableIndex <= lastIndex {
+		ready.Entries = n.log.rangeEntries(n.unstableIndex, lastIndex+1)
+	}
+	if n.lastApplied < n.commitIndex {
+		ready.CommittedEntries = n.log.rangeEntries(n.lastApplied+1, n.commitIndex+1)
+	}
+	n.captureReady(ready)
 	return ready
 }
 
 // Advance acknowledges that the most recently reported Ready batch was handled.
 func (n *Node) Advance() {
-	n.hardStateDirty = false
-	n.messages = nil
+	// Preserve the Phase 1 behavior for callers that acknowledge immediately
+	// after driving the node without first materializing Ready.
+	if !n.readyAck.valid {
+		n.captureReady(n.readyWithoutCapture())
+	}
+	ack := n.readyAck
+	if ack.hardState && n.hardStateDirty && n.hardState == ack.hard {
+		n.hardStateDirty = false
+	}
+	if ack.messageCount >= len(n.messages) {
+		n.messages = nil
+	} else if ack.messageCount > 0 {
+		n.messages = n.messages[ack.messageCount:]
+	}
+	if ack.entries && n.unstableIndex <= ack.stableTo {
+		n.unstableIndex = ack.stableTo + 1
+	}
+	if ack.committed && ack.appliedTo > n.lastApplied {
+		n.lastApplied = ack.appliedTo
+	}
+	n.readyAck = readyAck{}
+}
+
+func (n *Node) readyWithoutCapture() Ready {
+	ready := Ready{Messages: n.messages}
+	if n.hardStateDirty {
+		hardState := n.hardState
+		ready.HardState = &hardState
+	}
+	lastIndex := n.log.lastIndex()
+	if n.unstableIndex <= lastIndex {
+		ready.Entries = n.log.rangeEntries(n.unstableIndex, lastIndex+1)
+	}
+	if n.lastApplied < n.commitIndex {
+		ready.CommittedEntries = n.log.rangeEntries(n.lastApplied+1, n.commitIndex+1)
+	}
+	return ready
+}
+
+func (n *Node) captureReady(ready Ready) {
+	ack := readyAck{
+		valid:        true,
+		hardState:    ready.HardState != nil,
+		messageCount: len(ready.Messages),
+		entries:      len(ready.Entries) > 0,
+		committed:    len(ready.CommittedEntries) > 0,
+	}
+	if ready.HardState != nil {
+		ack.hard = *ready.HardState
+	}
+	if len(ready.Entries) > 0 {
+		ack.stableTo = ready.Entries[len(ready.Entries)-1].Index
+	}
+	if len(ready.CommittedEntries) > 0 {
+		ack.appliedTo = ready.CommittedEntries[len(ready.CommittedEntries)-1].Index
+	}
+	n.readyAck = ack
 }
 
 func orderedPeers(peers []NodeID) []NodeID {
@@ -203,8 +306,8 @@ func (n *Node) startElection() {
 			Body: &raftpb.Message_RequestVote{RequestVote: &raftpb.RequestVoteReq{
 				Term:         n.hardState.Term,
 				CandidateId:  uint64(n.config.ID),
-				LastLogIndex: 0,
-				LastLogTerm:  0,
+				LastLogIndex: n.log.lastIndex(),
+				LastLogTerm:  n.log.lastTerm(),
 			}},
 		})
 	}
@@ -220,6 +323,9 @@ func (n *Node) becomeFollower(term uint64) {
 	n.role = follower
 	n.heartbeatElapsed = 0
 	n.votes = nil
+	n.nextIndex = nil
+	n.matchIndex = nil
+	n.inflight = nil
 }
 
 func (n *Node) becomeFollowerSameTerm() {
@@ -227,14 +333,35 @@ func (n *Node) becomeFollowerSameTerm() {
 	n.heartbeatElapsed = 0
 	n.votes = nil
 	n.electionElapsed = 0
+	n.nextIndex = nil
+	n.matchIndex = nil
+	n.inflight = nil
 }
 
 func (n *Node) becomeLeader() {
 	n.role = leader
 	n.heartbeatElapsed = 0
 	n.votes = nil
-	// TODO(phase2): append the leader's term-start no-op entry.
-	n.sendHeartbeats()
+
+	// Probe the pre-NOOP end of the log first. This keeps heartbeats empty and
+	// learns each follower's match point before suffix transmission. The NOOP
+	// itself is nevertheless appended synchronously in this transition and is
+	// part of the same Ready persistence batch as the probes.
+	probeIndex := n.log.lastIndex()
+	n.nextIndex = make(map[NodeID]uint64, len(n.peers))
+	n.matchIndex = make(map[NodeID]uint64, len(n.peers))
+	n.inflight = make(map[NodeID]*appendInflight, len(n.peers))
+	for _, peer := range n.peers {
+		n.nextIndex[peer] = probeIndex + 1
+		n.matchIndex[peer] = 0
+	}
+	n.appendLocal(raftpb.EntryType_NOOP, nil)
+	n.advanceCommit()
+	for _, peer := range n.peers {
+		if peer != n.config.ID {
+			n.sendAppend(peer, true)
+		}
+	}
 }
 
 func (n *Node) hasMajority() bool {
@@ -255,8 +382,7 @@ func (n *Node) handleRequestVote(m *raftpb.Message, req *raftpb.RequestVoteReq) 
 }
 
 func (n *Node) candidateLogIsUpToDate(index, term uint64) bool {
-	// Phase 1 has an empty log. Keep the full Raft comparison wired for Phase 2.
-	const lastLogIndex, lastLogTerm uint64 = 0, 0
+	lastLogIndex, lastLogTerm := n.log.lastIndex(), n.log.lastTerm()
 	return term > lastLogTerm || (term == lastLogTerm && index >= lastLogIndex)
 }
 
@@ -271,20 +397,49 @@ func (n *Node) handleRequestVoteResponse(m *raftpb.Message, resp *raftpb.Request
 }
 
 func (n *Node) handleAppendEntries(m *raftpb.Message, req *raftpb.AppendEntriesReq) {
-	if !n.validAppendEntries(req) {
-		n.sendAppendEntriesResponse(NodeID(m.From), false)
-		return
-	}
-	if n.role != leader {
+	if n.role != follower {
 		n.becomeFollowerSameTerm()
 	}
 	n.electionElapsed = 0
+	if !n.log.matches(req.PrevLogIndex, req.PrevLogTerm) {
+		n.sendAppendEntriesResponse(NodeID(m.From), false)
+		return
+	}
+	if changed := n.log.appendFromLeader(req.Entries); changed != 0 && changed < n.unstableIndex {
+		n.unstableIndex = changed
+	}
+	if req.LeaderCommit > n.commitIndex {
+		n.commitIndex = min(req.LeaderCommit, n.log.lastIndex())
+	}
 	n.sendAppendEntriesResponse(NodeID(m.From), true)
 }
 
-func (n *Node) validAppendEntries(req *raftpb.AppendEntriesReq) bool {
-	// Phase 1 only has empty-log heartbeats; replication begins in Phase 2.
-	return req.PrevLogIndex == 0 && req.PrevLogTerm == 0 && len(req.Entries) == 0 && req.LeaderCommit == 0
+func (n *Node) handleAppendEntriesResponse(m *raftpb.Message, resp *raftpb.AppendEntriesResp) {
+	peer := NodeID(m.From)
+	if n.role != leader || !n.isPeer(peer) || peer == n.config.ID {
+		return
+	}
+	pending := n.inflight[peer]
+	if pending == nil {
+		return
+	}
+	n.inflight[peer] = nil
+	if !resp.Success {
+		if n.nextIndex[peer] > n.log.firstIndex() {
+			n.nextIndex[peer]--
+		}
+		n.sendAppend(peer, false)
+		return
+	}
+
+	if pending.lastIndex > n.matchIndex[peer] {
+		n.matchIndex[peer] = pending.lastIndex
+	}
+	n.nextIndex[peer] = n.matchIndex[peer] + 1
+	commitAdvanced := n.advanceCommit()
+	if n.nextIndex[peer] <= n.log.lastIndex() || commitAdvanced {
+		n.sendAppend(peer, false)
+	}
 }
 
 func (n *Node) rejectLowerTermRequest(m *raftpb.Message) {
@@ -321,23 +476,122 @@ func (n *Node) sendAppendEntriesResponse(to NodeID, success bool) {
 }
 
 func (n *Node) sendHeartbeats() {
+	n.broadcastAppend(false)
+}
+
+func (n *Node) appendLocal(typ raftpb.EntryType, data []byte) uint64 {
+	index := n.log.appendLocal(n.hardState.Term, typ, data)
+	if index < n.unstableIndex {
+		n.unstableIndex = index
+	}
+	if n.matchIndex != nil {
+		n.matchIndex[n.config.ID] = index
+		n.nextIndex[n.config.ID] = index + 1
+	}
+	return index
+}
+
+func (n *Node) broadcastAppend(probe bool) {
 	for _, peer := range n.peers {
 		if peer == n.config.ID {
 			continue
 		}
-		n.messages = append(n.messages, &raftpb.Message{
-			From: uint64(n.config.ID),
-			To:   uint64(peer),
-			Term: n.hardState.Term,
-			Body: &raftpb.Message_AppendEntries{AppendEntries: &raftpb.AppendEntriesReq{
-				Term:         n.hardState.Term,
-				LeaderId:     uint64(n.config.ID),
-				PrevLogIndex: 0,
-				PrevLogTerm:  0,
-				LeaderCommit: 0,
-			}},
-		})
+		n.sendAppend(peer, probe)
 	}
+}
+
+// broadcastAvailableAppend starts one logical AppendEntries request per idle
+// follower. A follower that already has an in-flight request will receive the
+// newly appended suffix as soon as that request resolves; emitting another
+// copy here would make its uncorrelated success response ambiguous.
+func (n *Node) broadcastAvailableAppend() {
+	for _, peer := range n.peers {
+		if peer == n.config.ID || n.inflight[peer] != nil {
+			continue
+		}
+		n.sendAppend(peer, false)
+	}
+}
+
+func (n *Node) sendAppend(peer NodeID, probe bool) {
+	if pending := n.inflight[peer]; pending != nil {
+		n.emitAppend(peer, pending)
+		return
+	}
+
+	lastIndex := n.log.lastIndex()
+	next := n.nextIndex[peer]
+	if next < n.log.firstIndex() {
+		next = n.log.firstIndex()
+	}
+	if next > lastIndex+1 {
+		next = lastIndex + 1
+	}
+	n.nextIndex[peer] = next
+	prevIndex := next - 1
+	prevTerm, ok := n.log.term(prevIndex)
+	if !ok {
+		return
+	}
+	pending := &appendInflight{
+		prevIndex:    prevIndex,
+		prevTerm:     prevTerm,
+		lastIndex:    prevIndex,
+		leaderCommit: n.commitIndex,
+	}
+	if !probe && next <= lastIndex {
+		pending.hasEntries = true
+		pending.lastIndex = lastIndex
+	}
+	n.inflight[peer] = pending
+	n.emitAppend(peer, pending)
+}
+
+func (n *Node) emitAppend(peer NodeID, pending *appendInflight) {
+	var entries []*raftpb.Entry
+	if pending.hasEntries {
+		entries = entryPointers(n.log.rangeEntries(pending.prevIndex+1, pending.lastIndex+1))
+	}
+	n.messages = append(n.messages, &raftpb.Message{
+		From: uint64(n.config.ID),
+		To:   uint64(peer),
+		Term: n.hardState.Term,
+		Body: &raftpb.Message_AppendEntries{AppendEntries: &raftpb.AppendEntriesReq{
+			Term:         n.hardState.Term,
+			LeaderId:     uint64(n.config.ID),
+			PrevLogIndex: pending.prevIndex,
+			PrevLogTerm:  pending.prevTerm,
+			Entries:      entries,
+			LeaderCommit: pending.leaderCommit,
+		}},
+	})
+}
+
+// advanceCommit implements Raft section 5.4.2. A majority can directly
+// commit only an entry from this leader's current term; preceding entries
+// become committed indirectly when that current-term entry advances.
+func (n *Node) advanceCommit() bool {
+	if n.role != leader {
+		return false
+	}
+	majority := len(n.peers)/2 + 1
+	for index := n.log.lastIndex(); index > n.commitIndex; index-- {
+		term, ok := n.log.term(index)
+		if !ok || term != n.hardState.Term {
+			continue
+		}
+		replicas := 0
+		for _, peer := range n.peers {
+			if n.matchIndex[peer] >= index {
+				replicas++
+			}
+		}
+		if replicas >= majority {
+			n.commitIndex = index
+			return true
+		}
+	}
+	return false
 }
 
 func (n *Node) isPeer(id NodeID) bool {

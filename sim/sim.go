@@ -57,6 +57,9 @@ type simNode struct {
 	node       *raft.Node
 	halted     bool
 	generation uint64
+
+	applied     []raftpb.Entry
+	lastApplied uint64
 }
 
 type partitionKey struct{ from, to raft.NodeID }
@@ -223,6 +226,60 @@ func (s *Sim) Leaderships() map[uint64][]raft.NodeID {
 	return observed
 }
 
+// Propose synchronously supplies a client proposal to one simulated node and
+// processes the resulting Ready through the same persistence/send/apply/
+// Advance path as ticks and inbound messages. A down or fail-stopped node is
+// reported as not leader.
+func (s *Sim) Propose(id raft.NodeID, data []byte) (index, term uint64, isLeader bool) {
+	sn, ok := s.nodes[id]
+	if !ok || sn.node == nil || sn.halted {
+		s.record("propose node=%d reject(unavailable)", id)
+		return 0, 0, false
+	}
+	index, term, isLeader = sn.node.Propose(data)
+	s.record("propose node=%d index=%d term=%d leader=%t", id, index, term, isLeader)
+	s.processReady(sn, sn.node.Ready())
+	return index, term, isLeader
+}
+
+// Log returns a deep copy of the entries durably saved for a simulated node,
+// in index order. It is an inspection helper for deterministic scenarios.
+func (s *Sim) Log(id raft.NodeID) []raftpb.Entry {
+	sn, ok := s.nodes[id]
+	if !ok {
+		return nil
+	}
+	first, last := sn.storage.FirstIndex(), sn.storage.LastIndex()
+	if last < first {
+		return nil
+	}
+	entries, err := sn.storage.Entries(first, last+1)
+	if err != nil {
+		return nil
+	}
+	return cloneSimEntries(entries)
+}
+
+// AppliedEntries returns a deep copy of every committed entry handed to the
+// simulator's synchronous apply step, in application order.
+func (s *Sim) AppliedEntries(id raft.NodeID) []raftpb.Entry {
+	sn, ok := s.nodes[id]
+	if !ok {
+		return nil
+	}
+	return cloneSimEntries(sn.applied)
+}
+
+// LastApplied returns the greatest committed index processed by the
+// simulator's synchronous apply step for id.
+func (s *Sim) LastApplied(id raft.NodeID) uint64 {
+	sn, ok := s.nodes[id]
+	if !ok {
+		return 0
+	}
+	return sn.lastApplied
+}
+
 // Run drains the event queue through virtual time `until` (inclusive),
 // running every registered invariant after each processed event. It returns
 // the first invariant error encountered, if any.
@@ -269,4 +326,20 @@ func (s *Sim) scheduleMessage(m *raftpb.Message) {
 
 func (s *Sim) record(format string, args ...any) {
 	s.trace = append(s.trace, fmt.Sprintf("t=%d %s", s.now, fmt.Sprintf(format, args...)))
+}
+
+func cloneSimEntries(entries []raftpb.Entry) []raftpb.Entry {
+	if len(entries) == 0 {
+		return nil
+	}
+	cloned := make([]raftpb.Entry, 0, len(entries))
+	for i := range entries {
+		cloned = append(cloned, raftpb.Entry{
+			Index: entries[i].Index,
+			Term:  entries[i].Term,
+			Type:  entries[i].Type,
+			Data:  append([]byte(nil), entries[i].Data...),
+		})
+	}
+	return cloned
 }
