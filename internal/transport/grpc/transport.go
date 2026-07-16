@@ -53,6 +53,14 @@ func (t *Transport) Stop() {
 	t.mu.Unlock()
 }
 
+// Server returns the underlying gRPC server so the host can register
+// additional services (e.g. the KV service) on the same listener.
+func (t *Transport) Server() *grpcgo.Server {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.server
+}
+
 // Send asynchronously performs a best-effort unary RPC. Failures are dropped.
 func (t *Transport) Send(to raft.NodeID, m *raftpb.Message) {
 	addr, ok := t.peers[to]

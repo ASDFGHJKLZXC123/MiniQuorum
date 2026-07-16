@@ -18,8 +18,10 @@ import (
 	"miniquorum/internal/clock"
 	"miniquorum/internal/raft"
 	"miniquorum/internal/server"
+	"miniquorum/internal/statemachine/mapsm"
 	"miniquorum/internal/storage"
 	transportgrpc "miniquorum/internal/transport/grpc"
+	raftpb "miniquorum/proto"
 )
 
 func main() {
@@ -46,7 +48,17 @@ func main() {
 	}
 
 	node := raft.NewNode(raft.Config{ID: raft.NodeID(id), Peers: peerIDs(peers)}, raft.InitialState{}, fixedRand{})
-	transport := transportgrpc.New(peers, node.Step)
+	host := &server.Host{Node: node, Storage: storage.NewMemStorage()}
+	transport := transportgrpc.New(peers, func(m *raftpb.Message) {
+		if err := host.Step(m); err != nil {
+			log.Printf("miniquorumd node=%d fail-stop (step): %v", id, err)
+		}
+	})
+	host.Transport = transport
+	applier := server.NewKVApplier(mapsm.New())
+	host.Applier = applier
+	raftpb.RegisterKVServer(transport.Server(), server.NewKVService(host, applier, peers))
+
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Printf("listen %s: %v", addr, err)
@@ -59,7 +71,6 @@ func main() {
 		}
 	}()
 
-	host := &server.Host{Node: node, Storage: storage.NewMemStorage(), Transport: transport}
 	ticker := clock.NewRealClock().NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -72,8 +83,7 @@ func main() {
 			log.Printf("miniquorumd node=%d stopped", id)
 			return
 		case <-ticker.C():
-			node.Tick()
-			if err := host.ProcessReady(); err != nil {
+			if err := host.Tick(); err != nil {
 				log.Printf("miniquorumd node=%d fail-stop: %v", id, err)
 				transport.Stop()
 				return

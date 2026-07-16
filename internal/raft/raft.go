@@ -104,6 +104,8 @@ type Node struct {
 	hardStateDirty bool
 	messages       []*raftpb.Message
 	readyAck       readyAck
+
+	leaderHint NodeID
 }
 
 // NewNode constructs a node, applying the pinned tick defaults when omitted.
@@ -185,6 +187,16 @@ func (n *Node) Propose(data []byte) (index, term uint64, isLeader bool) {
 	n.advanceCommit()
 	n.broadcastAvailableAppend()
 	return index, n.hardState.Term, true
+}
+
+// LeaderHint returns the most recently observed leader for the current or a
+// recent term. It is a best-known hint only: it may be stale or unknown
+// (ok==false) around elections.
+func (n *Node) LeaderHint() (id NodeID, ok bool) {
+	if n.leaderHint == 0 {
+		return 0, false
+	}
+	return n.leaderHint, true
 }
 
 // Ready reports pending output without discarding it.
@@ -342,6 +354,7 @@ func (n *Node) becomeLeader() {
 	n.role = leader
 	n.heartbeatElapsed = 0
 	n.votes = nil
+	n.leaderHint = n.config.ID
 
 	// Probe the pre-NOOP end of the log first. This keeps heartbeats empty and
 	// learns each follower's match point before suffix transmission. The NOOP
@@ -401,6 +414,10 @@ func (n *Node) handleAppendEntries(m *raftpb.Message, req *raftpb.AppendEntriesR
 		n.becomeFollowerSameTerm()
 	}
 	n.electionElapsed = 0
+	// Term equality with n.hardState.Term is already enforced by Step before
+	// this handler runs, and only the current term's leader may legitimately
+	// send AppendEntries, so this is always a fresh, trustworthy hint.
+	n.leaderHint = NodeID(req.GetLeaderId())
 	requestLastIndex, valid := appendRequestLastIndex(req)
 	if !valid {
 		n.sendAppendEntriesResponse(NodeID(m.From), false, 0)

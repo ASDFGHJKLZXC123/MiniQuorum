@@ -31,3 +31,16 @@ a successful request. The implementation keeps one logical request in flight
 per follower and deterministically resends that same request on a heartbeat
 until a response arrives. This keeps the Phase 2 implementation simple, at the
 cost of O(log length) retries for a severely divergent follower.
+
+## Leadership-lost is wire-compatible with NotLeader (Phase 2C)
+
+`ExecuteResponse` (frozen) has no separate field for "your proposal was lost
+to a leadership change, retry" versus "I was never the leader". The server
+does not need one: when a different entry commits at a waiter's index (see
+`internal/server/waiter.go`), it fails that waiter the same way it answers a
+plain non-leader request — `NotLeader` with whatever leader hint is currently
+known (often the very hint learned from the AppendEntries that caused the
+stale commit, so it is frequently accurate rather than empty). `mqctl`
+already retries every `NotLeader` response identically (follow the hint, else
+round-robin, same client_id/seq), so the two server-side causes collapse into
+one client-side retry path with no protocol change.
