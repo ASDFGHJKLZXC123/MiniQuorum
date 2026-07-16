@@ -1,0 +1,19 @@
+.PHONY: proto test boundary sim corpus lint
+
+proto:
+	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative proto/raft.proto proto/kv.proto
+
+test:
+	go test ./... -race
+
+boundary:
+	go test ./internal/boundary -run '^TestRaftBoundary$$' -count=1
+
+sim:
+	go test ./sim
+
+corpus:
+	go test ./checker
+
+lint:
+	golangci-lint run

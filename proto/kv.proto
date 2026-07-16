@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package miniquorum;
+
+option go_package = "miniquorum/proto;raftpb";
+
+message Command {
+  uint64 client_id = 1;
+  uint64 seq = 2;
+  Op op = 3;
+  bytes key = 4;
+  bytes value = 5;
+}
+
+enum Op {
+  OP_UNSPECIFIED = 0;
+  PUT = 1;
+  DELETE = 2;
+  GET = 3;
+}
+
+message ExecuteRequest { Command cmd = 1; }
+
+message ExecuteResponse {
+  bool ok = 1;
+  bytes value = 2;
+  bool found = 3;
+  NotLeader not_leader = 4;
+}
+
+message NotLeader {
+  uint64 leader_id = 1;
+  string leader_addr = 2;
+}
+
+service KV {
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+}
