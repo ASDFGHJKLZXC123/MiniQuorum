@@ -41,13 +41,22 @@ type Config struct {
 
 // simNode is the sim's per-node bookkeeping. storage outlives crashes; it
 // models the disk. node is nil while the node is crashed.
+//
+// generation is bumped on every crash. Tick events carry the generation they
+// were scheduled under (see scheduleTick); an event whose generation no
+// longer matches sn.generation is stale and is dropped without rescheduling.
+// This closes the window where a tick queued before a crash is still
+// in-flight when Restart runs: without the check, that stale tick would
+// later fire against the freshly restarted node and reschedule itself,
+// running a second tick stream alongside the one Restart started.
 type simNode struct {
-	id      raft.NodeID
-	cfg     raft.Config
-	storage storage.Storage
-	rnd     *nodeRand
-	node    *raft.Node
-	halted  bool
+	id         raft.NodeID
+	cfg        raft.Config
+	storage    storage.Storage
+	rnd        *nodeRand
+	node       *raft.Node
+	halted     bool
+	generation uint64
 }
 
 type partitionKey struct{ from, to raft.NodeID }
@@ -118,12 +127,11 @@ func NewSim(cfg Config) (*Sim, error) {
 	}
 
 	for _, id := range order {
-		peers := make([]raft.NodeID, 0, len(order)-1)
-		for _, other := range order {
-			if other != id {
-				peers = append(peers, other)
-			}
-		}
+		// The frozen raft.Config.Peers contract is full ordered cluster
+		// membership, including the local node itself (see raft_test.go and
+		// Node.hasMajority, which divides by len(peers)). Each node gets its
+		// own copy so no two nodes ever alias the same backing array.
+		peers := append([]raft.NodeID(nil), order...)
 		rc := raft.Config{
 			ID:              id,
 			Peers:           peers,
@@ -214,7 +222,14 @@ func (s *Sim) pushAt(at VirtualTime, e *event) {
 }
 
 func (s *Sim) scheduleTick(id raft.NodeID, at VirtualTime) {
-	s.pushAt(at, &event{kind: eventTick, node: id})
+	s.pushAt(at, &event{kind: eventTick, node: id, generation: s.nodes[id].generation})
+}
+
+// tickIsStale reports whether ev (an eventTick) was scheduled under a
+// generation of its node that a subsequent crash has since invalidated.
+func (s *Sim) tickIsStale(ev *event) bool {
+	sn := s.nodes[ev.node]
+	return sn == nil || ev.generation != sn.generation
 }
 
 func (s *Sim) scheduleMessage(m *raftpb.Message) {

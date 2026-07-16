@@ -27,6 +27,11 @@ type event struct {
 	kind eventKind
 	node raft.NodeID     // target node for tick/crash/restart
 	msg  *raftpb.Message // payload for eventMessage
+
+	// generation is the target node's simNode.generation at schedule time.
+	// Only meaningful for eventTick; see simNode.generation and
+	// Sim.tickIsStale.
+	generation uint64
 }
 
 // eventQueue is a deterministic min-heap on (time, seq). It implements

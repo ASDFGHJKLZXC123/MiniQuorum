@@ -8,6 +8,10 @@ import (
 func (s *Sim) handleEvent(ev *event) {
 	switch ev.kind {
 	case eventTick:
+		if s.tickIsStale(ev) {
+			s.record("tick node=%d skip(stale gen=%d current=%d)", ev.node, ev.generation, s.nodes[ev.node].generation)
+			return
+		}
 		s.handleTick(ev.node)
 	case eventMessage:
 		s.handleMessage(ev.msg)
@@ -50,6 +54,7 @@ func (s *Sim) handleCrash(id raft.NodeID) {
 	sn := s.nodes[id]
 	sn.node = nil
 	sn.halted = false
+	sn.generation++
 	s.record("crash node=%d", id)
 }
 
