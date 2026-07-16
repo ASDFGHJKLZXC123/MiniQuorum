@@ -1,0 +1,5 @@
+# MiniQuorum run log
+
+| Date | Packet | Branch / commit | Worker outcome | Verifier outcome | Gate evidence |
+|---|---|---|---|---|---|
+| 2026-07-15 | 0A | `phase-0/0A` / `b9a3f3ca4e526ce37339b179b44a2ff197326acb` (baseline `7194ed8`) | PASS after one correction cycle — GPT-5.6-Terra, high effort | Unconditional PASS — Claude Opus 4.8 (`claude-opus-4-8`), high effort, session `8e518c63-e19a-4ecf-b599-293b58081ff1`; read-only, no fallback | Orchestrator and verifier: `make proto` byte-identical; `go build ./...`; `go vet ./...`; `golangci-lint run` (0 issues); `go test ./... -race`; `make boundary`; focused boundary, raft defaults, storage, clock, unary gRPC transport, server lifecycle/fail-stop, and daemon tests; `make sim SEED=123`; `make corpus`; `go doc -all ./internal/raft`; daemon start/tick/SIGTERM exit 0; all PASS. Fresh local clone reproduced the CI-equivalent gates. Negative controls independently planted forbidden `time.Now()` and a bare `go` statement, observed boundary failures, reverted, and re-ran green. CI link: N/A — local-only repository by instruction. |
