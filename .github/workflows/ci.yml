@@ -22,5 +22,7 @@ jobs:
           version: v2.10.1
       - name: Race tests
         run: go test ./... -race
+      - name: Phase 1 500-seed simulator corpus
+        run: make sim-500
       - name: Raft determinism boundary
         run: make boundary

@@ -194,6 +194,35 @@ func (s *Sim) Now() VirtualTime { return s.now }
 // Sim runs built from identical Config (same seed) produce identical traces.
 func (s *Sim) Trace() []string { return append([]string(nil), s.trace...) }
 
+// HighestTerm returns the greatest term durably recorded by any simulated
+// node. It is an inspection helper for scenario assertions; it does not
+// expose or alter Raft's internal state.
+func (s *Sim) HighestTerm() uint64 {
+	var highest uint64
+	for _, id := range s.order {
+		hs, err := s.nodes[id].storage.HardState()
+		if err == nil && hs.Term > highest {
+			highest = hs.Term
+		}
+	}
+	return highest
+}
+
+// Leaderships returns a stable snapshot of the leaders observed from emitted
+// AppendEntries messages, grouped by term. The returned slices and map are
+// copies, so callers cannot affect invariant tracking.
+func (s *Sim) Leaderships() map[uint64][]raft.NodeID {
+	observed := make(map[uint64][]raft.NodeID, len(s.leaders.leaders))
+	for term, set := range s.leaders.leaders {
+		ids := make([]raft.NodeID, 0, len(set))
+		for id := range set {
+			ids = append(ids, id)
+		}
+		observed[term] = sortedIDs(ids)
+	}
+	return observed
+}
+
 // Run drains the event queue through virtual time `until` (inclusive),
 // running every registered invariant after each processed event. It returns
 // the first invariant error encountered, if any.
