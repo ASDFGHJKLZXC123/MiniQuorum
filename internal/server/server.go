@@ -28,9 +28,20 @@ type Host struct {
 	Storage   storage.Storage
 	Transport transport.Transport
 	Applier   Applier
+	// SelfID is this node's own ID, used only to record itself as the
+	// best-known leader after a successful leader Propose. raft.Node keeps
+	// no exported notion of "self" the host can query, so the host is told.
+	SelfID raft.NodeID
 
 	mu      sync.Mutex
 	stopped error
+
+	// leaderHint is the best-known leader ID, observed from inbound
+	// AppendEntries or recorded as self after a successful leader Propose.
+	// Zero means unknown. It is a hint only: it may be stale or wrong around
+	// elections, and that staleness is explicitly acceptable (see
+	// LeaderHint) — internal/raft's frozen API carries no such state.
+	leaderHint raft.NodeID
 }
 
 type readyNode interface {
@@ -60,6 +71,9 @@ func (h *Host) Step(m *raftpb.Message) error {
 	if h.stopped != nil {
 		return h.stopped
 	}
+	if req := m.GetAppendEntries(); req != nil {
+		h.recordLeaderHintLocked(raft.NodeID(req.GetLeaderId()))
+	}
 	h.Node.Step(m)
 	return h.processReadyLocked()
 }
@@ -75,18 +89,36 @@ func (h *Host) Propose(data []byte, onProposed func(index, term uint64)) (index,
 		return 0, 0, false, h.stopped
 	}
 	index, term, isLeader = h.Node.Propose(data)
-	if isLeader && onProposed != nil {
-		onProposed(index, term)
+	if isLeader {
+		h.recordLeaderHintLocked(h.SelfID)
+		if onProposed != nil {
+			onProposed(index, term)
+		}
 	}
 	return index, term, isLeader, h.processReadyLocked()
 }
 
 // LeaderHint returns the node's best-known leader without racing Tick, Step,
-// or Propose. See raft.Node.LeaderHint for the staleness guarantees.
+// or Propose. It is a best-known hint only, tracked entirely by the host
+// (see the leaderHint field): it may be stale or unknown (ok==false) around
+// elections.
 func (h *Host) LeaderHint() (raft.NodeID, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.Node.LeaderHint()
+	if h.leaderHint == 0 {
+		return 0, false
+	}
+	return h.leaderHint, true
+}
+
+// recordLeaderHintLocked updates the best-known leader. Callers hold h.mu.
+// A zero ID (unset LeaderId, or SelfID left at its zero value) leaves the
+// existing hint untouched rather than recording "no leader".
+func (h *Host) recordLeaderHintLocked(id raft.NodeID) {
+	if id == 0 {
+		return
+	}
+	h.leaderHint = id
 }
 
 func (h *Host) processReadyLocked() error {

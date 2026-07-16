@@ -34,7 +34,14 @@ type KVApplier struct {
 
 	mu      sync.Mutex
 	waiters map[waiterKey]chan waiterOutcome
-	byIndex map[uint64]waiterKey
+	// byIndex tracks every term currently registered at an index, not just
+	// the most recent one: two waiters can be outstanding at the same index
+	// for different terms (e.g. this node proposed at (5,3), lost and
+	// regained leadership, and later proposed again at (5,4) before the
+	// first waiter's entry was ever applied or cancelled). fulfill must be
+	// able to find and resolve all of them, not just whichever registered
+	// last.
+	byIndex map[uint64]map[uint64]struct{}
 }
 
 // NewKVApplier constructs a KVApplier over sm.
@@ -42,7 +49,7 @@ func NewKVApplier(sm statemachine.StateMachine) *KVApplier {
 	return &KVApplier{
 		sm:      sm,
 		waiters: make(map[waiterKey]chan waiterOutcome),
-		byIndex: make(map[uint64]waiterKey),
+		byIndex: make(map[uint64]map[uint64]struct{}),
 	}
 }
 
@@ -69,7 +76,12 @@ func (a *KVApplier) register(index, term uint64) <-chan waiterOutcome {
 	ch := make(chan waiterOutcome, 1)
 	key := waiterKey{index: index, term: term}
 	a.waiters[key] = ch
-	a.byIndex[index] = key
+	terms := a.byIndex[index]
+	if terms == nil {
+		terms = make(map[uint64]struct{})
+		a.byIndex[index] = terms
+	}
+	terms[term] = struct{}{}
 	return ch
 }
 
@@ -82,32 +94,45 @@ func (a *KVApplier) cancel(index, term uint64) {
 	key := waiterKey{index: index, term: term}
 	if _, ok := a.waiters[key]; ok {
 		delete(a.waiters, key)
-		if a.byIndex[index] == key {
-			delete(a.byIndex, index)
-		}
+		a.removeFromIndexLocked(index, term)
 	}
 }
 
+// removeFromIndexLocked drops term from index's registered-term set. Callers
+// must hold a.mu.
+func (a *KVApplier) removeFromIndexLocked(index, term uint64) {
+	terms, ok := a.byIndex[index]
+	if !ok {
+		return
+	}
+	delete(terms, term)
+	if len(terms) == 0 {
+		delete(a.byIndex, index)
+	}
+}
+
+// fulfill resolves every waiter registered at index, not just one: the
+// waiter whose term matches the committed entry receives its result, and
+// every other term registered at that index is failed stale (its own
+// proposal was lost, usually to a leadership change) so it can never remain
+// stranded waiting on a result that will never come.
 func (a *KVApplier) fulfill(index, term uint64, result statemachine.Result) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	key := waiterKey{index: index, term: term}
-	if ch, ok := a.waiters[key]; ok {
+	terms := a.byIndex[index]
+	for t := range terms {
+		key := waiterKey{index: index, term: t}
+		ch, ok := a.waiters[key]
+		if !ok {
+			continue
+		}
 		delete(a.waiters, key)
-		delete(a.byIndex, index)
-		ch <- waiterOutcome{result: result}
-		return
-	}
-	// No waiter for this exact (index, term): if some other waiter is still
-	// registered at this index, a different entry has committed there, so
-	// that waiter's own proposal was lost and it must never be handed this
-	// entry's result.
-	if staleKey, ok := a.byIndex[index]; ok {
-		if ch, ok := a.waiters[staleKey]; ok {
-			delete(a.waiters, staleKey)
+		if t == term {
+			ch <- waiterOutcome{result: result}
+		} else {
 			ch <- waiterOutcome{stale: true}
 		}
-		delete(a.byIndex, index)
 	}
+	delete(a.byIndex, index)
 }

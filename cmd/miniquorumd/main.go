@@ -3,9 +3,12 @@ package main
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
+	mathrand "math/rand/v2"
 	"net"
 	"os"
 	"os/signal"
@@ -47,8 +50,13 @@ func main() {
 		return
 	}
 
-	node := raft.NewNode(raft.Config{ID: raft.NodeID(id), Peers: peerIDs(peers)}, raft.InitialState{}, fixedRand{})
-	host := &server.Host{Node: node, Storage: storage.NewMemStorage()}
+	rnd, err := newProdRand()
+	if err != nil {
+		log.Printf("seed election jitter rand: %v", err)
+		return
+	}
+	node := raft.NewNode(raft.Config{ID: raft.NodeID(id), Peers: peerIDs(peers)}, raft.InitialState{}, rnd)
+	host := &server.Host{Node: node, Storage: storage.NewMemStorage(), SelfID: raft.NodeID(id)}
 	transport := transportgrpc.New(peers, func(m *raftpb.Message) {
 		if err := host.Step(m); err != nil {
 			log.Printf("miniquorumd node=%d fail-stop (step): %v", id, err)
@@ -121,6 +129,25 @@ func peerIDs(peers map[raft.NodeID]string) []raft.NodeID {
 	return ids
 }
 
-type fixedRand struct{}
+// prodRand implements raft.Rand for the production daemon: a PRNG seeded
+// once from a cryptographic source at startup, rather than a fixed sequence.
+// A fixed or shared jitter sequence across real, independently started
+// processes can synchronize their election timeouts and prevent the cluster
+// from ever electing a leader; crypto seeding decorrelates them.
+type prodRand struct {
+	r *mathrand.Rand
+}
 
-func (fixedRand) IntN(n int) int { return 0 }
+// newProdRand seeds a prodRand from crypto/rand. Seed acquisition failure is
+// reported rather than silently falling back to a weak or fixed seed.
+func newProdRand() (*prodRand, error) {
+	var seed [16]byte
+	if _, err := cryptorand.Read(seed[:]); err != nil {
+		return nil, fmt.Errorf("read crypto seed: %w", err)
+	}
+	s1 := binary.BigEndian.Uint64(seed[:8])
+	s2 := binary.BigEndian.Uint64(seed[8:])
+	return &prodRand{r: mathrand.New(mathrand.NewPCG(s1, s2))}, nil
+}
+
+func (p *prodRand) IntN(n int) int { return p.r.IntN(n) }

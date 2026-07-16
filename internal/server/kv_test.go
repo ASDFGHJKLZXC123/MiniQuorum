@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"miniquorum/internal/raft"
@@ -70,6 +71,50 @@ func TestKVApplierNOOPAdvancesIndexWithoutTouchingAnyWaiter(t *testing.T) {
 	}
 }
 
+// TestKVApplierResolvesEveryWaiterAtACommittedIndexRegardlessOfRegistrationOrder
+// is the adversarial case byIndex used to lose: two waiters registered at the
+// same index for different terms (this node proposed at (5,3), lost and
+// regained leadership, and proposed again at (5,4) before the first waiter's
+// entry was ever applied or cancelled). Whichever registered second used to
+// silently overwrite byIndex's single slot, stranding the other forever. Both
+// registration orders must resolve: the exact (index,term) match gets the
+// applied result, and the other term gets a stale failure — never neither.
+func TestKVApplierResolvesEveryWaiterAtACommittedIndexRegardlessOfRegistrationOrder(t *testing.T) {
+	for _, order := range [][2]uint64{{3, 4}, {4, 3}} {
+		t.Run(fmt.Sprintf("register_%d_then_%d", order[0], order[1]), func(t *testing.T) {
+			applier := NewKVApplier(mapsm.New())
+			channels := map[uint64]<-chan waiterOutcome{
+				order[0]: applier.register(5, order[0]),
+				order[1]: applier.register(5, order[1]),
+			}
+
+			data := marshalCommand(t, &raftpb.Command{ClientId: 1, Seq: 1, Op: raftpb.Op_PUT, Key: []byte("k"), Value: []byte("v")})
+			if err := applier.Apply(&raftpb.Entry{Index: 5, Term: 3, Type: raftpb.EntryType_NORMAL, Data: data}); err != nil {
+				t.Fatalf("Apply() error = %v", err)
+			}
+
+			for term, ch := range channels {
+				select {
+				case outcome := <-ch:
+					wantStale := term != 3
+					if outcome.stale != wantStale {
+						t.Fatalf("term %d waiter outcome.stale = %v, want %v", term, outcome.stale, wantStale)
+					}
+				default:
+					t.Fatalf("waiter registered at term %d left unresolved (stranded)", term)
+				}
+			}
+
+			if len(applier.waiters) != 0 {
+				t.Fatalf("waiters not fully drained: %v", applier.waiters)
+			}
+			if len(applier.byIndex) != 0 {
+				t.Fatalf("byIndex not fully cleaned up: %v", applier.byIndex)
+			}
+		})
+	}
+}
+
 func TestKVApplierCancelIsIdempotentAfterFulfillment(t *testing.T) {
 	applier := NewKVApplier(mapsm.New())
 	_ = applier.register(9, 1)
@@ -133,6 +178,84 @@ func TestKVServiceExecuteFollowsLearnedLeaderHint(t *testing.T) {
 	hint := resp.GetNotLeader()
 	if hint == nil || hint.GetLeaderId() != 2 || hint.GetLeaderAddr() != "n2:1" {
 		t.Fatalf("resp.NotLeader = %+v, want leader_id=2 leader_addr=n2:1", hint)
+	}
+}
+
+// --- Host: LeaderHint tracking -----------------------------------------
+//
+// internal/raft carries no leader-hint state (phases/phase-0-scaffold.md §4
+// pins its exported API exactly); the host tracks its own ID and the
+// best-known leader entirely itself, observing inbound AppendEntries and
+// recording itself after a successful leader Propose.
+
+func TestHostLeaderHintUnknownBeforeAnyObservation(t *testing.T) {
+	node := raft.NewNode(raft.Config{ID: 1, Peers: []raft.NodeID{1, 2, 3}}, raft.InitialState{}, fixedTestRand{})
+	host := &Host{Node: node, Storage: storage.NewMemStorage(), Transport: noopTransport{}, SelfID: 1}
+
+	if id, ok := host.LeaderHint(); ok {
+		t.Fatalf("LeaderHint() = (%d,true), want unknown before any leader is observed", id)
+	}
+}
+
+func TestHostLeaderHintLearnedFromInboundAppendEntries(t *testing.T) {
+	node := raft.NewNode(raft.Config{ID: 3, Peers: []raft.NodeID{1, 2, 3}}, raft.InitialState{}, fixedTestRand{})
+	host := &Host{Node: node, Storage: storage.NewMemStorage(), Transport: noopTransport{}, SelfID: 3}
+
+	if err := host.Step(&raftpb.Message{
+		From: 2, To: 3, Term: 5,
+		Body: &raftpb.Message_AppendEntries{AppendEntries: &raftpb.AppendEntriesReq{Term: 5, LeaderId: 2}},
+	}); err != nil {
+		t.Fatalf("Step() error = %v", err)
+	}
+
+	if id, ok := host.LeaderHint(); !ok || id != 2 {
+		t.Fatalf("LeaderHint() = (%d,%v), want (2,true) after AppendEntries from node 2", id, ok)
+	}
+}
+
+func TestHostLeaderHintRecordsSelfAfterSuccessfulLeaderPropose(t *testing.T) {
+	node := raft.NewNode(raft.Config{ID: 1, Peers: []raft.NodeID{1}, ElectionTickMin: 1, ElectionTickMax: 2}, raft.InitialState{}, fixedTestRand{})
+	host := &Host{Node: node, Storage: storage.NewMemStorage(), Transport: noopTransport{}, SelfID: 1}
+
+	if err := host.Tick(); err != nil { // election timeout -> immediate single-node leadership
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if id, ok := host.LeaderHint(); ok {
+		t.Fatalf("LeaderHint() = (%d,true) merely from becoming leader, want still unknown until a Propose records self", id)
+	}
+
+	if _, _, isLeader, err := host.Propose([]byte("data"), nil); err != nil || !isLeader {
+		t.Fatalf("Propose() = (isLeader=%v, err=%v), want isLeader=true, err=nil", isLeader, err)
+	}
+
+	if id, ok := host.LeaderHint(); !ok || id != 1 {
+		t.Fatalf("LeaderHint() = (%d,%v), want (1,true) after a successful leader Propose", id, ok)
+	}
+}
+
+func TestHostLeaderHintIgnoresZeroLeaderIDAndKeepsPriorHint(t *testing.T) {
+	node := raft.NewNode(raft.Config{ID: 3, Peers: []raft.NodeID{1, 2, 3}}, raft.InitialState{}, fixedTestRand{})
+	host := &Host{Node: node, Storage: storage.NewMemStorage(), Transport: noopTransport{}, SelfID: 3}
+
+	if err := host.Step(&raftpb.Message{
+		From: 2, To: 3, Term: 5,
+		Body: &raftpb.Message_AppendEntries{AppendEntries: &raftpb.AppendEntriesReq{Term: 5, LeaderId: 2}},
+	}); err != nil {
+		t.Fatalf("Step() error = %v", err)
+	}
+
+	// A same-term AppendEntries with an unset LeaderId (0) must never erase
+	// an already-known hint; stale/empty hints are allowed, but this is
+	// neither — it is a case that must not overwrite good data with none.
+	if err := host.Step(&raftpb.Message{
+		From: 2, To: 3, Term: 5,
+		Body: &raftpb.Message_AppendEntries{AppendEntries: &raftpb.AppendEntriesReq{Term: 5, LeaderId: 0}},
+	}); err != nil {
+		t.Fatalf("Step() error = %v", err)
+	}
+
+	if id, ok := host.LeaderHint(); !ok || id != 2 {
+		t.Fatalf("LeaderHint() = (%d,%v), want (2,true) unchanged by a zero LeaderId message", id, ok)
 	}
 }
 

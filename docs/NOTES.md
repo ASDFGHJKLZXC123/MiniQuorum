@@ -44,3 +44,30 @@ stale commit, so it is frequently accurate rather than empty). `mqctl`
 already retries every `NotLeader` response identically (follow the hint, else
 round-robin, same client_id/seq), so the two server-side causes collapse into
 one client-side retry path with no protocol change.
+
+## Leader hints live on the host, not in `internal/raft` (Phase 2C correction)
+
+An early Phase 2C draft added a `Node.LeaderHint()` accessor plus `leaderHint`
+state to the raft core to serve `NotLeader` hints. That broke the frozen
+Phase 0 API contract (`internal/raft` exposes exactly the synchronous shape in
+`phases/phase-0-scaffold.md` §4) for a value the core has no intrinsic need
+to track. The fix moved the hint entirely into `internal/server.Host`: it
+records its own configured ID (`Host.SelfID`) as the hint after a successful
+leader `Propose`, and learns a hint by inspecting inbound `AppendEntries`
+messages in `Host.Step` before handing them to `Node.Step`. Both sources are
+best-effort — an unset (`0`) `LeaderId` never overwrites an existing hint,
+and staleness around elections is accepted, matching the original design's
+guarantees without adding any state to the consensus core.
+
+## Production election jitter must be crypto-seeded (Phase 2C correction)
+
+`cmd/miniquorumd` originally injected a `Rand` that always returned `0`. Three
+independently started real processes with identical, unjittered election
+timeouts can keep re-triggering elections in lockstep and never converge on a
+stable leader — a liveness bug that sim can't catch (sim's seeded PRNG is
+intentionally deterministic per the Implementation Guide's `Rand` decision,
+and each simulated node already draws distinct values from it). The daemon
+now seeds a `math/rand/v2` PCG source from `crypto/rand` once at startup
+(`newProdRand` in `cmd/miniquorumd/main.go`) and fails startup explicitly if
+the crypto seed read fails, rather than silently falling back to a fixed or
+weak seed.

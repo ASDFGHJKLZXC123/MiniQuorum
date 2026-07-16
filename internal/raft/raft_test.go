@@ -193,55 +193,6 @@ func TestMajorityElectionSendsImmediateAndPeriodicHeartbeats(t *testing.T) {
 	}
 }
 
-func TestLeaderHintUnknownBeforeAnyLeaderIsObserved(t *testing.T) {
-	node := NewNode(Config{ID: 1, Peers: []NodeID{1, 2, 3}}, InitialState{}, fixedTestRand{})
-	if id, ok := node.LeaderHint(); ok {
-		t.Fatalf("LeaderHint() = (%d,true), want unknown before any leader is observed", id)
-	}
-}
-
-func TestLeaderHintReportsSelfOnBecomingLeader(t *testing.T) {
-	node := NewNode(
-		Config{ID: 1, Peers: []NodeID{1, 2, 3}, ElectionTickMin: 1, ElectionTickMax: 2},
-		InitialState{},
-		fixedTestRand{},
-	)
-	node.Tick()
-	node.Advance()
-	node.Step(requestVoteResponse(2, 1, 1, true))
-	node.Advance()
-
-	if id, ok := node.LeaderHint(); !ok || id != 1 {
-		t.Fatalf("LeaderHint() = (%d,%v), want (1,true) after becoming leader", id, ok)
-	}
-}
-
-func TestLeaderHintLearnedFromAppendEntriesAndSurvivesCandidacy(t *testing.T) {
-	node := NewNode(Config{ID: 3, Peers: []NodeID{1, 2, 3}}, InitialState{}, fixedTestRand{})
-	node.Step(appendEntries(2, 3, 5))
-	node.Advance()
-
-	if id, ok := node.LeaderHint(); !ok || id != 2 {
-		t.Fatalf("LeaderHint() = (%d,%v), want (2,true) after AppendEntries from node 2", id, ok)
-	}
-
-	// A later, unrelated election timeout that fails to win a majority must
-	// not erase the last-known hint: the spec allows staleness here.
-	node = NewNode(
-		Config{ID: 3, Peers: []NodeID{1, 2, 3}, ElectionTickMin: 1, ElectionTickMax: 2},
-		InitialState{},
-		fixedTestRand{},
-	)
-	node.Step(appendEntries(2, 3, 5))
-	node.Advance()
-	node.Tick()
-	node.Advance()
-
-	if id, ok := node.LeaderHint(); !ok || id != 2 {
-		t.Fatalf("LeaderHint() = (%d,%v), want stale (2,true) to survive an unresolved candidacy", id, ok)
-	}
-}
-
 type fixedTestRand struct{}
 
 func (fixedTestRand) IntN(int) int { return 0 }
