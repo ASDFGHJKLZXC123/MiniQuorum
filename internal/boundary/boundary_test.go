@@ -13,7 +13,7 @@ import (
 
 var forbiddenImports = map[string]struct{}{
 	"time": {}, "math/rand": {}, "crypto/rand": {}, "net": {}, "os": {},
-	"io/fs": {}, "sync": {}, "google.golang.org/grpc": {},
+	"io": {}, "sync": {}, "google.golang.org/grpc": {},
 }
 
 func TestRaftBoundary(t *testing.T) {
@@ -58,7 +58,7 @@ func checkDirectory(root string) error {
 		}
 		for _, spec := range file.Imports {
 			path := strings.Trim(spec.Path.Value, "\"")
-			if _, forbidden := forbiddenImports[path]; forbidden {
+			if isForbiddenImport(path) {
 				return &boundaryError{file: name, detail: "forbidden import " + path}
 			}
 		}
@@ -75,6 +75,15 @@ func checkDirectory(root string) error {
 		}
 	}
 	return nil
+}
+
+func isForbiddenImport(path string) bool {
+	for forbidden := range forbiddenImports {
+		if path == forbidden || strings.HasPrefix(path, forbidden+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 type boundaryError struct {

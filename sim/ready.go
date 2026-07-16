@@ -2,6 +2,7 @@ package sim
 
 import (
 	"miniquorum/internal/raft"
+	"miniquorum/internal/statemachine"
 	raftpb "miniquorum/proto"
 )
 
@@ -86,15 +87,26 @@ func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 		s.observeLeader(m)
 		s.scheduleMessage(m)
 	}
-	// Packet 2A has no map state machine yet, but the simulator records the
-	// exact ordered apply stream synchronously so replication scenarios can
-	// assert commit/apply behavior without crossing the deterministic boundary.
 	for i := range rd.CommittedEntries {
+		var result statemachine.Result
+		if sn.sm != nil {
+			var err error
+			result, err = sn.sm.Apply(&rd.CommittedEntries[i])
+			if err != nil {
+				sn.halted = true
+				s.record("node=%d apply_error index=%d %v fail-stop", sn.id, rd.CommittedEntries[i].Index, err)
+				return
+			}
+		}
 		sn.applied = append(sn.applied, raftpb.Entry{
 			Index: rd.CommittedEntries[i].Index,
 			Term:  rd.CommittedEntries[i].Term,
 			Type:  rd.CommittedEntries[i].Type,
 			Data:  append([]byte(nil), rd.CommittedEntries[i].Data...),
+		})
+		sn.results = append(sn.results, statemachine.Result{
+			Value: append([]byte(nil), result.Value...),
+			Found: result.Found,
 		})
 		sn.lastApplied = rd.CommittedEntries[i].Index
 	}

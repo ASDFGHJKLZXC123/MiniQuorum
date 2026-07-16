@@ -15,6 +15,7 @@ import (
 	"math/rand"
 
 	"miniquorum/internal/raft"
+	"miniquorum/internal/statemachine"
 	"miniquorum/internal/storage"
 	raftpb "miniquorum/proto"
 )
@@ -59,7 +60,9 @@ type simNode struct {
 	generation uint64
 
 	applied     []raftpb.Entry
+	results     []statemachine.Result
 	lastApplied uint64
+	sm          statemachine.StateMachine
 }
 
 type partitionKey struct{ from, to raft.NodeID }
@@ -127,6 +130,9 @@ func NewSim(cfg Config) (*Sim, error) {
 		minDelay:     minDelay,
 		maxDelay:     maxDelay,
 		leaders:      newLeaderTracker(),
+		// Log matching is a universal Phase 2 safety property, not an
+		// opt-in scenario assertion. Run checks it after every event.
+		invariants: []InvariantFunc{LogMatching},
 	}
 
 	for _, id := range order {
