@@ -23,6 +23,10 @@ type waiterOutcome struct {
 	// meaning this node's proposal was lost (usually a leadership change).
 	// The caller must treat this as retryable and never surface result.
 	stale bool
+	// err is non-nil when the host permanently fail-stopped before this
+	// waiter's entry could commit and apply, so no outcome can ever arrive.
+	// The caller must surface it as a retryable failure and never read result.
+	err error
 }
 
 // KVApplier bridges the entry-aware StateMachine to the Host's single
@@ -53,7 +57,10 @@ func NewKVApplier(sm statemachine.StateMachine) *KVApplier {
 	}
 }
 
-var _ Applier = (*KVApplier)(nil)
+var (
+	_ Applier          = (*KVApplier)(nil)
+	_ FailStopNotifier = (*KVApplier)(nil)
+)
 
 // Apply satisfies Applier: it applies entry to the state machine, then
 // fulfills whichever waiter (if any) is registered for entry's log position.
@@ -108,6 +115,28 @@ func (a *KVApplier) removeFromIndexLocked(index, term uint64) {
 	delete(terms, term)
 	if len(terms) == 0 {
 		delete(a.byIndex, index)
+	}
+}
+
+// FailStop implements FailStopNotifier: it resolves every registered waiter
+// with err and empties both maps. The Host calls it exactly once, holding
+// Host.mu, when Ready processing fails and the host permanently fail-stops —
+// from that point nothing can ever commit or apply on this node, so every
+// waiter still registered (the failing proposal's own and any earlier ones
+// still awaiting quorum) would otherwise stay blocked forever. The drain is
+// exhaustive and final: waiters register only inside Host.Propose's
+// onProposed callback under Host.mu, and every Host entry point
+// short-circuits once stopped, so no waiter can appear after this runs.
+// A concurrent cancel (context expiry) is safe: whichever side removes the
+// waiter from the maps first delivers (or, for cancel, suppresses) its single
+// outcome, and the other finds nothing. Calling FailStop again is a no-op.
+func (a *KVApplier) FailStop(err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for key, ch := range a.waiters {
+		delete(a.waiters, key)
+		a.removeFromIndexLocked(key.index, key.term)
+		ch <- waiterOutcome{err: err}
 	}
 }
 

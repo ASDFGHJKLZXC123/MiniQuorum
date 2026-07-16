@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"miniquorum/internal/raft"
 	"miniquorum/internal/statemachine"
@@ -12,6 +14,8 @@ import (
 	"miniquorum/internal/storage"
 	raftpb "miniquorum/proto"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -417,6 +421,285 @@ type failingOnNormalSM struct {
 func (f *failingOnNormalSM) Apply(entry *raftpb.Entry) (statemachine.Result, error) {
 	if entry.GetType() == raftpb.EntryType_NORMAL {
 		return statemachine.Result{}, f.err
+	}
+	return f.StateMachine.Apply(entry)
+}
+
+// --- KVApplier + KVService: fail-stop drains EVERY outstanding waiter -------
+//
+// packet 2C correction (verifier finding, MEDIUM): a fail-stopping proposal
+// used to clean up only its own waiter. On a multi-node leader, an earlier
+// proposal still awaiting quorum stayed registered in both KVApplier maps
+// forever once the host fail-stopped — nothing could ever commit again, so
+// its Execute stayed blocked for as long as its context lived (forever, with
+// context.Background). The Host now notifies its Applier exactly once on the
+// stopped transition (FailStopNotifier), and KVApplier.FailStop resolves
+// every registered waiter with a retryable error. Save and Apply failures
+// funnel through that same single transition, which the two three-node
+// scenarios below exercise end to end.
+
+func TestKVApplierFailStopDrainsEveryWaiterExactlyOnce(t *testing.T) {
+	applier := NewKVApplier(mapsm.New())
+	chA := applier.register(2, 1)
+	chB := applier.register(3, 1)
+
+	failure := errors.New("fail-stop boom")
+	applier.FailStop(failure)
+
+	for name, ch := range map[string]<-chan waiterOutcome{"A": chA, "B": chB} {
+		select {
+		case outcome := <-ch:
+			if !errors.Is(outcome.err, failure) {
+				t.Fatalf("waiter %s outcome.err = %v, want the fail-stop error", name, outcome.err)
+			}
+		default:
+			t.Fatalf("waiter %s left unresolved by FailStop", name)
+		}
+	}
+	assertNoStrandedWaiters(t, applier)
+
+	// A second FailStop cannot happen (the stopped transition is unique) but
+	// must be harmless, as must a context cancel arriving after the drain.
+	applier.FailStop(failure)
+	applier.cancel(2, 1)
+	for name, ch := range map[string]<-chan waiterOutcome{"A": chA, "B": chB} {
+		select {
+		case outcome := <-ch:
+			t.Fatalf("waiter %s delivered a second outcome: %+v", name, outcome)
+		default:
+		}
+	}
+}
+
+// TestKVServiceExecuteFailStopDrainsEarlierOutstandingWaiterOnSaveFailure is
+// the multi-waiter regression itself: a real three-node leader has proposal A
+// registered and awaiting quorum (its AppendEntries are never acked) when a
+// later proposal B's Storage.Save fails. The host permanently fail-stops, so
+// A can never commit: both Execute calls — not only B's — must come back
+// retryable and both maps must empty, even though neither call's context ever
+// expires.
+func TestKVServiceExecuteFailStopDrainsEarlierOutstandingWaiterOnSaveFailure(t *testing.T) {
+	store := &armedFailStorage{inner: storage.NewMemStorage(), err: errors.New("save boom")}
+	applier := NewKVApplier(mapsm.New())
+	host := threeNodeLeaderHost(t, store, applier)
+	svc := NewKVService(host, applier, map[raft.NodeID]string{1: "n1:1", 2: "n2:1", 3: "n3:1"})
+
+	doneA := executeAsync(svc, &raftpb.Command{ClientId: 1, Seq: 1, Op: raftpb.Op_PUT, Key: []byte("a"), Value: []byte("va")})
+	waitForWaiterCount(t, applier, 1)
+	assertLeaderHintBarrier(t, host)
+	// A's Propose has fully drained its own Ready (registration, Save, and
+	// the leader hint all happen inside one host.mu critical section), so the
+	// next Save the host performs belongs to B's proposal. Arm the failure.
+	store.arm()
+
+	respB, errB := svc.Execute(context.Background(), &raftpb.ExecuteRequest{Cmd: &raftpb.Command{ClientId: 2, Seq: 1, Op: raftpb.Op_PUT, Key: []byte("b"), Value: []byte("vb")}})
+	assertUnavailable(t, executeResult{resp: respB, err: errB}, "B")
+
+	assertUnavailable(t, awaitExecute(t, doneA), "A")
+	assertNoStrandedWaiters(t, applier)
+
+	if err := host.Tick(); !errors.Is(err, host.stopped) || err == nil {
+		t.Fatalf("Tick() after fail-stop = %v, want the same fail-stop error", err)
+	}
+}
+
+// TestKVServiceExecuteFailStopDrainsOutstandingWaitersOnApplyFailure proves a
+// state-machine Apply failure rides the same drain. Proposals A, B, C are all
+// outstanding on a real three-node leader; the follower then acks the probe
+// and the suffix, committing indices 1..4 in one batch. The apply loop runs
+// NOOP, then A (applies for real and is fulfilled with its exact result),
+// then B — whose apply fails, fail-stopping the host with C never reached.
+// B and C must drain retryable while A's committed success is preserved.
+func TestKVServiceExecuteFailStopDrainsOutstandingWaitersOnApplyFailure(t *testing.T) {
+	sm := &failOnNthNormalSM{StateMachine: mapsm.New(), n: 2, err: errors.New("apply boom")}
+	applier := NewKVApplier(sm)
+	host := threeNodeLeaderHost(t, storage.NewMemStorage(), applier)
+	svc := NewKVService(host, applier, map[raft.NodeID]string{1: "n1:1", 2: "n2:1", 3: "n3:1"})
+
+	doneA := executeAsync(svc, &raftpb.Command{ClientId: 1, Seq: 1, Op: raftpb.Op_PUT, Key: []byte("a"), Value: []byte("va")})
+	waitForWaiterCount(t, applier, 1)
+	doneB := executeAsync(svc, &raftpb.Command{ClientId: 2, Seq: 1, Op: raftpb.Op_PUT, Key: []byte("b"), Value: []byte("vb")})
+	waitForWaiterCount(t, applier, 2)
+	doneC := executeAsync(svc, &raftpb.Command{ClientId: 3, Seq: 1, Op: raftpb.Op_PUT, Key: []byte("c"), Value: []byte("vc")})
+	waitForWaiterCount(t, applier, 3)
+	assertLeaderHintBarrier(t, host)
+
+	// Follower 2 acks the leader's initial probe (the in-flight request
+	// covering index 0), which releases the suffix request carrying entries
+	// 1..4: NOOP, A, B, C.
+	if err := host.Step(ackAppend(2, 1, 0)); err != nil {
+		t.Fatalf("Step(probe ack) error = %v", err)
+	}
+	// Acking that suffix gives index 4 a quorum (leader + follower 2), so the
+	// same Ready commits 1..4 and applies until B fails.
+	if err := host.Step(ackAppend(2, 1, 4)); err == nil {
+		t.Fatal("Step(suffix ack) error = nil, want the state-machine apply failure surfaced")
+	}
+
+	resultA := awaitExecute(t, doneA)
+	if resultA.err != nil || !resultA.resp.GetOk() || resultA.resp.GetNotLeader() != nil {
+		t.Fatalf("A Execute = (%+v, %v), want its exact committed-and-applied Ok result before the fail-stop", resultA.resp, resultA.err)
+	}
+	assertUnavailable(t, awaitExecute(t, doneB), "B")
+	assertUnavailable(t, awaitExecute(t, doneC), "C")
+	assertNoStrandedWaiters(t, applier)
+
+	if err := host.Tick(); !errors.Is(err, host.stopped) || err == nil {
+		t.Fatalf("Tick() after fail-stop = %v, want the same fail-stop error", err)
+	}
+}
+
+// threeNodeLeaderHost builds a {1,2,3} cluster host for node 1 and elects it
+// by granting node 2's vote. The term-start NOOP (index 1, term 1) and every
+// later proposal stay uncommitted until the test itself acks AppendEntries,
+// which is what lets a proposal sit registered "awaiting quorum".
+func threeNodeLeaderHost(t *testing.T, store storage.Storage, applier *KVApplier) *Host {
+	t.Helper()
+	node := raft.NewNode(raft.Config{ID: 1, Peers: []raft.NodeID{1, 2, 3}, ElectionTickMin: 1, ElectionTickMax: 2}, raft.InitialState{}, fixedTestRand{})
+	host := &Host{Node: node, Storage: store, Transport: noopTransport{}, Applier: applier, SelfID: 1}
+	if err := host.Tick(); err != nil { // election timeout -> candidate at term 1
+		t.Fatalf("Tick() (candidacy) error = %v", err)
+	}
+	if err := host.Step(&raftpb.Message{
+		From: 2, To: 1, Term: 1,
+		Body: &raftpb.Message_RequestVoteResp{RequestVoteResp: &raftpb.RequestVoteResp{Term: 1, VoteGranted: true}},
+	}); err != nil { // vote quorum (self + node 2) -> leader, NOOP appended
+		t.Fatalf("Step(vote grant) error = %v", err)
+	}
+	return host
+}
+
+func ackAppend(from, term, matchIndex uint64) *raftpb.Message {
+	return &raftpb.Message{
+		From: from, To: 1, Term: term,
+		Body: &raftpb.Message_AppendEntriesResp{AppendEntriesResp: &raftpb.AppendEntriesResp{
+			Term: term, Success: true, MatchIndex: matchIndex,
+		}},
+	}
+}
+
+type executeResult struct {
+	resp *raftpb.ExecuteResponse
+	err  error
+}
+
+// executeAsync runs one Execute with a context that never expires — exactly
+// the caller the fail-stop drain must be able to release — and reports its
+// result without asserting from the goroutine.
+func executeAsync(svc *KVService, cmd *raftpb.Command) <-chan executeResult {
+	done := make(chan executeResult, 1)
+	go func() {
+		resp, err := svc.Execute(context.Background(), &raftpb.ExecuteRequest{Cmd: cmd})
+		done <- executeResult{resp: resp, err: err}
+	}()
+	return done
+}
+
+func awaitExecute(t *testing.T, done <-chan executeResult) executeResult {
+	t.Helper()
+	select {
+	case result := <-done:
+		return result
+	case <-time.After(5 * time.Second):
+		t.Fatal("Execute call still blocked; fail-stop drain never released its waiter")
+		return executeResult{}
+	}
+}
+
+// waitForWaiterCount observes registrations made by concurrent Execute
+// goroutines; it only ever proceeds once the expected state is visible, so
+// test ordering never depends on scheduler timing.
+func waitForWaiterCount(t *testing.T, applier *KVApplier, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		applier.mu.Lock()
+		got := len(applier.waiters)
+		applier.mu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waiters = %d, want %d before deadline", got, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// assertLeaderHintBarrier doubles as a synchronization barrier: the hint is
+// recorded inside Propose's host.mu critical section (before the waiter
+// registers and the Ready drains), so once this acquires host.mu and reads
+// it, every Execute whose registration was already observed has fully
+// finished its Propose — including its Save — and is blocked on its channel.
+func assertLeaderHintBarrier(t *testing.T, host *Host) {
+	t.Helper()
+	if id, ok := host.LeaderHint(); !ok || id != 1 {
+		t.Fatalf("LeaderHint() = (%d,%v), want (1,true) after a successful leader Propose", id, ok)
+	}
+}
+
+func assertUnavailable(t *testing.T, result executeResult, who string) {
+	t.Helper()
+	if result.err == nil {
+		t.Fatalf("%s Execute error = nil (resp=%+v), want a retryable error after fail-stop", who, result.resp)
+	}
+	if status.Code(result.err) != codes.Unavailable {
+		t.Fatalf("%s Execute error = %v, want gRPC code Unavailable (mqctl retries it against another peer with the same client_id/seq)", who, result.err)
+	}
+}
+
+// armedFailStorage forwards to inner until armed, then fails every Save —
+// placing the failure on exactly the next proposal's Ready without hardcoding
+// how many Saves earlier host steps performed.
+type armedFailStorage struct {
+	inner storage.Storage
+	err   error
+
+	mu    sync.Mutex
+	armed bool
+}
+
+func (s *armedFailStorage) arm() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.armed = true
+}
+
+func (s *armedFailStorage) Save(hs *raft.HardState, entries []raftpb.Entry) error {
+	s.mu.Lock()
+	armed := s.armed
+	s.mu.Unlock()
+	if armed {
+		return s.err
+	}
+	return s.inner.Save(hs, entries)
+}
+
+func (s *armedFailStorage) HardState() (raft.HardState, error) { return s.inner.HardState() }
+func (s *armedFailStorage) Entries(lo, hi uint64) ([]raftpb.Entry, error) {
+	return s.inner.Entries(lo, hi)
+}
+func (s *armedFailStorage) FirstIndex() uint64 { return s.inner.FirstIndex() }
+func (s *armedFailStorage) LastIndex() uint64  { return s.inner.LastIndex() }
+
+// failOnNthNormalSM wraps a real StateMachine but fails the nth NORMAL apply
+// (1-based), letting NOOPs and every other client entry apply for real — so
+// one commit batch can fulfill an earlier proposal and then fail a later one.
+// Apply only ever runs on the single Ready-processing path (under Host.mu),
+// so the counter needs no lock of its own.
+type failOnNthNormalSM struct {
+	statemachine.StateMachine
+	n       int
+	applied int
+	err     error
+}
+
+func (f *failOnNthNormalSM) Apply(entry *raftpb.Entry) (statemachine.Result, error) {
+	if entry.GetType() == raftpb.EntryType_NORMAL {
+		f.applied++
+		if f.applied == f.n {
+			return statemachine.Result{}, f.err
+		}
 	}
 	return f.StateMachine.Apply(entry)
 }

@@ -16,6 +16,17 @@ type Applier interface {
 	Apply(*raftpb.Entry) error
 }
 
+// FailStopNotifier is optionally implemented by an Applier that must learn
+// when the host permanently fail-stops (a Ready batch's Storage.Save or
+// state-machine Apply failed). The Host notifies exactly once, on the
+// transition to stopped, while holding Host.mu — after it, no Ready will ever
+// be processed again, so anything still waiting on a commit or apply from
+// this node (e.g. KVApplier's registered waiters) can never be resolved by
+// normal means and must be released here.
+type FailStopNotifier interface {
+	FailStop(err error)
+}
+
 // Host coordinates a deterministic Raft node and its external dependencies.
 // raft.Node is not safe for concurrent use, and the real server drives it
 // from three sources (a tick timer, inbound transport messages, and KV
@@ -124,6 +135,13 @@ func (h *Host) recordLeaderHintLocked(id raft.NodeID) {
 func (h *Host) processReadyLocked() error {
 	if err := processReady(h.Node, h.Storage, h.Transport, h.Applier); err != nil {
 		h.stopped = err
+		// This is the sole stopped transition and it runs at most once: every
+		// entry point returns early while stopped, so processReadyLocked can
+		// never error again. Notifying under h.mu means no Propose (and thus
+		// no waiter registration) can interleave with the drain.
+		if notifier, ok := h.Applier.(FailStopNotifier); ok {
+			notifier.FailStop(err)
+		}
 		return err
 	}
 	return nil

@@ -71,3 +71,26 @@ now seeds a `math/rand/v2` PCG source from `crypto/rand` once at startup
 (`newProdRand` in `cmd/miniquorumd/main.go`) and fails startup explicitly if
 the crypto seed read fails, rather than silently falling back to a fixed or
 weak seed.
+
+## Fail-stop must drain every outstanding waiter, not just the failing one (Phase 2C correction)
+
+A fail-stopping proposal used to clean up only its own waiter: on a
+multi-node leader, an earlier proposal still awaiting quorum stayed
+registered in `KVApplier`'s maps forever once a later Ready's `Storage.Save`
+or `Apply` failed — the host never processes another Ready, so nothing could
+ever fulfill it, and its `Execute` stayed blocked for as long as its context
+lived (forever, with `context.Background`). The fix is a single server-side
+notification contract: `Host` invokes `FailStopNotifier.FailStop(err)` on its
+`Applier` exactly once, under `Host.mu`, at the stopped transition — the one
+point both `Save` and `Apply` errors funnel through — and
+`KVApplier.FailStop` resolves every registered waiter and empties both maps.
+The drain is exhaustive and final because waiters register only inside
+`Host.Propose`'s `onProposed` callback under `Host.mu`, and a stopped host
+short-circuits before `onProposed` can ever run again.
+
+Outcome choice (two wire-compatible options existed): drained waiters
+surface `codes.Unavailable "raft host stopped"` — the same shape the
+concurrently-failing `Execute` already returns — rather than a `NotLeader`
+response. A dead node is not "not the leader", and its hint may still name
+itself; an RPC error makes `mqctl` round-robin to another peer immediately,
+reusing the same `client_id`/`seq`, which dedup makes safe.

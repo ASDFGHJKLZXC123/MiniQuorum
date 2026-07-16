@@ -54,15 +54,11 @@ func (s *KVService) Execute(ctx context.Context, req *raftpb.ExecuteRequest) (*r
 		outcomeCh = s.applier.register(index, term)
 	})
 	if err != nil {
-		// onProposed only ever runs when isLeader, so a waiter exists to clean
-		// up exactly when isLeader is true. The Ready batch that failed to
-		// persist or apply never fulfilled it (a Storage.Save error aborts
-		// before any apply; a state-machine Apply error aborts before this
-		// entry — the highest index just appended — is ever reached), and the
-		// host is now fail-stopped, so nothing will ever fulfill it later.
-		if isLeader {
-			s.applier.cancel(index, term)
-		}
+		// A Propose error is always the fail-stop transition (a stopped host
+		// short-circuits with isLeader=false before onProposed can run), and
+		// that transition already drained every registered waiter — this
+		// call's own included — via KVApplier.FailStop. Nothing to clean up
+		// here; the buffered outcome this handler never reads is discarded.
 		return nil, status.Errorf(codes.Unavailable, "raft host stopped: %v", err)
 	}
 	if !isLeader {
@@ -71,6 +67,14 @@ func (s *KVService) Execute(ctx context.Context, req *raftpb.ExecuteRequest) (*r
 
 	select {
 	case outcome := <-outcomeCh:
+		if outcome.err != nil {
+			// The host fail-stopped (a later Ready's Save or Apply failed)
+			// before this entry could commit and apply. Same retryable shape
+			// as the Propose-error path above: mqctl treats any RPC error as
+			// a transport failure and retries against another peer with the
+			// unchanged (client_id, seq), which dedup makes safe.
+			return nil, status.Errorf(codes.Unavailable, "raft host stopped: %v", outcome.err)
+		}
 		if outcome.stale {
 			return s.notLeaderResponse(), nil
 		}
