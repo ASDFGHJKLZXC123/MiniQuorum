@@ -54,6 +54,15 @@ func (s *KVService) Execute(ctx context.Context, req *raftpb.ExecuteRequest) (*r
 		outcomeCh = s.applier.register(index, term)
 	})
 	if err != nil {
+		// onProposed only ever runs when isLeader, so a waiter exists to clean
+		// up exactly when isLeader is true. The Ready batch that failed to
+		// persist or apply never fulfilled it (a Storage.Save error aborts
+		// before any apply; a state-machine Apply error aborts before this
+		// entry — the highest index just appended — is ever reached), and the
+		// host is now fail-stopped, so nothing will ever fulfill it later.
+		if isLeader {
+			s.applier.cancel(index, term)
+		}
 		return nil, status.Errorf(codes.Unavailable, "raft host stopped: %v", err)
 	}
 	if !isLeader {

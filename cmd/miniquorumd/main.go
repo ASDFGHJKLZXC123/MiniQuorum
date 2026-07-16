@@ -141,8 +141,16 @@ type prodRand struct {
 // newProdRand seeds a prodRand from crypto/rand. Seed acquisition failure is
 // reported rather than silently falling back to a weak or fixed seed.
 func newProdRand() (*prodRand, error) {
+	return newProdRandFromEntropy(cryptorand.Read)
+}
+
+// newProdRandFromEntropy seeds a prodRand from 16 bytes produced by read
+// (crypto/rand.Read in production). The entropy source is injectable so
+// startup seeding and failure propagation can be tested deterministically,
+// rather than by asserting two crypto-seeded sequences never collide.
+func newProdRandFromEntropy(read func(b []byte) (int, error)) (*prodRand, error) {
 	var seed [16]byte
-	if _, err := cryptorand.Read(seed[:]); err != nil {
+	if _, err := read(seed[:]); err != nil {
 		return nil, fmt.Errorf("read crypto seed: %w", err)
 	}
 	s1 := binary.BigEndian.Uint64(seed[:8])

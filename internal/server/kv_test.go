@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"miniquorum/internal/raft"
+	"miniquorum/internal/statemachine"
 	"miniquorum/internal/statemachine/mapsm"
 	"miniquorum/internal/storage"
 	raftpb "miniquorum/proto"
@@ -302,6 +303,122 @@ func TestKVServiceExecutePutThenGetGoesThroughApply(t *testing.T) {
 	if !getResp.GetOk() || !getResp.GetFound() || string(getResp.GetValue()) != "v" {
 		t.Fatalf("Execute(get) = %+v, want ok found value=v", getResp)
 	}
+}
+
+// --- KVService: waiter cleanup on a fail-stopping Propose -------------------
+//
+// packet 2C correction: Execute registers a waiter before the Ready
+// containing its own entry is drained (see the register-before-drain
+// comment on KVApplier.register). If that Ready's Storage.Save or
+// state-machine Apply fails, Host.Propose returns an error and the host is
+// now permanently fail-stopped — nothing will ever fulfill that waiter. Both
+// tests below drive a single-node leader through Execute with a failure
+// injected on the Propose's own Ready, then assert the waiter maps are fully
+// drained and the fail-stop/Ready-ordering behavior is otherwise unchanged.
+
+// singleNodeLeaderHost builds a one-node cluster and ticks it into
+// leadership (electing itself and committing the term-start NOOP) before any
+// failure is injected, so the failure under test is isolated to the
+// Execute-triggered Propose's own Ready rather than the election's.
+func singleNodeLeaderHost(t *testing.T, store storage.Storage, applier *KVApplier) *Host {
+	t.Helper()
+	node := raft.NewNode(raft.Config{ID: 1, Peers: []raft.NodeID{1}, ElectionTickMin: 1, ElectionTickMax: 2}, raft.InitialState{}, fixedTestRand{})
+	host := &Host{Node: node, Storage: store, Transport: noopTransport{}, Applier: applier, SelfID: 1}
+	if err := host.Tick(); err != nil { // election timeout -> immediate single-node leadership + NOOP commit
+		t.Fatalf("Tick() (election) error = %v", err)
+	}
+	return host
+}
+
+func TestKVServiceExecuteCancelsWaiterWhenProposeReadySaveFails(t *testing.T) {
+	store := &failAfterNSavesStorage{inner: storage.NewMemStorage(), okSaves: 1, err: errors.New("save boom")}
+	applier := NewKVApplier(mapsm.New())
+	host := singleNodeLeaderHost(t, store, applier)
+	svc := NewKVService(host, applier, map[raft.NodeID]string{1: "n1:1"})
+
+	_, err := svc.Execute(context.Background(), &raftpb.ExecuteRequest{Cmd: &raftpb.Command{ClientId: 1, Seq: 1, Op: raftpb.Op_PUT, Key: []byte("k"), Value: []byte("v")}})
+	if err == nil {
+		t.Fatal("Execute() error = nil, want the storage save failure surfaced")
+	}
+	assertNoStrandedWaiters(t, applier)
+
+	// Fail-stop must still hold: the host must not be touched again, and the
+	// Ready-processing order (Save before anything else) must be unchanged.
+	savesAfterFailure := store.saves
+	if err := host.Tick(); !errors.Is(err, host.stopped) || err == nil {
+		t.Fatalf("Tick() after fail-stop = %v, want the same fail-stop error", err)
+	}
+	if store.saves != savesAfterFailure {
+		t.Fatalf("storage saves after fail-stopped Tick = %d, want still %d (node must not be touched again)", store.saves, savesAfterFailure)
+	}
+}
+
+func TestKVServiceExecuteCancelsWaiterWhenProposeReadyApplyFails(t *testing.T) {
+	applier := NewKVApplier(&failingOnNormalSM{StateMachine: mapsm.New(), err: errors.New("apply boom")})
+	host := singleNodeLeaderHost(t, storage.NewMemStorage(), applier)
+	svc := NewKVService(host, applier, map[raft.NodeID]string{1: "n1:1"})
+
+	_, err := svc.Execute(context.Background(), &raftpb.ExecuteRequest{Cmd: &raftpb.Command{ClientId: 1, Seq: 1, Op: raftpb.Op_PUT, Key: []byte("k"), Value: []byte("v")}})
+	if err == nil {
+		t.Fatal("Execute() error = nil, want the state-machine apply failure surfaced")
+	}
+	assertNoStrandedWaiters(t, applier)
+
+	if err := host.Tick(); !errors.Is(err, host.stopped) || err == nil {
+		t.Fatalf("Tick() after fail-stop = %v, want the same fail-stop error", err)
+	}
+}
+
+func assertNoStrandedWaiters(t *testing.T, applier *KVApplier) {
+	t.Helper()
+	applier.mu.Lock()
+	defer applier.mu.Unlock()
+	if len(applier.waiters) != 0 {
+		t.Fatalf("waiters not cleaned up after a fail-stopping Propose: %v", applier.waiters)
+	}
+	if len(applier.byIndex) != 0 {
+		t.Fatalf("byIndex not cleaned up after a fail-stopping Propose: %v", applier.byIndex)
+	}
+}
+
+// failAfterNSavesStorage lets the first okSaves calls through to inner, then
+// fails every subsequent Save — isolating the failure to a specific Ready
+// (here, the Execute-triggered Propose's Ready, not the prior election's).
+type failAfterNSavesStorage struct {
+	inner   storage.Storage
+	okSaves int
+	saves   int
+	err     error
+}
+
+func (s *failAfterNSavesStorage) Save(hs *raft.HardState, entries []raftpb.Entry) error {
+	s.saves++
+	if s.saves > s.okSaves {
+		return s.err
+	}
+	return s.inner.Save(hs, entries)
+}
+
+func (s *failAfterNSavesStorage) HardState() (raft.HardState, error) { return s.inner.HardState() }
+func (s *failAfterNSavesStorage) Entries(lo, hi uint64) ([]raftpb.Entry, error) {
+	return s.inner.Entries(lo, hi)
+}
+func (s *failAfterNSavesStorage) FirstIndex() uint64 { return s.inner.FirstIndex() }
+func (s *failAfterNSavesStorage) LastIndex() uint64  { return s.inner.LastIndex() }
+
+// failingOnNormalSM wraps a real StateMachine but fails Apply for NORMAL
+// entries, while letting NOOP entries (the election's term-start no-op)
+// succeed normally — isolating the failure to the client command under test.
+type failingOnNormalSM struct {
+	statemachine.StateMachine
+	err error
+}
+
+func (f *failingOnNormalSM) Apply(entry *raftpb.Entry) (statemachine.Result, error) {
+	if entry.GetType() == raftpb.EntryType_NORMAL {
+		return statemachine.Result{}, f.err
+	}
+	return f.StateMachine.Apply(entry)
 }
 
 // --- Host: mutex-serialized fail-stop --------------------------------------

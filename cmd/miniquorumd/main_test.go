@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 
@@ -14,19 +15,53 @@ func TestPeerIDsAreSorted(t *testing.T) {
 	}
 }
 
-// TestNewProdRandProducesIndependentSequences guards against the
-// synchronized-jitter failure this Rand replaces: two independently seeded
-// instances (standing in for two real processes) must not draw the same
-// sequence. A probabilistic false failure is astronomically unlikely (each
-// draw is one of 1000 values), so this is not a flaky assertion.
-func TestNewProdRandProducesIndependentSequences(t *testing.T) {
-	a, err := newProdRand()
-	if err != nil {
-		t.Fatalf("newProdRand() error = %v", err)
+// fixedEntropy returns an entropy-read func that fills every requested byte
+// slice with a repeated pattern byte, so two calls with different patterns
+// are guaranteed (not merely overwhelmingly likely) to seed different PCG
+// states.
+func fixedEntropy(pattern byte) func([]byte) (int, error) {
+	return func(b []byte) (int, error) {
+		for i := range b {
+			b[i] = pattern
+		}
+		return len(b), nil
 	}
-	b, err := newProdRand()
+}
+
+// TestNewProdRandFromEntropySameSeedIsDeterministic pins that seeding is a
+// pure function of the entropy bytes: replaying the same bytes must replay
+// the same draw sequence.
+func TestNewProdRandFromEntropySameSeedIsDeterministic(t *testing.T) {
+	a, err := newProdRandFromEntropy(fixedEntropy(0x11))
 	if err != nil {
-		t.Fatalf("newProdRand() error = %v", err)
+		t.Fatalf("newProdRandFromEntropy() error = %v", err)
+	}
+	b, err := newProdRandFromEntropy(fixedEntropy(0x11))
+	if err != nil {
+		t.Fatalf("newProdRandFromEntropy() error = %v", err)
+	}
+
+	for i := 0; i < 8; i++ {
+		if va, vb := a.IntN(1000), b.IntN(1000); va != vb {
+			t.Fatalf("draw %d: got %d and %d from identical seed bytes, want equal", i, va, vb)
+		}
+	}
+}
+
+// TestNewProdRandFromEntropyDistinctSeedsProduceDistinctSequences guards
+// against the synchronized-jitter failure this Rand replaces: two
+// independently seeded instances (standing in for two real processes) must
+// not draw the same sequence. Unlike comparing two crypto-seeded instances,
+// the two seeds here are explicitly constructed to differ, so this is a
+// deterministic assertion, not a probabilistic one.
+func TestNewProdRandFromEntropyDistinctSeedsProduceDistinctSequences(t *testing.T) {
+	a, err := newProdRandFromEntropy(fixedEntropy(0x11))
+	if err != nil {
+		t.Fatalf("newProdRandFromEntropy() error = %v", err)
+	}
+	b, err := newProdRandFromEntropy(fixedEntropy(0x22))
+	if err != nil {
+		t.Fatalf("newProdRandFromEntropy() error = %v", err)
 	}
 
 	var seqA, seqB [8]int
@@ -35,7 +70,27 @@ func TestNewProdRandProducesIndependentSequences(t *testing.T) {
 		seqB[i] = b.IntN(1000)
 	}
 	if seqA == seqB {
-		t.Fatalf("two independently crypto-seeded prodRand instances produced the same sequence %v; jitter would synchronize across real processes", seqA)
+		t.Fatalf("two distinctly seeded prodRand instances produced the same sequence %v; jitter would synchronize across real processes", seqA)
+	}
+}
+
+// TestNewProdRandFromEntropyPropagatesReadError pins the explicit startup
+// failure requirement: if entropy acquisition fails, seeding must fail
+// rather than silently falling back to a weak or fixed seed.
+func TestNewProdRandFromEntropyPropagatesReadError(t *testing.T) {
+	wantErr := errors.New("entropy source exhausted")
+	if _, err := newProdRandFromEntropy(func([]byte) (int, error) { return 0, wantErr }); !errors.Is(err, wantErr) {
+		t.Fatalf("newProdRandFromEntropy() error = %v, want it to wrap %v", err, wantErr)
+	}
+}
+
+// TestNewProdRandUsesRealCryptoRand is the one place production wiring is
+// exercised end-to-end: newProdRand must succeed using the real crypto/rand
+// source. It asserts success only, never a sequence, so it carries no
+// collision risk.
+func TestNewProdRandUsesRealCryptoRand(t *testing.T) {
+	if _, err := newProdRand(); err != nil {
+		t.Fatalf("newProdRand() error = %v", err)
 	}
 }
 
