@@ -2,6 +2,13 @@
 
 Phase 0 establishes the deterministic Raft boundary and its enforcement test.
 
+## Unbounded client deduplication (Phase 2)
+
+The map state machine retains one cached result and highest sequence number per
+client ID indefinitely. Session expiry is deliberately out of scope, so this
+deduplication table grows without bound; it is the accepted Phase 2 trade-off
+that preserves safe retry semantics across leader changes.
+
 ## Disruptive rejoin without PreVote (Phase 1)
 
 Seed 505 elects a leader, then isolates a follower as a one-node minority. The
