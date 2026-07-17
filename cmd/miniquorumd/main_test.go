@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"miniquorum/internal/raft"
+	raftpb "miniquorum/proto"
 )
 
 func TestPeerIDsAreSorted(t *testing.T) {
@@ -110,3 +111,33 @@ func TestProdRandIntNStaysInBounds(t *testing.T) {
 }
 
 var _ raft.Rand = (*prodRand)(nil)
+
+func TestOpenDataDirCreatesAndRecoversDiskLog(t *testing.T) {
+	dir := t.TempDir() + "/node-1/raft"
+	store, err := openDataDir(dir)
+	if err != nil {
+		t.Fatalf("openDataDir() error = %v", err)
+	}
+	hard := raft.HardState{Term: 4, VotedFor: 2}
+	entries := []raftpb.Entry{{Index: 1, Term: 4, Type: raftpb.EntryType_NOOP}}
+	if err := store.Save(&hard, entries); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	reopened, err := openDataDir(dir)
+	if err != nil {
+		t.Fatalf("openDataDir(reopen) error = %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+	gotHard, err := reopened.HardState()
+	if err != nil || gotHard != hard {
+		t.Fatalf("HardState() = %+v, %v, want %+v, nil", gotHard, err, hard)
+	}
+	gotEntries, err := reopened.Entries(1, 2)
+	if err != nil || len(gotEntries) != 1 || gotEntries[0].Index != 1 || gotEntries[0].Term != 4 {
+		t.Fatalf("Entries(1,2) = %+v, %v, want recovered index 1 term 4", gotEntries, err)
+	}
+}

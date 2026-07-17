@@ -22,7 +22,7 @@ import (
 	"miniquorum/internal/raft"
 	"miniquorum/internal/server"
 	"miniquorum/internal/statemachine/mapsm"
-	"miniquorum/internal/storage"
+	"miniquorum/internal/storage/disklog"
 	transportgrpc "miniquorum/internal/transport/grpc"
 	raftpb "miniquorum/proto"
 )
@@ -33,7 +33,7 @@ func main() {
 	var dataDir string
 	flag.Uint64Var(&id, "id", 0, "this node ID")
 	flag.StringVar(&peersFlag, "peers", "", "comma-separated id=address peers")
-	flag.StringVar(&dataDir, "data-dir", "", "data directory (disk storage starts in Phase 3)")
+	flag.StringVar(&dataDir, "data-dir", "", "directory for this node's durable Raft log")
 	flag.Parse()
 	if id == 0 {
 		log.Print("--id is required")
@@ -49,14 +49,32 @@ func main() {
 		log.Printf("--peers must include this node ID %d", id)
 		return
 	}
+	if dataDir == "" {
+		log.Print("--data-dir is required")
+		return
+	}
+	store, err := openDataDir(dataDir)
+	if err != nil {
+		log.Printf("open --data-dir: %v", err)
+		return
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			log.Printf("close data-dir: %v", err)
+		}
+	}()
 
 	rnd, err := newProdRand()
 	if err != nil {
 		log.Printf("seed election jitter rand: %v", err)
 		return
 	}
-	node := raft.NewNode(raft.Config{ID: raft.NodeID(id), Peers: peerIDs(peers)}, raft.InitialState{}, rnd)
-	host := &server.Host{Node: node, Storage: storage.NewMemStorage(), SelfID: raft.NodeID(id)}
+	node, err := server.NewRecoveredNode(raft.Config{ID: raft.NodeID(id), Peers: peerIDs(peers)}, store, rnd)
+	if err != nil {
+		log.Printf("recover node: %v", err)
+		return
+	}
+	host := &server.Host{Node: node, Storage: store, SelfID: raft.NodeID(id)}
 	transport := transportgrpc.New(peers, func(m *raftpb.Message) {
 		if err := host.Step(m); err != nil {
 			log.Printf("miniquorumd node=%d fail-stop (step): %v", id, err)
@@ -99,6 +117,20 @@ func main() {
 			log.Printf("miniquorumd node=%d tick", id)
 		}
 	}
+}
+
+func openDataDir(path string) (*disklog.DiskLog, error) {
+	if path == "" {
+		return nil, fmt.Errorf("data directory is empty")
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return nil, fmt.Errorf("create %s: %w", path, err)
+	}
+	store, err := disklog.Open(path, disklog.Options{})
+	if err != nil {
+		return nil, fmt.Errorf("open disklog in %s: %w", path, err)
+	}
+	return store, nil
 }
 
 func parsePeers(value string) (map[raft.NodeID]string, error) {
