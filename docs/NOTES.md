@@ -115,3 +115,28 @@ on one file. The single physical rewrite in the package is recovery's
 torn-tail handling, which truncates the final segment at the first bad tail
 record so discarded bytes cannot resurface as mid-log corruption after
 appends resume.
+
+## Disklog recovery must re-establish durability, not assume it (Phase 3A)
+
+What the paper doesn't tell you: bytes that read back after a restart are
+not evidence they are on stable media. A process that wrote a batch and then
+failed its fsync fail-stops — but its in-memory poison dies with it, and the
+complete frames it wrote may sit in the page cache, readable by the next
+process yet gone after a power cut. The same holds for a segment name whose
+creation-time directory fsync failed. Meanwhile recovered state drives
+responses without any further `Save`: a follower re-answers a repeated
+`RequestVote` from its recovered `VotedFor` with no new `HardState`, and
+`Save(nil, nil)` persists nothing — so nothing downstream will sync on the
+recovered state's behalf. `Open` therefore syncs every segment file and then
+the directory before it returns, and fails if it cannot; normal Saves keep
+one Ready = one Save = one batch = one sync.
+
+Related recovery subtlety: a record's own length header cannot be trusted to
+decide torn-tail versus mid-log corruption. An upward-corrupted middle
+length claims the rest of the file and masquerades as a torn tail (silently
+discarding intact synced records after it); a downward-corrupted final
+length leaves trailing payload bytes that look like data "after" a bad
+record. Recovery classifies by evidence instead: a failed record in the
+final segment is a torn tail only if no complete, CRC-valid record starts at
+any byte offset after its header — otherwise the damage is mid-log and
+startup refuses with `ErrCorrupt`.

@@ -98,6 +98,20 @@ func flipByte(t *testing.T, path string, offset int) {
 	}
 }
 
+// patchUint32 overwrites the little-endian uint32 at offset — pointed at a
+// frame's first header field, it corrupts that record's length in place.
+func patchUint32(t *testing.T, path string, offset int, value uint32) {
+	t.Helper()
+	buf, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error: %v", path, err)
+	}
+	binary.LittleEndian.PutUint32(buf[offset:], value)
+	if err := os.WriteFile(path, buf, 0o644); err != nil {
+		t.Fatalf("WriteFile(%s) error: %v", path, err)
+	}
+}
+
 func appendBytes(t *testing.T, path string, data []byte) {
 	t.Helper()
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
@@ -610,6 +624,112 @@ func TestMidLogCorruptionRefusesStartup(t *testing.T) {
 	})
 }
 
+func TestLengthHeaderCorruption(t *testing.T) {
+	// Three single-entry batches in one segment, one entries frame each. The
+	// length header under test belongs to frames[1] (a middle record, with an
+	// intact record after it) or frames[2] (the true final record). A length
+	// header can lie in either direction, and neither lie may be believed:
+	// an upward-corrupted middle length claims bytes through the end of the
+	// file and must not masquerade as a torn tail (that would silently
+	// discard the intact records after it), while a downward-corrupted final
+	// length leaves trailing bytes that must not read as mid-log corruption
+	// (nothing intact follows, so it is the log's damaged tail).
+	build := func(t *testing.T) (dir, seg string, frames []frameInfo) {
+		t.Helper()
+		dir = t.TempDir()
+		l := mustOpen(t, dir, Options{})
+		mustSave(t, l, nil, makeEntries(1, 1, "alpha"))
+		mustSave(t, l, nil, makeEntries(2, 1, "beta"))
+		mustSave(t, l, nil, makeEntries(3, 1, "gamma"))
+		if err := l.Close(); err != nil {
+			t.Fatalf("Close() error: %v", err)
+		}
+		seg = filepath.Join(dir, "000001.seg")
+		frames = scanFrames(t, seg)
+		if len(frames) != 3 {
+			t.Fatalf("frames = %d, want 3", len(frames))
+		}
+		return dir, seg, frames
+	}
+
+	t.Run("middle length corrupted past end of file", func(t *testing.T) {
+		dir, seg, frames := build(t)
+		patchUint32(t, seg, frames[1].offset, uint32(fileSize(t, seg)))
+		_, err := Open(dir, Options{})
+		if !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "intact record") {
+			t.Fatalf("Open() error = %v, want ErrCorrupt naming the intact record after the damage", err)
+		}
+	})
+	t.Run("middle length corrupted to claim exactly the rest of the file", func(t *testing.T) {
+		dir, seg, frames := build(t)
+		rest := int(fileSize(t, seg)) - frames[1].offset - frameHeaderSize
+		patchUint32(t, seg, frames[1].offset, uint32(rest))
+		_, err := Open(dir, Options{})
+		if !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("Open() error = %v, want ErrCorrupt", err)
+		}
+	})
+	t.Run("middle length corrupted within the file", func(t *testing.T) {
+		dir, seg, frames := build(t)
+		payloadLen := frames[1].length - frameHeaderSize
+		patchUint32(t, seg, frames[1].offset, uint32(payloadLen+3)) // swallows part of frame 2's header
+		_, err := Open(dir, Options{})
+		if !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("Open() error = %v, want ErrCorrupt", err)
+		}
+	})
+	t.Run("length corrupted in a non-final segment", func(t *testing.T) {
+		dir := t.TempDir()
+		l := mustOpen(t, dir, Options{RotateSize: 1})
+		mustSave(t, l, nil, makeEntries(1, 1, "a"))
+		mustSave(t, l, nil, makeEntries(2, 1, "b"))
+		if err := l.Close(); err != nil {
+			t.Fatalf("Close() error: %v", err)
+		}
+		seg := filepath.Join(dir, "000001.seg")
+		patchUint32(t, seg, 0, uint32(fileSize(t, seg)+50))
+		_, err := Open(dir, Options{RotateSize: 1})
+		if !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "000001.seg") {
+			t.Fatalf("Open() error = %v, want ErrCorrupt in 000001.seg", err)
+		}
+	})
+
+	// The final record's length corrupted: whatever the direction, nothing
+	// intact follows it, so it is dropped as the log's damaged tail — the
+	// file is truncated at its offset, earlier records survive, and the log
+	// accepts appends again.
+	checkTailDropped := func(t *testing.T, dir, seg string, frames []frameInfo) {
+		t.Helper()
+		l := mustOpen(t, dir, Options{})
+		want := append(makeEntries(1, 1, "alpha"), makeEntries(2, 1, "beta")...)
+		assertState(t, l, raft.HardState{}, want)
+		if size := fileSize(t, seg); size != int64(frames[2].offset) {
+			t.Fatalf("segment size after recovery = %d, want %d", size, frames[2].offset)
+		}
+		mustSave(t, l, nil, makeEntries(3, 2, "replacement"))
+		if err := l.Close(); err != nil {
+			t.Fatalf("Close() error: %v", err)
+		}
+		assertState(t, mustOpen(t, dir, Options{}), raft.HardState{}, append(want, makeEntries(3, 2, "replacement")...))
+	}
+	t.Run("final length corrupted downward", func(t *testing.T) {
+		dir, seg, frames := build(t)
+		payloadLen := frames[2].length - frameHeaderSize
+		patchUint32(t, seg, frames[2].offset, uint32(payloadLen-2))
+		checkTailDropped(t, dir, seg, frames)
+	})
+	t.Run("final length corrupted to zero", func(t *testing.T) {
+		dir, seg, frames := build(t)
+		patchUint32(t, seg, frames[2].offset, 0)
+		checkTailDropped(t, dir, seg, frames)
+	})
+	t.Run("final length corrupted past end of file", func(t *testing.T) {
+		dir, seg, frames := build(t)
+		patchUint32(t, seg, frames[2].offset, uint32(frames[2].length+100))
+		checkTailDropped(t, dir, seg, frames)
+	})
+}
+
 func TestSemanticallyInvalidRecordRefused(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -731,8 +851,27 @@ func TestDirectorySyncFailpoint(t *testing.T) {
 			t.Fatalf("Close() error: %v", err)
 		}
 		// The half-rotated dir (000002.seg created, sync unreported) is a
-		// crash-equivalent state: recovery accepts the empty final segment.
-		assertState(t, mustOpen(t, dir, Options{}), raft.HardState{}, makeEntries(1, 1, "a"))
+		// crash-equivalent state, but the segment's name was never made
+		// durable and later Saves sync only the file. Recovery may accept
+		// the half-rotation only by retrying the directory sync itself —
+		// and must refuse to open while it still cannot.
+		if _, err := Open(dir, Options{syncDir: func(*os.File) error { return boom }}); !errors.Is(err, boom) || !strings.Contains(err.Error(), "recovery sync dir") {
+			t.Fatalf("Open() with still-failing dir sync error = %v, want recovery dir-sync boom", err)
+		}
+		var dirSyncs int
+		reopened, err := Open(dir, Options{syncDir: func(f *os.File) error { dirSyncs++; return f.Sync() }})
+		if err != nil {
+			t.Fatalf("Open() error: %v", err)
+		}
+		defer func() { _ = reopened.Close() }()
+		if dirSyncs != 1 {
+			t.Fatalf("dirSyncs during recovery = %d, want 1", dirSyncs)
+		}
+		assertState(t, reopened, raft.HardState{}, makeEntries(1, 1, "a"))
+		// The recovered half-rotation is durable end to end; the empty
+		// final segment accepts appends as usual.
+		mustSave(t, reopened, nil, makeEntries(2, 1, "b"))
+		assertState(t, reopened, raft.HardState{}, makeEntries(1, 1, "a", "b"))
 	})
 }
 
@@ -762,9 +901,73 @@ func TestFileSyncFailurePoisons(t *testing.T) {
 	if err := l.Close(); err != nil {
 		t.Fatalf("Close() error: %v", err)
 	}
-	// The unreported-sync bytes were in fact written whole, so a reopen —
-	// like a restart after the fail-stop — recovers both batches intact.
-	assertState(t, mustOpen(t, dir, Options{}), raft.HardState{}, append(makeEntries(1, 1, "a"), makeEntries(2, 1, "b")...))
+
+	// The poison dies with the process, and the failed batch's bytes —
+	// written whole, sync unreported — may sit only in the page cache:
+	// readable, but not durable. Recovery may serve them solely because it
+	// syncs them first; recovered state drives responses (a re-granted vote
+	// carries no new HardState to Save), so accepting surviving frames
+	// without establishing their durability would let a later crash forget
+	// an already-acknowledged vote or entry.
+	t.Run("reopen establishes durability before serving", func(t *testing.T) {
+		var fileSyncs, dirSyncs int
+		reopened, err := Open(dir, Options{
+			syncFile: func(f *os.File) error { fileSyncs++; return f.Sync() },
+			syncDir:  func(f *os.File) error { dirSyncs++; return f.Sync() },
+		})
+		if err != nil {
+			t.Fatalf("Open() error: %v", err)
+		}
+		defer func() { _ = reopened.Close() }()
+		if fileSyncs != 1 || dirSyncs != 1 {
+			t.Fatalf("recovery syncs = %d file, %d dir, want 1 file (the lone segment), 1 dir", fileSyncs, dirSyncs)
+		}
+		assertState(t, reopened, raft.HardState{}, append(makeEntries(1, 1, "a"), makeEntries(2, 1, "b")...))
+	})
+	t.Run("reopen fails when recovery cannot sync the segment", func(t *testing.T) {
+		_, err := Open(dir, Options{syncFile: func(*os.File) error { return boom }})
+		if !errors.Is(err, boom) || !strings.Contains(err.Error(), "recovery sync") {
+			t.Fatalf("Open() error = %v, want recovery-sync boom", err)
+		}
+	})
+	t.Run("reopen fails when recovery cannot sync the directory", func(t *testing.T) {
+		_, err := Open(dir, Options{syncDir: func(*os.File) error { return boom }})
+		if !errors.Is(err, boom) || !strings.Contains(err.Error(), "recovery sync dir") {
+			t.Fatalf("Open() error = %v, want recovery dir-sync boom", err)
+		}
+	})
+}
+
+func TestRecoverySyncsEverySegmentAndDirectory(t *testing.T) {
+	// Open after a restart cannot know which surviving bytes and names were
+	// ever synced, so before serving it must sync every segment file and
+	// then the directory — after which ordinary Saves resume their
+	// one-sync-per-Save contract.
+	dir := t.TempDir()
+	l := mustOpen(t, dir, Options{RotateSize: 1})
+	mustSave(t, l, nil, makeEntries(1, 1, "a"))
+	mustSave(t, l, nil, makeEntries(2, 1, "b"))
+	mustSave(t, l, nil, makeEntries(3, 1, "c")) // three segments
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close() error: %v", err)
+	}
+	var fileSyncs, dirSyncs int
+	reopened, err := Open(dir, Options{
+		RotateSize: 1,
+		syncFile:   func(f *os.File) error { fileSyncs++; return f.Sync() },
+		syncDir:    func(f *os.File) error { dirSyncs++; return f.Sync() },
+	})
+	if err != nil {
+		t.Fatalf("Open() error: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	if fileSyncs != 3 || dirSyncs != 1 {
+		t.Fatalf("recovery syncs = %d file, %d dir, want 3 file (one per segment), 1 dir", fileSyncs, dirSyncs)
+	}
+	mustSave(t, reopened, nil, makeEntries(4, 1, "d")) // rotates, then one batch sync
+	if fileSyncs != 4 {
+		t.Fatalf("fileSyncs after one post-recovery Save = %d, want 4", fileSyncs)
+	}
 }
 
 func TestNonContiguousAppendRejected(t *testing.T) {

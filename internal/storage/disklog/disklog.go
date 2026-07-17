@@ -23,7 +23,11 @@
 // segment (fresh Open, every rotation) also syncs the directory so the new
 // name itself survives a crash. Recovery scans segments in order, verifies
 // every CRC, and rebuilds the hard state and entry sequence in an in-memory
-// mirror that serves all reads.
+// mirror that serves all reads; before Open returns it syncs every segment
+// file and then the directory, because bytes and names that merely read back
+// are not evidence of durability — a previous process may have died between
+// write and sync — and recovered state can drive responses (a re-granted
+// vote arrives with no new HardState to Save), so it must be durable first.
 package disklog
 
 import (
@@ -73,9 +77,10 @@ type Options struct {
 	// segment.
 	RotateSize int64
 
-	// syncFile and syncDir are in-package test seams for the two durability
-	// points: the segment sync ending every Save and the directory sync
-	// after every segment creation. Nil selects (*os.File).Sync.
+	// syncFile and syncDir are in-package test seams for the durability
+	// points: the segment sync ending every Save, the directory sync after
+	// every segment creation, and the recovery syncs Open performs before it
+	// serves anything. Nil selects (*os.File).Sync.
 	syncFile func(*os.File) error
 	syncDir  func(*os.File) error
 }
@@ -143,6 +148,9 @@ func Open(dir string, opts Options) (*DiskLog, error) {
 		}
 	}
 	if err != nil {
+		if l.active != nil {
+			_ = l.active.Close()
+		}
 		_ = dirFile.Close()
 		return nil, err
 	}
@@ -286,8 +294,22 @@ func (l *DiskLog) createSegment(seq uint64) (*os.File, error) {
 	return f, nil
 }
 
-// recover replays every segment into the mirror and reopens the last one for
-// appending.
+// recover replays every segment into the mirror, reopens the last one for
+// appending, and then — before the log serves anything — makes everything it
+// recovered durable: it syncs every segment file and then the directory,
+// exactly as if it had just written each byte and name itself.
+//
+// The recovery syncs are load-bearing. Bytes and names that read back are not
+// evidence of durability: a previous process may have written a batch and
+// fail-stopped on a failed sync (its Save error and poison die with it), or
+// crashed between write and sync, leaving complete frames only in the page
+// cache; a previous rotation may have created a segment and failed the
+// directory sync, leaving a name no one ever made durable. Recovered state
+// drives responses without any further Save — a follower re-answers a
+// repeated RequestVote from its recovered VotedFor with no new HardState, and
+// Save(nil, nil) persists nothing — so Open is the last point where
+// durability can be established before something depends on it. If a sync
+// fails here, Open fails; serving unverified state is exactly the bug.
 func (l *DiskLog) recover(seqs []uint64) error {
 	for i, seq := range seqs {
 		if err := l.replaySegment(seq, i == len(seqs)-1); err != nil {
@@ -305,15 +327,56 @@ func (l *DiskLog) recover(seqs []uint64) error {
 		return fmt.Errorf("disklog: stat %s: %w", segmentName(last), err)
 	}
 	l.active, l.activeSeq, l.activeSize = f, last, info.Size()
+	for _, seq := range seqs[:len(seqs)-1] {
+		if err := l.syncSegment(seq); err != nil {
+			return err
+		}
+	}
+	if err := l.syncFile(l.active); err != nil {
+		return fmt.Errorf("disklog: recovery sync %s: %w", segmentName(last), err)
+	}
+	if err := l.syncDir(l.dir); err != nil {
+		return fmt.Errorf("disklog: recovery sync dir: %w", err)
+	}
+	return nil
+}
+
+// syncSegment opens one closed segment just long enough to sync it.
+func (l *DiskLog) syncSegment(seq uint64) error {
+	f, err := os.OpenFile(l.segmentPath(seq), os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("disklog: open %s for recovery sync: %w", segmentName(seq), err)
+	}
+	if err := l.syncFile(f); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("disklog: recovery sync %s: %w", segmentName(seq), err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("disklog: close %s after recovery sync: %w", segmentName(seq), err)
+	}
 	return nil
 }
 
 // replaySegment applies each record of one segment to the mirror. A record
-// that does not read back whole is discarded as a torn tail — and recovery
-// succeeds — only when it is provably the last record of the log: in the
-// final segment with nothing after its frame. Anything else is corruption:
-// synced records are never torn, so a bad record with more log after it
-// cannot come from a crash.
+// that does not read back whole must be classified before recovery may
+// continue:
+//
+//   - In a non-final segment it is corruption outright. Rotation happens only
+//     after every byte of the previous segment was synced, so a rotated
+//     segment can never hold a torn tail.
+//   - In the final segment it is the log's torn tail — recovery physically
+//     truncates it and succeeds — only when nothing after it reads back as a
+//     complete, CRC-valid record. A tear takes a suffix of the file, so an
+//     intact record after the failure is proof the damage sits mid-log:
+//     refusing to start is the only safe answer, because truncating there
+//     would silently discard synced, possibly acknowledged, records.
+//
+// The classification must not trust the failed record's own length header.
+// An upward-corrupted length in a middle record claims bytes through the end
+// of the file and would masquerade as a torn tail, while a downward-corrupted
+// length in the true final record leaves trailing bytes that would read as
+// data "after" it; nextValidFrame scans for evidence instead of believing
+// either.
 func (l *DiskLog) replaySegment(seq uint64, final bool) error {
 	path := l.segmentPath(seq)
 	buf, err := os.ReadFile(path)
@@ -322,43 +385,84 @@ func (l *DiskLog) replaySegment(seq uint64, final bool) error {
 	}
 	offset := 0
 	for offset < len(buf) {
-		rest := buf[offset:]
-		frameLen := len(rest) // a short frame claims the remaining bytes
-		reason := ""
-		if len(rest) < frameHeaderSize {
-			reason = fmt.Sprintf("short header: %d bytes", len(rest))
-		} else {
-			payloadLen := int(binary.LittleEndian.Uint32(rest))
-			storedCRC := binary.LittleEndian.Uint32(rest[4:])
-			if payloadLen > len(rest)-frameHeaderSize {
-				reason = fmt.Sprintf("short payload: header wants %d bytes, %d remain", payloadLen, len(rest)-frameHeaderSize)
-			} else {
-				frameLen = frameHeaderSize + payloadLen
-				payload := rest[frameHeaderSize:frameLen]
-				if computed := crc32.Checksum(payload, castagnoli); computed != storedCRC {
-					reason = fmt.Sprintf("crc32c mismatch: stored %08x, computed %08x", storedCRC, computed)
-				} else {
-					record := &raftpb.LogRecord{}
-					if err := proto.Unmarshal(payload, record); err != nil {
-						reason = "unmarshal: " + err.Error()
-					} else if err := l.applyRecord(record); err != nil {
-						// A CRC-valid record this package would never write
-						// is damage or a bug, not a tear — even at the tail.
-						return fmt.Errorf("%w: %s offset %d: %v", ErrCorrupt, segmentName(seq), offset, err)
-					}
-				}
-			}
+		frameLen, reason, err := l.replayFrame(buf[offset:])
+		if err != nil {
+			// A CRC-valid record this package would never write is damage or
+			// a bug, not a tear — even at the tail.
+			return fmt.Errorf("%w: %s offset %d: %v", ErrCorrupt, segmentName(seq), offset, err)
 		}
 		if reason == "" {
 			offset += frameLen
 			continue
 		}
-		if final && offset+frameLen == len(buf) {
-			return l.truncateTail(path, seq, int64(offset))
+		if !final {
+			return fmt.Errorf("%w: %s offset %d: %s", ErrCorrupt, segmentName(seq), offset, reason)
 		}
-		return fmt.Errorf("%w: %s offset %d: %s", ErrCorrupt, segmentName(seq), offset, reason)
+		if p, ok := nextValidFrame(buf, offset+frameHeaderSize); ok {
+			return fmt.Errorf("%w: %s offset %d: %s, but offset %d holds an intact record — mid-log damage, not a torn tail", ErrCorrupt, segmentName(seq), offset, reason, p)
+		}
+		return l.truncateTail(path, seq, int64(offset))
 	}
 	return nil
+}
+
+// replayFrame validates the frame at the head of rest and applies its record
+// to the mirror. It returns the consumed frame length on success; a non-empty
+// reason when the frame does not read back whole (recoverable if it proves to
+// be the log's torn tail); or an error for a CRC-valid record whose contents
+// this package could never have written.
+func (l *DiskLog) replayFrame(rest []byte) (int, string, error) {
+	if len(rest) < frameHeaderSize {
+		return 0, fmt.Sprintf("short header: %d bytes", len(rest)), nil
+	}
+	payloadLen := int(binary.LittleEndian.Uint32(rest))
+	storedCRC := binary.LittleEndian.Uint32(rest[4:])
+	if payloadLen > len(rest)-frameHeaderSize {
+		return 0, fmt.Sprintf("short payload: header wants %d bytes, %d remain", payloadLen, len(rest)-frameHeaderSize), nil
+	}
+	frameLen := frameHeaderSize + payloadLen
+	payload := rest[frameHeaderSize:frameLen]
+	if computed := crc32.Checksum(payload, castagnoli); computed != storedCRC {
+		return 0, fmt.Sprintf("crc32c mismatch: stored %08x, computed %08x", storedCRC, computed), nil
+	}
+	record := &raftpb.LogRecord{}
+	if err := proto.Unmarshal(payload, record); err != nil {
+		return 0, "unmarshal: " + err.Error(), nil
+	}
+	if err := l.applyRecord(record); err != nil {
+		return 0, "", err
+	}
+	return frameLen, "", nil
+}
+
+// nextValidFrame reports the first offset at or after from where a complete,
+// CRC-valid frame holding a well-formed non-empty LogRecord begins. Every
+// byte offset is a candidate because the failed record before it cannot say
+// where it truly ends. A hit is overwhelming evidence of real log data: a
+// stray 8-byte header must point inside the file, carry the CRC32-C of
+// exactly the bytes it spans, and frame a record with its oneof set — the
+// last check also keeps runs of zero bytes (whose empty payload trivially
+// matches CRC zero) from counting as records. The scan runs only on the
+// already-failed recovery path, over the bytes after the failure — typically
+// one torn batch.
+func nextValidFrame(buf []byte, from int) (int, bool) {
+	for p := from; p+frameHeaderSize <= len(buf); p++ {
+		payloadLen := int(binary.LittleEndian.Uint32(buf[p:]))
+		end := p + frameHeaderSize + payloadLen
+		if end > len(buf) {
+			continue
+		}
+		payload := buf[p+frameHeaderSize : end]
+		if crc32.Checksum(payload, castagnoli) != binary.LittleEndian.Uint32(buf[p+4:]) {
+			continue
+		}
+		record := &raftpb.LogRecord{}
+		if err := proto.Unmarshal(payload, record); err != nil || record.GetBody() == nil {
+			continue
+		}
+		return p, true
+	}
+	return 0, false
 }
 
 // applyRecord replays one record into the mirror, enforcing the same
