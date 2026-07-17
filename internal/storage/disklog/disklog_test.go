@@ -3,6 +3,9 @@ package disklog
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"hash/crc32"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -86,27 +89,38 @@ func fileSize(t *testing.T, path string) int64 {
 	return info.Size()
 }
 
-func flipByte(t *testing.T, path string, offset int) {
+// alterSymbol changes one legal physical interior symbol to a different legal
+// symbol. The frame remains structurally complete, so recovery must reach its
+// length or CRC validation rather than rejecting an out-of-alphabet byte.
+func alterSymbol(t *testing.T, path string, offset int) {
 	t.Helper()
 	buf, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile(%s) error: %v", path, err)
 	}
-	buf[offset] ^= 0xff
+	if !isFrameSymbol(buf[offset]) {
+		t.Fatalf("byte at offset %d is 0x%02x, want an interior symbol", offset, buf[offset])
+	}
+	buf[offset] = frameSymbolBase + ((buf[offset] - frameSymbolBase + 1) & 0x0f)
 	if err := os.WriteFile(path, buf, 0o644); err != nil {
 		t.Fatalf("WriteFile(%s) error: %v", path, err)
 	}
 }
 
-// patchUint32 overwrites the little-endian uint32 at offset — pointed at a
-// frame's first header field, it corrupts that record's length in place.
-func patchUint32(t *testing.T, path string, offset int, value uint32) {
+// patchUint32 changes the decoded little-endian length at frameOffset while
+// retaining the frame markers and legal fixed-width physical alphabet.
+func patchUint32(t *testing.T, path string, frameOffset int, value uint32) {
 	t.Helper()
 	buf, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile(%s) error: %v", path, err)
 	}
-	binary.LittleEndian.PutUint32(buf[offset:], value)
+	var decoded [4]byte
+	binary.LittleEndian.PutUint32(decoded[:], value)
+	start := frameOffset + 1
+	if err := encodeSymbols(buf[start:start+len(decoded)*2], decoded[:]); err != nil {
+		t.Fatalf("encode length at frame offset %d: %v", frameOffset, err)
+	}
 	if err := os.WriteFile(path, buf, 0o644); err != nil {
 		t.Fatalf("WriteFile(%s) error: %v", path, err)
 	}
@@ -128,7 +142,8 @@ func appendBytes(t *testing.T, path string, data []byte) {
 
 type frameInfo struct {
 	offset int
-	length int // full frame length including the 8-byte header
+	length int // full physical frame length, including both markers
+	body   []byte
 	record *raftpb.LogRecord
 }
 
@@ -141,22 +156,121 @@ func scanFrames(t *testing.T, path string) []frameInfo {
 	var frames []frameInfo
 	offset := 0
 	for offset < len(buf) {
-		if len(buf)-offset < frameHeaderSize {
-			t.Fatalf("scanFrames(%s): short header at offset %d", path, offset)
+		if buf[offset] != frameStart {
+			t.Fatalf("scanFrames(%s): byte 0x%02x at boundary offset %d", path, buf[offset], offset)
 		}
-		payloadLen := int(binary.LittleEndian.Uint32(buf[offset:]))
-		end := offset + frameHeaderSize + payloadLen
-		if end > len(buf) {
-			t.Fatalf("scanFrames(%s): short payload at offset %d", path, offset)
+		end := offset + 1
+		for end < len(buf) && buf[end] != frameEnd {
+			if !isFrameSymbol(buf[end]) {
+				t.Fatalf("scanFrames(%s): invalid interior byte 0x%02x at offset %d", path, buf[end], end)
+			}
+			end++
+		}
+		if end == len(buf) {
+			t.Fatalf("scanFrames(%s): unterminated frame at offset %d", path, offset)
+		}
+		symbols := buf[offset+1 : end]
+		if len(symbols)%2 != 0 {
+			t.Fatalf("scanFrames(%s): odd symbol count at offset %d", path, offset)
+		}
+		body := make([]byte, len(symbols)/2)
+		if err := decodeSymbols(body, symbols); err != nil {
+			t.Fatalf("scanFrames(%s): decode at offset %d: %v", path, offset, err)
+		}
+		if len(body) < frameHeaderSize {
+			t.Fatalf("scanFrames(%s): short decoded header at offset %d", path, offset)
+		}
+		payloadLen := uint64(binary.LittleEndian.Uint32(body[:4]))
+		wantBodyLen, ok := checkedAddUint64(frameHeaderSize, payloadLen)
+		if !ok || wantBodyLen != uint64(len(body)) {
+			t.Fatalf("scanFrames(%s): body length %d, header wants %d", path, len(body), wantBodyLen)
+		}
+		payload := body[frameHeaderSize:]
+		if got, want := crc32.Checksum(payload, castagnoli), binary.LittleEndian.Uint32(body[4:8]); got != want {
+			t.Fatalf("scanFrames(%s): crc %08x, want %08x", path, got, want)
 		}
 		record := &raftpb.LogRecord{}
-		if err := proto.Unmarshal(buf[offset+frameHeaderSize:end], record); err != nil {
+		if err := proto.Unmarshal(payload, record); err != nil {
 			t.Fatalf("scanFrames(%s): unmarshal at offset %d: %v", path, offset, err)
 		}
-		frames = append(frames, frameInfo{offset: offset, length: end - offset, record: record})
-		offset = end
+		frames = append(frames, frameInfo{offset: offset, length: end + 1 - offset, body: body, record: record})
+		offset = end + 1
 	}
 	return frames
+}
+
+func physicalFrameForBody(t *testing.T, body []byte) []byte {
+	t.Helper()
+	encodedLen, ok := checkedMulUint64(uint64(len(body)), encodedByteWidth)
+	if !ok {
+		t.Fatal("encoded body length overflow")
+	}
+	encodedLenInt, err := checkedInt(encodedLen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := make([]byte, encodedLenInt+2)
+	frame[0], frame[len(frame)-1] = frameStart, frameEnd
+	if err := encodeSymbols(frame[1:len(frame)-1], body); err != nil {
+		t.Fatalf("encode body: %v", err)
+	}
+	return frame
+}
+
+func physicalFrameForPayload(t *testing.T, payload []byte, declaredLength uint32, crc uint32) []byte {
+	t.Helper()
+	body := make([]byte, frameHeaderSize+len(payload))
+	binary.LittleEndian.PutUint32(body[:4], declaredLength)
+	binary.LittleEndian.PutUint32(body[4:8], crc)
+	copy(body[frameHeaderSize:], payload)
+	return physicalFrameForBody(t, body)
+}
+
+func physicalFrameForRecord(t *testing.T, record *raftpb.LogRecord) []byte {
+	t.Helper()
+	frame, err := appendFrame(nil, record)
+	if err != nil {
+		t.Fatalf("appendFrame() error: %v", err)
+	}
+	return frame
+}
+
+func decodedBodyFromPhysicalFrame(t *testing.T, frame []byte) []byte {
+	t.Helper()
+	if len(frame) < 2 || frame[0] != frameStart || frame[len(frame)-1] != frameEnd {
+		t.Fatalf("invalid test frame markers: %x", frame)
+	}
+	symbols := frame[1 : len(frame)-1]
+	if len(symbols)%2 != 0 {
+		t.Fatalf("test frame has odd symbol count %d", len(symbols))
+	}
+	body := make([]byte, len(symbols)/2)
+	if err := decodeSymbols(body, symbols); err != nil {
+		t.Fatalf("decode test frame: %v", err)
+	}
+	return body
+}
+
+func entryLogRecord(index, term uint64, data []byte) *raftpb.LogRecord {
+	return &raftpb.LogRecord{Body: &raftpb.LogRecord_Entries{Entries: &raftpb.EntriesRecord{
+		Entries: []*raftpb.Entry{{Index: index, Term: term, Type: raftpb.EntryType_NORMAL, Data: data}},
+	}}}
+}
+
+func writeSegmentBytes(t *testing.T, dir string, data []byte) string {
+	t.Helper()
+	path := filepath.Join(dir, "000001.seg")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("WriteFile(%s) error: %v", path, err)
+	}
+	return path
+}
+
+func noSyncOptions() Options {
+	return Options{
+		syncFile: func(*os.File) error { return nil },
+		syncDir:  func(*os.File) error { return nil },
+	}
 }
 
 func recordKind(record *raftpb.LogRecord) string {
@@ -220,6 +334,268 @@ func TestOpenErrors(t *testing.T) {
 	}
 	if _, err := Open(t.TempDir(), Options{RotateSize: -1}); err == nil || !strings.Contains(err.Error(), "negative rotate size") {
 		t.Fatalf("Open(rotate -1) error = %v, want negative rotate size", err)
+	}
+}
+
+func TestCodecRoundTripAllByteValues(t *testing.T) {
+	decoded := make([]byte, 256)
+	for i := range decoded {
+		decoded[i] = byte(i)
+	}
+	frame := make([]byte, len(decoded)*2+2)
+	frame[0], frame[len(frame)-1] = frameStart, frameEnd
+	interior := frame[1 : len(frame)-1]
+	if err := encodeSymbols(interior, decoded); err != nil {
+		t.Fatalf("encodeSymbols() error: %v", err)
+	}
+	if frame[0] != 0xFA || frame[len(frame)-1] != 0xFB {
+		t.Fatalf("physical markers = 0x%02x, 0x%02x, want 0xFA, 0xFB", frame[0], frame[len(frame)-1])
+	}
+	seen := [16]bool{}
+	for i, symbol := range interior {
+		if !isFrameSymbol(symbol) {
+			t.Fatalf("interior[%d] = 0x%02x, outside 0x40..0x4F", i, symbol)
+		}
+		seen[symbol-frameSymbolBase] = true
+	}
+	for nibble, ok := range seen {
+		if !ok {
+			t.Fatalf("physical interior did not exercise symbol 0x%02x for nibble %x", frameSymbolBase+byte(nibble), nibble)
+		}
+	}
+	roundTrip := make([]byte, len(decoded))
+	if err := decodeSymbols(roundTrip, interior); err != nil {
+		t.Fatalf("decodeSymbols() error: %v", err)
+	}
+	if !reflect.DeepEqual(roundTrip, decoded) {
+		t.Fatalf("codec round trip mismatch: got %x, want %x", roundTrip, decoded)
+	}
+}
+
+func TestEveryFinalFramePrefix(t *testing.T) {
+	priorFrame := physicalFrameForRecord(t, entryLogRecord(1, 1, []byte("prior")))
+	newFrame := physicalFrameForRecord(t, entryLogRecord(2, 1, []byte("new")))
+	var sawOddIncomplete, sawEvenIncomplete bool
+	for k := 0; k <= len(newFrame); k++ {
+		k := k
+		t.Run(fmt.Sprintf("cut-%d", k), func(t *testing.T) {
+			dir := t.TempDir()
+			image := make([]byte, 0, len(priorFrame)+k)
+			image = append(image, priorFrame...)
+			image = append(image, newFrame[:k]...)
+			seg := writeSegmentBytes(t, dir, image)
+			l, err := Open(dir, noSyncOptions())
+			if err != nil {
+				t.Fatalf("Open() at prefix %d error: %v", k, err)
+			}
+			defer func() { _ = l.Close() }()
+
+			want := makeEntries(1, 1, "prior")
+			wantSize := int64(len(priorFrame))
+			if k == len(newFrame) {
+				want = append(want, makeEntries(2, 1, "new")...)
+				wantSize += int64(len(newFrame))
+			} else if k > 0 {
+				symbolCount := k - 1 // start marker is retained; terminator is not
+				if symbolCount%2 == 0 {
+					sawEvenIncomplete = true
+				} else {
+					sawOddIncomplete = true
+				}
+			}
+			assertState(t, l, raft.HardState{}, want)
+			if size := fileSize(t, seg); size != wantSize {
+				t.Fatalf("prefix %d recovery size = %d, want %d", k, size, wantSize)
+			}
+		})
+	}
+	if !sawOddIncomplete || !sawEvenIncomplete {
+		t.Fatalf("prefix matrix missed parity: odd=%t even=%t", sawOddIncomplete, sawEvenIncomplete)
+	}
+}
+
+func TestFinalTerminatorAmbiguityAcceptedLimit(t *testing.T) {
+	priorFrame := physicalFrameForRecord(t, entryLogRecord(1, 1, []byte("prior")))
+	targetFrame := physicalFrameForRecord(t, entryLogRecord(2, 1, []byte("target")))
+	changedTerminator := append([]byte(nil), targetFrame...)
+	changedTerminator[len(changedTerminator)-1] = frameSymbolBase
+	cases := []struct {
+		name string
+		tail []byte
+	}{
+		{name: "missing final terminator", tail: targetFrame[:len(targetFrame)-1]},
+		{name: "final terminator changed to alphabet symbol", tail: changedTerminator},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			image := append(append([]byte(nil), priorFrame...), tc.tail...)
+			seg := writeSegmentBytes(t, dir, image)
+			l, err := Open(dir, noSyncOptions())
+			if err != nil {
+				t.Fatalf("Open() error: %v", err)
+			}
+			defer func() { _ = l.Close() }()
+			assertState(t, l, raft.HardState{}, makeEntries(1, 1, "prior"))
+			if size := fileSize(t, seg); size != int64(len(priorFrame)) {
+				t.Fatalf("ambiguous final tail size = %d, want prior boundary %d", size, len(priorFrame))
+			}
+		})
+	}
+}
+
+func TestCompleteMiddleFrameRejectsEverySingleByteSubstitution(t *testing.T) {
+	fixtureData := make([]byte, 16)
+	for nibble := range fixtureData {
+		fixtureData[nibble] = byte(nibble<<4 | nibble)
+	}
+	first := physicalFrameForRecord(t, entryLogRecord(1, 1, []byte("first")))
+	target := physicalFrameForRecord(t, entryLogRecord(2, 1, fixtureData))
+	last := physicalFrameForRecord(t, entryLogRecord(3, 1, []byte("last")))
+
+	seen := [16]bool{}
+	for _, b := range decodedBodyFromPhysicalFrame(t, target) {
+		seen[b>>4], seen[b&0x0f] = true, true
+	}
+	for nibble, ok := range seen {
+		if !ok {
+			t.Fatalf("target decoded body does not exercise nibble %x", nibble)
+		}
+	}
+
+	image := make([]byte, 0, len(first)+len(target)+len(last))
+	image = append(image, first...)
+	targetOffset := len(image)
+	image = append(image, target...)
+	image = append(image, last...)
+	dir := t.TempDir()
+	seg := writeSegmentBytes(t, dir, image)
+	for position, original := range target {
+		at := targetOffset + position
+		for replacement := 0; replacement < 256; replacement++ {
+			if byte(replacement) == original {
+				continue
+			}
+			image[at] = byte(replacement)
+			if err := os.WriteFile(seg, image, 0o644); err != nil {
+				t.Fatalf("WriteFile(position=%d replacement=0x%02x): %v", position, replacement, err)
+			}
+			l, err := Open(dir, noSyncOptions())
+			if l != nil {
+				_ = l.Close()
+			}
+			if !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("position %d: 0x%02x -> 0x%02x: Open() error = %v, want ErrCorrupt", position, original, replacement, err)
+			}
+		}
+		image[at] = original
+	}
+}
+
+func TestObservedFinalTerminatorValidationFailures(t *testing.T) {
+	validPayload, err := proto.Marshal(entryLogRecord(1, 1, []byte("supported")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	validCRC := crc32.Checksum(validPayload, castagnoli)
+	emptyPayload, err := proto.Marshal(&raftpb.LogRecord{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name    string
+		frame   []byte
+		message string
+	}{
+		{name: "odd symbol count", frame: []byte{frameStart, frameSymbolBase, frameEnd}, message: "odd interior symbol count"},
+		{name: "short header", frame: physicalFrameForBody(t, []byte{1, 2, 3, 4, 5, 6}), message: "short decoded body"},
+		{name: "smaller length mismatch", frame: physicalFrameForPayload(t, validPayload, uint32(len(validPayload)-1), validCRC), message: "decoded body size"},
+		{name: "larger length mismatch", frame: physicalFrameForPayload(t, validPayload, uint32(len(validPayload)+1), validCRC), message: "decoded body size"},
+		{name: "crc mismatch", frame: physicalFrameForPayload(t, validPayload, uint32(len(validPayload)), validCRC^1), message: "crc32c mismatch"},
+		{name: "malformed protobuf", frame: physicalFrameForPayload(t, []byte{0x0a}, 1, crc32.Checksum([]byte{0x0a}, castagnoli)), message: "unmarshal LogRecord"},
+		{name: "empty oneof", frame: physicalFrameForPayload(t, emptyPayload, uint32(len(emptyPayload)), crc32.Checksum(emptyPayload, castagnoli)), message: "unsupported or empty"},
+		{name: "unsupported oneof", frame: physicalFrameForPayload(t, []byte{0x22, 0x00}, 2, crc32.Checksum([]byte{0x22, 0x00}, castagnoli)), message: "unsupported or empty"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			seg := writeSegmentBytes(t, dir, tc.frame)
+			before := fileSize(t, seg)
+			_, err := Open(dir, noSyncOptions())
+			if !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("Open() error = %v, want ErrCorrupt containing %q", err, tc.message)
+			}
+			if size := fileSize(t, seg); size != before {
+				t.Fatalf("complete invalid frame was truncated: size=%d, want %d", size, before)
+			}
+		})
+	}
+}
+
+func TestPhysicalFrameBoundaryCorruption(t *testing.T) {
+	valid := physicalFrameForRecord(t, entryLogRecord(1, 1, []byte("valid")))
+	badStart := append([]byte(nil), valid...)
+	badStart[0] = 0
+	invalidInterior := append([]byte(nil), valid...)
+	invalidInterior[1] = frameSymbolLimit + 1
+	nestedStart := append([]byte(nil), valid...)
+	nestedStart[1] = frameStart
+	zeroPadding := append(append([]byte(nil), valid...), 0)
+	cases := []struct {
+		name  string
+		image []byte
+	}{
+		{name: "bad start marker", image: badStart},
+		{name: "invalid interior symbol", image: invalidInterior},
+		{name: "start marker inside frame", image: nestedStart},
+		{name: "zero padding after complete frame", image: zeroPadding},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeSegmentBytes(t, dir, tc.image)
+			_, err := Open(dir, noSyncOptions())
+			if !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("Open() error = %v, want ErrCorrupt", err)
+			}
+		})
+	}
+}
+
+func TestCheckedFrameSizeArithmetic(t *testing.T) {
+	got, ok := checkedFrameSize(math.MaxUint32)
+	want := (uint64(math.MaxUint32)+frameHeaderSize)*encodedByteWidth + frameMarkerBytes
+	if !ok || got != want {
+		t.Fatalf("checkedFrameSize(MaxUint32) = %d, %t, want %d, true", got, ok, want)
+	}
+	if fitsIntBits(got, 32) {
+		t.Fatalf("physical size %d incorrectly fits a 32-bit int", got)
+	}
+	if !fitsIntBits(math.MaxInt32, 32) || fitsIntBits(uint64(math.MaxInt32)+1, 32) {
+		t.Fatal("32-bit int boundary check is incorrect")
+	}
+	if _, ok := checkedFrameSize(math.MaxUint64); ok {
+		t.Fatal("checkedFrameSize(MaxUint64) did not report overflow")
+	}
+	if _, ok := checkedAddUint64(math.MaxUint64, 1); ok {
+		t.Fatal("checkedAddUint64 overflow was accepted")
+	}
+	if _, ok := checkedMulUint64(math.MaxUint64, 2); ok {
+		t.Fatal("checkedMulUint64 overflow was accepted")
+	}
+}
+
+func TestUntrustedDeclaredLengthDoesNotAllocate(t *testing.T) {
+	frame := physicalFrameForPayload(t, nil, math.MaxUint32, 0)
+	dir := t.TempDir()
+	seg := writeSegmentBytes(t, dir, frame)
+	before := fileSize(t, seg)
+	_, err := Open(dir, noSyncOptions())
+	if !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "decoded body size") {
+		t.Fatalf("Open() error = %v, want size mismatch before allocation", err)
+	}
+	if size := fileSize(t, seg); size != before {
+		t.Fatalf("invalid complete frame was truncated: size=%d, want %d", size, before)
 	}
 }
 
@@ -473,10 +849,10 @@ func TestHardStateLastWins(t *testing.T) {
 }
 
 func TestTornOrBadFinalRecordDiscarded(t *testing.T) {
-	// Each subtest builds a log with batch1 (entries 1..2), then batch2
-	// (hard state + entry 3), then damages batch2's final frame. Recovery
-	// must drop the damaged record, keep everything before it, and
-	// physically truncate the file at the damaged frame's offset.
+	// Historical test name retained for assertion audit. Each subtest builds
+	// batch1 (entries 1..2), then batch2 (hard state + entry 3), then damages
+	// batch2's final frame. EOF before the terminator is discarded; an
+	// observed terminator with a bad CRC is corruption under guide v1.6.
 	hard1 := raft.HardState{Term: 1, VotedFor: 1}
 	hard2 := raft.HardState{Term: 2, VotedFor: 2}
 	build := func(t *testing.T) (dir, seg string, frames []frameInfo) {
@@ -526,7 +902,7 @@ func TestTornOrBadFinalRecordDiscarded(t *testing.T) {
 	t.Run("header cut mid-record", func(t *testing.T) {
 		dir, seg, frames := build(t)
 		last := frames[len(frames)-1]
-		if err := os.Truncate(seg, int64(last.offset+frameHeaderSize-3)); err != nil {
+		if err := os.Truncate(seg, int64(last.offset+1+frameHeaderSize*2-3)); err != nil {
 			t.Fatal(err)
 		}
 		check(t, dir, seg, hard2, int64(last.offset))
@@ -534,8 +910,15 @@ func TestTornOrBadFinalRecordDiscarded(t *testing.T) {
 	t.Run("crc-damaged final record", func(t *testing.T) {
 		dir, seg, frames := build(t)
 		last := frames[len(frames)-1]
-		flipByte(t, seg, last.offset+frameHeaderSize)
-		check(t, dir, seg, hard2, int64(last.offset))
+		before := fileSize(t, seg)
+		alterSymbol(t, seg, last.offset+1+frameHeaderSize*2)
+		_, err := Open(dir, Options{})
+		if !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "crc32c mismatch") {
+			t.Fatalf("Open() error = %v, want complete final frame CRC corruption", err)
+		}
+		if size := fileSize(t, seg); size != before {
+			t.Fatalf("complete bad final frame was truncated: size=%d, want %d", size, before)
+		}
 	})
 	t.Run("whole final batch torn away", func(t *testing.T) {
 		dir, seg, frames := build(t)
@@ -581,7 +964,7 @@ func TestMidLogCorruptionRefusesStartup(t *testing.T) {
 		}
 		seg := filepath.Join(dir, "000001.seg")
 		frames := scanFrames(t, seg)
-		flipByte(t, seg, frames[1].offset+frameHeaderSize)
+		alterSymbol(t, seg, frames[1].offset+1+frameHeaderSize*2)
 		_, err := Open(dir, Options{})
 		if !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("Open() error = %v, want ErrCorrupt", err)
@@ -599,7 +982,7 @@ func TestMidLogCorruptionRefusesStartup(t *testing.T) {
 		if err := l.Close(); err != nil {
 			t.Fatalf("Close() error: %v", err)
 		}
-		flipByte(t, filepath.Join(dir, "000002.seg"), frameHeaderSize)
+		alterSymbol(t, filepath.Join(dir, "000002.seg"), 1+frameHeaderSize*2)
 		_, err := Open(dir, Options{RotateSize: 1})
 		if !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "000002.seg") {
 			t.Fatalf("Open() error = %v, want ErrCorrupt in 000002.seg", err)
@@ -627,13 +1010,10 @@ func TestMidLogCorruptionRefusesStartup(t *testing.T) {
 func TestLengthHeaderCorruption(t *testing.T) {
 	// Three single-entry batches in one segment, one entries frame each. The
 	// length header under test belongs to frames[1] (a middle record, with an
-	// intact record after it) or frames[2] (the true final record). A length
-	// header can lie in either direction, and neither lie may be believed:
-	// an upward-corrupted middle length claims bytes through the end of the
-	// file and must not masquerade as a torn tail (that would silently
-	// discard the intact records after it), while a downward-corrupted final
-	// length leaves trailing bytes that must not read as mid-log corruption
-	// (nothing intact follows, so it is the log's damaged tail).
+	// intact record after it) or frames[2] (the true final record). Fixed
+	// markers identify the physical end independently of the decoded length;
+	// once 0xFB is observed, every smaller or larger declaration is corruption
+	// even in the final frame.
 	build := func(t *testing.T) (dir, seg string, frames []frameInfo) {
 		t.Helper()
 		dir = t.TempDir()
@@ -656,14 +1036,14 @@ func TestLengthHeaderCorruption(t *testing.T) {
 		dir, seg, frames := build(t)
 		patchUint32(t, seg, frames[1].offset, uint32(fileSize(t, seg)))
 		_, err := Open(dir, Options{})
-		if !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "intact record") {
-			t.Fatalf("Open() error = %v, want ErrCorrupt naming the intact record after the damage", err)
+		if !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "decoded body size") {
+			t.Fatalf("Open() error = %v, want complete-frame length corruption", err)
 		}
 	})
 	t.Run("middle length corrupted to claim exactly the rest of the file", func(t *testing.T) {
 		dir, seg, frames := build(t)
-		rest := int(fileSize(t, seg)) - frames[1].offset - frameHeaderSize
-		patchUint32(t, seg, frames[1].offset, uint32(rest))
+		payloadLen := len(frames[1].body) - frameHeaderSize
+		patchUint32(t, seg, frames[1].offset, uint32(payloadLen+len(frames[2].body)))
 		_, err := Open(dir, Options{})
 		if !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("Open() error = %v, want ErrCorrupt", err)
@@ -671,8 +1051,8 @@ func TestLengthHeaderCorruption(t *testing.T) {
 	})
 	t.Run("middle length corrupted within the file", func(t *testing.T) {
 		dir, seg, frames := build(t)
-		payloadLen := frames[1].length - frameHeaderSize
-		patchUint32(t, seg, frames[1].offset, uint32(payloadLen+3)) // swallows part of frame 2's header
+		payloadLen := len(frames[1].body) - frameHeaderSize
+		patchUint32(t, seg, frames[1].offset, uint32(payloadLen+3))
 		_, err := Open(dir, Options{})
 		if !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("Open() error = %v, want ErrCorrupt", err)
@@ -694,39 +1074,36 @@ func TestLengthHeaderCorruption(t *testing.T) {
 		}
 	})
 
-	// The final record's length corrupted: whatever the direction, nothing
-	// intact follows it, so it is dropped as the log's damaged tail — the
-	// file is truncated at its offset, earlier records survive, and the log
-	// accepts appends again.
-	checkTailDropped := func(t *testing.T, dir, seg string, frames []frameInfo) {
+	// These three assertions intentionally migrate the old raw-frame
+	// expectation: an observed final terminator makes every length mismatch
+	// corruption, and Open must leave the file untouched.
+	checkFinalRefused := func(t *testing.T, dir, seg string) {
 		t.Helper()
-		l := mustOpen(t, dir, Options{})
-		want := append(makeEntries(1, 1, "alpha"), makeEntries(2, 1, "beta")...)
-		assertState(t, l, raft.HardState{}, want)
-		if size := fileSize(t, seg); size != int64(frames[2].offset) {
-			t.Fatalf("segment size after recovery = %d, want %d", size, frames[2].offset)
+		before := fileSize(t, seg)
+		_, err := Open(dir, Options{})
+		if !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "decoded body size") {
+			t.Fatalf("Open() error = %v, want complete final frame length corruption", err)
 		}
-		mustSave(t, l, nil, makeEntries(3, 2, "replacement"))
-		if err := l.Close(); err != nil {
-			t.Fatalf("Close() error: %v", err)
+		if size := fileSize(t, seg); size != before {
+			t.Fatalf("complete bad final frame was truncated: size=%d, want %d", size, before)
 		}
-		assertState(t, mustOpen(t, dir, Options{}), raft.HardState{}, append(want, makeEntries(3, 2, "replacement")...))
 	}
 	t.Run("final length corrupted downward", func(t *testing.T) {
 		dir, seg, frames := build(t)
-		payloadLen := frames[2].length - frameHeaderSize
+		payloadLen := len(frames[2].body) - frameHeaderSize
 		patchUint32(t, seg, frames[2].offset, uint32(payloadLen-2))
-		checkTailDropped(t, dir, seg, frames)
+		checkFinalRefused(t, dir, seg)
 	})
 	t.Run("final length corrupted to zero", func(t *testing.T) {
 		dir, seg, frames := build(t)
 		patchUint32(t, seg, frames[2].offset, 0)
-		checkTailDropped(t, dir, seg, frames)
+		checkFinalRefused(t, dir, seg)
 	})
 	t.Run("final length corrupted past end of file", func(t *testing.T) {
 		dir, seg, frames := build(t)
-		patchUint32(t, seg, frames[2].offset, uint32(frames[2].length+100))
-		checkTailDropped(t, dir, seg, frames)
+		payloadLen := len(frames[2].body) - frameHeaderSize
+		patchUint32(t, seg, frames[2].offset, uint32(payloadLen+100))
+		checkFinalRefused(t, dir, seg)
 	})
 }
 

@@ -6,12 +6,14 @@
 //
 // On-disk format: numbered segment files (000001.seg, ...) rotated once the
 // active segment reaches Options.RotateSize (default 8 MiB). Every record is
-// framed as [uint32 length][uint32 crc32c][payload] with both header fields
-// little-endian; the CRC32-C (Castagnoli) covers the payload only, a
-// marshaled raftpb.LogRecord. A batch is never split across segments —
-// rotation happens between batches — so one Save is one write and one sync
-// on one file, and a batch landing exactly at RotateSize fills its segment
-// while the following Save rotates.
+// framed as 0xFA || E(B) || 0xFB, where B is a little-endian uint32 payload
+// length, a little-endian CRC32-C (Castagnoli) of the payload, and a
+// marshaled raftpb.LogRecord. E maps each body byte to two bytes, high nibble
+// first, with nibble n represented by 0x40+n; only 0x40..0x4F is legal
+// between the markers. A batch is never split across segments — rotation
+// happens between batches — so one Save is one write and one sync on one
+// file, and a batch landing exactly at RotateSize fills its segment while the
+// following Save rotates.
 //
 // Suffix truncation is logical, via TruncateRecord frames (see
 // docs/NOTES.md); segment bytes are rewritten only when recovery physically
@@ -35,9 +37,11 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -55,14 +59,20 @@ import (
 const DefaultRotateSize = 8 << 20
 
 const (
-	segmentSuffix   = ".seg"
-	frameHeaderSize = 8 // uint32 payload length + uint32 crc32c
+	segmentSuffix    = ".seg"
+	frameStart       = byte(0xFA)
+	frameEnd         = byte(0xFB)
+	frameSymbolBase  = byte(0x40)
+	frameSymbolLimit = byte(0x4F)
+	frameHeaderSize  = 8 // uint32 payload length + uint32 crc32c
+	frameMarkerBytes = 2
+	encodedByteWidth = 2
 )
 
-// ErrCorrupt marks startup damage that cannot be attributed to a torn tail
-// write: only the final record of the final segment may be truncated and
-// survived, because synced records are never torn. Errors wrapping it name
-// the segment and byte offset.
+// ErrCorrupt marks startup damage that cannot be attributed to the sole
+// removable torn tail: EOF after a start marker and before its terminator in
+// the final record of the final segment. Errors wrapping it name the segment
+// and byte offset.
 var ErrCorrupt = errors.New("disklog: corrupt log")
 
 var errClosed = errors.New("disklog: closed")
@@ -182,19 +192,23 @@ func (l *DiskLog) Save(hs *raft.HardState, entries []raftpb.Entry) error {
 	if err != nil {
 		return err
 	}
-	if err := l.rotateIfNeeded(int64(len(batch))); err != nil {
+	batchSize := int64(len(batch))
+	if err := l.rotateIfNeeded(batchSize); err != nil {
 		l.failed = err
 		return err
 	}
-	if _, err := l.active.Write(batch); err != nil {
+	if n, err := l.active.Write(batch); err != nil {
 		l.failed = err
 		return fmt.Errorf("disklog: write %s: %w", segmentName(l.activeSeq), err)
+	} else if n != len(batch) {
+		l.failed = io.ErrShortWrite
+		return fmt.Errorf("disklog: write %s: wrote %d of %d bytes: %w", segmentName(l.activeSeq), n, len(batch), io.ErrShortWrite)
 	}
 	if err := l.syncFile(l.active); err != nil {
 		l.failed = err
 		return fmt.Errorf("disklog: sync %s: %w", segmentName(l.activeSeq), err)
 	}
-	l.activeSize += int64(len(batch))
+	l.activeSize += batchSize
 	if hs != nil {
 		l.hard = *hs
 	}
@@ -263,13 +277,19 @@ func (l *DiskLog) Close() error {
 // active one past rotateSize. The check runs before the write and an empty
 // segment always accepts its batch whole.
 func (l *DiskLog) rotateIfNeeded(batchSize int64) error {
-	if l.activeSize == 0 || l.activeSize+batchSize <= l.rotateSize {
+	if batchSize < 0 {
+		return fmt.Errorf("disklog: negative batch size %d", batchSize)
+	}
+	if l.activeSize == 0 || (l.activeSize <= l.rotateSize && batchSize <= l.rotateSize-l.activeSize) {
 		return nil
 	}
 	if err := l.active.Close(); err != nil {
 		return fmt.Errorf("disklog: close %s: %w", segmentName(l.activeSeq), err)
 	}
 	l.active = nil // no active segment until the next one exists; a failure here poisons the log
+	if l.activeSeq == math.MaxUint64 {
+		return errors.New("disklog: segment sequence overflow")
+	}
 	next, err := l.createSegment(l.activeSeq + 1)
 	if err != nil {
 		return err
@@ -357,26 +377,12 @@ func (l *DiskLog) syncSegment(seq uint64) error {
 	return nil
 }
 
-// replaySegment applies each record of one segment to the mirror. A record
-// that does not read back whole must be classified before recovery may
-// continue:
-//
-//   - In a non-final segment it is corruption outright. Rotation happens only
-//     after every byte of the previous segment was synced, so a rotated
-//     segment can never hold a torn tail.
-//   - In the final segment it is the log's torn tail — recovery physically
-//     truncates it and succeeds — only when nothing after it reads back as a
-//     complete, CRC-valid record. A tear takes a suffix of the file, so an
-//     intact record after the failure is proof the damage sits mid-log:
-//     refusing to start is the only safe answer, because truncating there
-//     would silently discard synced, possibly acknowledged, records.
-//
-// The classification must not trust the failed record's own length header.
-// An upward-corrupted length in a middle record claims bytes through the end
-// of the file and would masquerade as a torn tail, while a downward-corrupted
-// length in the true final record leaves trailing bytes that would read as
-// data "after" it; nextValidFrame scans for evidence instead of believing
-// either.
+// replaySegment applies each physical frame in one segment to the mirror.
+// At a record boundary EOF is success and every other byte must be 0xFA.
+// Once a frame starts, only encoded-nibble symbols may precede 0xFB. EOF
+// before 0xFB is removable only for the final record of the final segment;
+// every observed terminator commits recovery to validating the complete
+// frame, even when it is the last frame in the log.
 func (l *DiskLog) replaySegment(seq uint64, final bool) error {
 	path := l.segmentPath(seq)
 	buf, err := os.ReadFile(path)
@@ -385,84 +391,118 @@ func (l *DiskLog) replaySegment(seq uint64, final bool) error {
 	}
 	offset := 0
 	for offset < len(buf) {
-		frameLen, reason, err := l.replayFrame(buf[offset:])
+		if buf[offset] != frameStart {
+			return fmt.Errorf("%w: %s offset %d: byte 0x%02x at record boundary, want start marker 0x%02x", ErrCorrupt, segmentName(seq), offset, buf[offset], frameStart)
+		}
+
+		terminator := -1
+		for p := offset + 1; p < len(buf); p++ {
+			b := buf[p]
+			switch {
+			case b == frameEnd:
+				terminator = p
+			case b == frameStart:
+				return fmt.Errorf("%w: %s offset %d: start marker 0x%02x before frame terminator", ErrCorrupt, segmentName(seq), p, b)
+			case !isFrameSymbol(b):
+				return fmt.Errorf("%w: %s offset %d: invalid interior byte 0x%02x", ErrCorrupt, segmentName(seq), p, b)
+			}
+			if terminator >= 0 {
+				break
+			}
+		}
+		if terminator < 0 {
+			if !final {
+				return fmt.Errorf("%w: %s offset %d: EOF before frame terminator in non-final segment", ErrCorrupt, segmentName(seq), offset)
+			}
+			return l.truncateTail(path, seq, int64(offset))
+		}
+
+		record, err := decodeTerminatedFrame(buf[offset+1 : terminator])
 		if err != nil {
-			// A CRC-valid record this package would never write is damage or
-			// a bug, not a tear — even at the tail.
 			return fmt.Errorf("%w: %s offset %d: %v", ErrCorrupt, segmentName(seq), offset, err)
 		}
-		if reason == "" {
-			offset += frameLen
-			continue
+		if err := l.applyRecord(record); err != nil {
+			return fmt.Errorf("%w: %s offset %d: %v", ErrCorrupt, segmentName(seq), offset, err)
 		}
-		if !final {
-			return fmt.Errorf("%w: %s offset %d: %s", ErrCorrupt, segmentName(seq), offset, reason)
-		}
-		if p, ok := nextValidFrame(buf, offset+frameHeaderSize); ok {
-			return fmt.Errorf("%w: %s offset %d: %s, but offset %d holds an intact record — mid-log damage, not a torn tail", ErrCorrupt, segmentName(seq), offset, reason, p)
-		}
-		return l.truncateTail(path, seq, int64(offset))
+		offset = terminator + 1
 	}
 	return nil
 }
 
-// replayFrame validates the frame at the head of rest and applies its record
-// to the mirror. It returns the consumed frame length on success; a non-empty
-// reason when the frame does not read back whole (recoverable if it proves to
-// be the log's torn tail); or an error for a CRC-valid record whose contents
-// this package could never have written.
-func (l *DiskLog) replayFrame(rest []byte) (int, string, error) {
-	if len(rest) < frameHeaderSize {
-		return 0, fmt.Sprintf("short header: %d bytes", len(rest)), nil
+func isFrameSymbol(b byte) bool {
+	return b >= frameSymbolBase && b <= frameSymbolLimit
+}
+
+// decodeTerminatedFrame validates a frame whose 0xFB has already been
+// observed. It decodes the fixed header first, checks all size arithmetic in
+// uint64, and requires the physical symbol count to agree exactly with the
+// declared payload length before allocating the payload. A corrupt length
+// therefore cannot drive an allocation or an int conversion.
+func decodeTerminatedFrame(symbols []byte) (*raftpb.LogRecord, error) {
+	symbolCount := uint64(len(symbols))
+	if symbolCount%encodedByteWidth != 0 {
+		return nil, fmt.Errorf("odd interior symbol count %d", symbolCount)
 	}
-	payloadLen := int(binary.LittleEndian.Uint32(rest))
-	storedCRC := binary.LittleEndian.Uint32(rest[4:])
-	if payloadLen > len(rest)-frameHeaderSize {
-		return 0, fmt.Sprintf("short payload: header wants %d bytes, %d remain", payloadLen, len(rest)-frameHeaderSize), nil
+	bodySize := symbolCount / encodedByteWidth
+	if bodySize < frameHeaderSize {
+		return nil, fmt.Errorf("short decoded body: %d bytes, want at least %d", bodySize, frameHeaderSize)
 	}
-	frameLen := frameHeaderSize + payloadLen
-	payload := rest[frameHeaderSize:frameLen]
+
+	headerSymbolCount, ok := checkedMulUint64(frameHeaderSize, encodedByteWidth)
+	if !ok {
+		return nil, errors.New("frame header symbol count overflow")
+	}
+	headerSymbolCountInt, err := checkedInt(headerSymbolCount)
+	if err != nil {
+		return nil, err
+	}
+	var header [8]byte
+	if err := decodeSymbols(header[:], symbols[:headerSymbolCountInt]); err != nil {
+		return nil, err
+	}
+
+	payloadSize := uint64(binary.LittleEndian.Uint32(header[:4]))
+	wantBodySize, ok := checkedAddUint64(frameHeaderSize, payloadSize)
+	if !ok {
+		return nil, errors.New("decoded body size overflow")
+	}
+	if bodySize != wantBodySize {
+		return nil, fmt.Errorf("decoded body size %d does not match header size %d + payload length %d", bodySize, frameHeaderSize, payloadSize)
+	}
+	payloadSizeInt, err := checkedInt(payloadSize)
+	if err != nil {
+		return nil, fmt.Errorf("payload length: %w", err)
+	}
+	payload := make([]byte, payloadSizeInt)
+	if err := decodeSymbols(payload, symbols[headerSymbolCountInt:]); err != nil {
+		return nil, err
+	}
+
+	storedCRC := binary.LittleEndian.Uint32(header[4:])
 	if computed := crc32.Checksum(payload, castagnoli); computed != storedCRC {
-		return 0, fmt.Sprintf("crc32c mismatch: stored %08x, computed %08x", storedCRC, computed), nil
+		return nil, fmt.Errorf("crc32c mismatch: stored %08x, computed %08x", storedCRC, computed)
 	}
 	record := &raftpb.LogRecord{}
 	if err := proto.Unmarshal(payload, record); err != nil {
-		return 0, "unmarshal: " + err.Error(), nil
+		return nil, fmt.Errorf("unmarshal LogRecord: %w", err)
 	}
-	if err := l.applyRecord(record); err != nil {
-		return 0, "", err
+	if !hasSupportedRecordKind(record) {
+		return nil, errors.New("unknown record type: unsupported or empty LogRecord oneof")
 	}
-	return frameLen, "", nil
+	return record, nil
 }
 
-// nextValidFrame reports the first offset at or after from where a complete,
-// CRC-valid frame holding a well-formed non-empty LogRecord begins. Every
-// byte offset is a candidate because the failed record before it cannot say
-// where it truly ends. A hit is overwhelming evidence of real log data: a
-// stray 8-byte header must point inside the file, carry the CRC32-C of
-// exactly the bytes it spans, and frame a record with its oneof set — the
-// last check also keeps runs of zero bytes (whose empty payload trivially
-// matches CRC zero) from counting as records. The scan runs only on the
-// already-failed recovery path, over the bytes after the failure — typically
-// one torn batch.
-func nextValidFrame(buf []byte, from int) (int, bool) {
-	for p := from; p+frameHeaderSize <= len(buf); p++ {
-		payloadLen := int(binary.LittleEndian.Uint32(buf[p:]))
-		end := p + frameHeaderSize + payloadLen
-		if end > len(buf) {
-			continue
-		}
-		payload := buf[p+frameHeaderSize : end]
-		if crc32.Checksum(payload, castagnoli) != binary.LittleEndian.Uint32(buf[p+4:]) {
-			continue
-		}
-		record := &raftpb.LogRecord{}
-		if err := proto.Unmarshal(payload, record); err != nil || record.GetBody() == nil {
-			continue
-		}
-		return p, true
+func hasSupportedRecordKind(record *raftpb.LogRecord) bool {
+	switch body := record.GetBody().(type) {
+	case *raftpb.LogRecord_HardState:
+		return body != nil && body.HardState != nil
+	case *raftpb.LogRecord_Entries:
+		return body != nil && body.Entries != nil
+	case *raftpb.LogRecord_Truncate:
+		return body != nil && body.Truncate != nil
+	default:
+		return false
 	}
-	return 0, false
 }
 
 // applyRecord replays one record into the mirror, enforcing the same
@@ -511,9 +551,10 @@ func (l *DiskLog) applyRecord(record *raftpb.LogRecord) error {
 	return nil
 }
 
-// truncateTail physically discards a torn or bad final record so its bytes
-// can never resurface as mid-log corruption once appends resume, then syncs
-// the shrunken file.
+// truncateTail physically discards the sole recoverable tail shape: an
+// unterminated final frame in the final segment. Complete invalid frames are
+// corruption and never reach this function. The shrunken file is synced so
+// discarded bytes cannot resurface after appends resume.
 func (l *DiskLog) truncateTail(path string, seq uint64, offset int64) error {
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
@@ -593,8 +634,9 @@ func encodeBatch(hs *raft.HardState, entries []raftpb.Entry, last uint64) ([]byt
 	return appendFrame(batch, &raftpb.LogRecord{Body: &raftpb.LogRecord_Entries{Entries: record}})
 }
 
-// appendFrame appends one framed record: [uint32 len][uint32 crc32c][payload],
-// header fields little-endian, CRC32-C over the payload only.
+// appendFrame appends 0xFA || E(B) || 0xFB, where B is the little-endian
+// length and CRC32-C header followed by the protobuf payload. All sizing is
+// checked in uint64 before converting to int or growing the batch.
 func appendFrame(batch []byte, record *raftpb.LogRecord) ([]byte, error) {
 	payload, err := proto.Marshal(record)
 	if err != nil {
@@ -603,10 +645,116 @@ func appendFrame(batch []byte, record *raftpb.LogRecord) ([]byte, error) {
 	if uint64(len(payload)) > math.MaxUint32 {
 		return nil, fmt.Errorf("disklog: record payload %d bytes overflows frame length", len(payload))
 	}
-	var header [frameHeaderSize]byte
+	physicalSize, ok := checkedFrameSize(uint64(len(payload)))
+	if !ok {
+		return nil, fmt.Errorf("disklog: record payload %d bytes overflows physical frame size", len(payload))
+	}
+	totalSize, ok := checkedAddUint64(uint64(len(batch)), physicalSize)
+	if !ok {
+		return nil, errors.New("disklog: batch size overflows uint64")
+	}
+	physicalSizeInt, err := checkedInt(physicalSize)
+	if err != nil {
+		return nil, fmt.Errorf("disklog: physical frame size: %w", err)
+	}
+	totalSizeInt, err := checkedInt(totalSize)
+	if err != nil {
+		return nil, fmt.Errorf("disklog: batch size: %w", err)
+	}
+
+	oldLen := len(batch)
+	batch = slices.Grow(batch, physicalSizeInt)
+	batch = batch[:totalSizeInt]
+	frame := batch[oldLen:]
+	frame[0] = frameStart
+	frame[len(frame)-1] = frameEnd
+
+	var header [8]byte
 	binary.LittleEndian.PutUint32(header[:4], uint32(len(payload)))
 	binary.LittleEndian.PutUint32(header[4:], crc32.Checksum(payload, castagnoli))
-	return append(append(batch, header[:]...), payload...), nil
+	bodySymbols := frame[1 : len(frame)-1]
+	headerSymbols := bodySymbols[:len(header)*2]
+	if err := encodeSymbols(headerSymbols, header[:]); err != nil {
+		return nil, fmt.Errorf("disklog: encode frame header: %w", err)
+	}
+	if err := encodeSymbols(bodySymbols[len(headerSymbols):], payload); err != nil {
+		return nil, fmt.Errorf("disklog: encode frame payload: %w", err)
+	}
+	return batch, nil
+}
+
+func encodeSymbols(dst, decoded []byte) error {
+	want, ok := checkedMulUint64(uint64(len(decoded)), encodedByteWidth)
+	if !ok || want != uint64(len(dst)) {
+		return fmt.Errorf("encoded symbol buffer has %d bytes, want %d", len(dst), want)
+	}
+	for i, b := range decoded {
+		dst[2*i] = frameSymbolBase + b>>4
+		dst[2*i+1] = frameSymbolBase + b&0x0f
+	}
+	return nil
+}
+
+func decodeSymbols(dst, symbols []byte) error {
+	want, ok := checkedMulUint64(uint64(len(dst)), encodedByteWidth)
+	if !ok || want != uint64(len(symbols)) {
+		return fmt.Errorf("interior has %d symbols, want %d", len(symbols), want)
+	}
+	for i := range dst {
+		hi, lo := symbols[2*i], symbols[2*i+1]
+		if !isFrameSymbol(hi) {
+			return fmt.Errorf("invalid interior byte 0x%02x at symbol %d", hi, 2*i)
+		}
+		if !isFrameSymbol(lo) {
+			return fmt.Errorf("invalid interior byte 0x%02x at symbol %d", lo, 2*i+1)
+		}
+		dst[i] = (hi-frameSymbolBase)<<4 | (lo - frameSymbolBase)
+	}
+	return nil
+}
+
+func checkedFrameSize(payloadSize uint64) (uint64, bool) {
+	bodySize, ok := checkedAddUint64(frameHeaderSize, payloadSize)
+	if !ok {
+		return 0, false
+	}
+	encodedSize, ok := checkedMulUint64(bodySize, encodedByteWidth)
+	if !ok {
+		return 0, false
+	}
+	return checkedAddUint64(frameMarkerBytes, encodedSize)
+}
+
+func checkedAddUint64(a, b uint64) (uint64, bool) {
+	if math.MaxUint64-a < b {
+		return 0, false
+	}
+	return a + b, true
+}
+
+func checkedMulUint64(a, b uint64) (uint64, bool) {
+	if a != 0 && b > math.MaxUint64/a {
+		return 0, false
+	}
+	return a * b, true
+}
+
+func checkedInt(n uint64) (int, error) {
+	if !fitsIntBits(n, strconv.IntSize) {
+		return 0, fmt.Errorf("size %d exceeds %d-bit int", n, strconv.IntSize)
+	}
+	return int(n), nil
+}
+
+func fitsIntBits(n uint64, bits int) bool {
+	switch bits {
+	case 32:
+		return n <= math.MaxInt32
+	case 64:
+		return n <= math.MaxInt64
+	default:
+		return false
+	}
 }
 
 // entryPointers builds the record's entries without copying generated
