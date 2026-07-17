@@ -94,3 +94,56 @@ concurrently-failing `Execute` already returns — rather than a `NotLeader`
 response. A dead node is not "not the leader", and its hint may still name
 itself; an RPC error makes `mqctl` round-robin to another peer immediately,
 reusing the same `client_id`/`seq`, which dedup makes safe.
+
+## Disklog suffix truncation is logical, via TruncateRecord (Phase 3A)
+
+Of the two truncation options the phase spec authorizes,
+`internal/storage/disklog` implements the primary one: truncation as a log
+record, not a file rewrite. When `Save` receives entries whose first index
+is ≤ `LastIndex()`, it appends a `TruncateRecord{from_index}` frame ahead of
+the `EntriesRecord` in the same synced batch; recovery replays records in
+order and drops the mirrored suffix at `from_index` before appending the
+replacements. (Replay also treats an `EntriesRecord` overlapping existing
+indexes as an implicit truncate at its first index — the same rule
+`MemStorage.Save` applies — so both encodings of an overwrite agree.)
+
+This is the smaller option under segmented files: overwritten suffixes can
+span segment boundaries, so a physical truncate would need file deletions
+plus a tail rewrite plus directory syncs, while the logical record keeps
+segments strictly append-only and keeps one `Save` = one write + one fsync
+on one file. The single physical rewrite in the package is recovery's
+torn-tail handling, which truncates the final segment at the start of an
+unterminated final frame so discarded bytes cannot resurface after appends
+resume. A frame whose terminator was observed is never rewritten away.
+
+## Disklog recovery must re-establish durability, not assume it (Phase 3A)
+
+What the paper doesn't tell you: bytes that read back after a restart are
+not evidence they are on stable media. A process that wrote a batch and then
+failed its fsync fail-stops — but its in-memory poison dies with it, and the
+complete frames it wrote may sit in the page cache, readable by the next
+process yet gone after a power cut. The same holds for a segment name whose
+creation-time directory fsync failed. Meanwhile recovered state drives
+responses without any further `Save`: a follower re-answers a repeated
+`RequestVote` from its recovered `VotedFor` with no new `HardState`, and
+`Save(nil, nil)` persists nothing — so nothing downstream will sync on the
+recovered state's behalf. `Open` therefore syncs every segment file and then
+the directory before it returns, and fails if it cannot; normal Saves keep
+one Ready = one Save = one batch = one sync.
+
+The physical framing makes that tail rule decidable without believing the
+record's length. A frame is `0xFA || E(B) || 0xFB`; `E` represents every body
+byte as two bytes from the otherwise-unused `0x40..0x4F` alphabet. At a
+record boundary only `0xFA` is legal, and before `0xFB` only alphabet bytes
+are legal. Once `0xFB` is observed, parity, decoded length, CRC32C, protobuf,
+and record-kind failures are corruption even in the final frame. Only EOF
+before `0xFB` in the final record of the final segment is discarded; zero
+padding is not a special case.
+
+One information-theoretic limit remains and is accepted by guide decision
+#16: a missing final `0xFB`, or a final `0xFB` changed to an alphabet byte,
+is indistinguishable from an interrupted append that retained that same
+prefix. Recovery discards either shape as an incomplete final frame. The
+integrity guarantee is deliberately stated for every single-byte change in
+a complete non-final frame, where a following start marker exposes a changed
+terminator.
