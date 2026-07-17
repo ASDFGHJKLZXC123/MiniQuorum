@@ -393,6 +393,164 @@ func TestCrashStorageSuffixTruncationDurableOnlyWhenSynced(t *testing.T) {
 	}
 }
 
+// overlapRecordLens measures the framed byte lengths of the three records an
+// overlapping Save stages — hard state, truncate, entries — through public
+// behavior only: scratch saves measure the hard-state and entries records
+// (an empty scratch has nothing to overlap, so no truncate record), and a
+// retain-all before-sync crash on a probe carrying base measures the whole
+// batch; the truncate record is the remainder, and it must exist.
+func overlapRecordLens(t *testing.T, base []raftpb.Entry, hs *raft.HardState, overwrite []raftpb.Entry) (hsLen, truncLen, entriesLen int) {
+	t.Helper()
+	hsLen = recordBytesFor(t, hs, nil)
+	entriesLen = recordBytesFor(t, nil, overwrite)
+	probe := mustCrashStorage(t, 1, crashAt(2, CrashBeforeSync, RetainAllUnsynced))
+	mustSaveOK(t, probe, &raft.HardState{Term: 1, VotedFor: 1}, base)
+	if err := probe.Save(hs, overwrite); !errors.Is(err, ErrCrashed) {
+		t.Fatalf("probe Save() error = %v, want ErrCrashed", err)
+	}
+	info, ok := probe.LastCrash()
+	if !ok {
+		t.Fatal("probe LastCrash() reported no crash")
+	}
+	truncLen = info.UnsyncedBytes - hsLen - entriesLen
+	if truncLen <= 0 {
+		t.Fatalf("overlapping batch staged %d dirty bytes, want a truncate record beyond the %d-byte hard-state and %d-byte entries records", info.UnsyncedBytes, hsLen, entriesLen)
+	}
+	return hsLen, truncLen, entriesLen
+}
+
+// TestCrashStorageTruncateRecordDurableWhenEntriesRecordTorn pins the
+// intermediate crash state the disklog's logical truncation makes reachable:
+// in an overlapping batch the truncate record precedes the entries record,
+// so a before-sync cut that keeps the truncate record whole but tears the
+// entries record must recover to a durably SHORTENED old log — the
+// conflicting suffix is gone even though its replacement never landed. The
+// batch never acked (Save errored before returning), so Raft re-replicates
+// the suffix afterwards, modeled by an ordinary follow-up Save; and two
+// identical runs must end byte-identical on the platter.
+func TestCrashStorageTruncateRecordDurableWhenEntriesRecordTorn(t *testing.T) {
+	base := crashTestEntries(1, 1, "alpha", "bravo", "charlie")
+	hs2 := raft.HardState{Term: 2, VotedFor: 3}
+	overwrite := crashTestEntries(2, 2, "prime")
+	hsLen, truncLen, entriesLen := overlapRecordLens(t, base, &hs2, overwrite)
+	wantFinal := []raftpb.Entry{
+		{Index: 1, Term: 1, Type: raftpb.EntryType_NORMAL, Data: []byte("alpha")},
+		{Index: 2, Term: 2, Type: raftpb.EntryType_NORMAL, Data: []byte("prime")},
+	}
+
+	cuts := []struct {
+		name   string
+		retain int
+	}{
+		{"entries record entirely lost", hsLen + truncLen},
+		{"entries record torn one byte short", hsLen + truncLen + entriesLen - 1},
+	}
+	for _, tc := range cuts {
+		t.Run(tc.name, func(t *testing.T) {
+			run := func() []byte {
+				cs := mustCrashStorage(t, 1, crashAt(2, CrashBeforeSync, tc.retain))
+				mustSaveOK(t, cs, &raft.HardState{Term: 1, VotedFor: 1}, base)
+				syncedLen := len(cs.DurableBytes())
+				if err := cs.Save(&hs2, overwrite); !errors.Is(err, ErrCrashed) {
+					t.Fatalf("Save() error = %v, want ErrCrashed", err)
+				}
+				info, _ := cs.LastCrash()
+				if info.UnsyncedBytes != hsLen+truncLen+entriesLen || info.RetainedBytes != tc.retain {
+					t.Fatalf("LastCrash() = %+v, want %d dirty bytes with %d retained", info, hsLen+truncLen+entriesLen, tc.retain)
+				}
+				if err := cs.Recover(); err != nil {
+					t.Fatalf("Recover() error = %v", err)
+				}
+				hs, _ := cs.HardState()
+				if hs != hs2 {
+					t.Fatalf("recovered HardState = %+v, want %+v (the hard-state record survived complete)", hs, hs2)
+				}
+				if got := storedLog(t, cs); !crashLogsEqual(got, base[:1]) {
+					t.Fatalf("recovered log = %s, want the durably shortened %s", crashLogString(got), crashLogString(base[:1]))
+				}
+				if got, want := len(cs.DurableBytes()), syncedLen+hsLen+truncLen; got != want {
+					t.Fatalf("durable after recovery = %d bytes, want %d (truncate record kept, torn entries record trimmed)", got, want)
+				}
+				// The node is now legitimately behind: replication re-sends
+				// the suffix and the log extends past the truncate point.
+				mustSaveOK(t, cs, nil, crashTestEntries(2, 2, "prime"))
+				if got := storedLog(t, cs); !crashLogsEqual(got, wantFinal) {
+					t.Fatalf("re-replicated log = %s, want %s", crashLogString(got), crashLogString(wantFinal))
+				}
+				return cs.DurableBytes()
+			}
+			if first, second := run(), run(); !bytes.Equal(first, second) {
+				t.Fatal("identical runs left different platter bytes, want byte-identical replay")
+			}
+		})
+	}
+}
+
+// TestCrashStorageOverlappingBatchEveryPrefixCutMatchesDisklogRecordOrder
+// cuts the dirty buffer of an overlapping three-record batch — hard state,
+// truncate, entries: the disklog's replay order — at every byte offset. The
+// recovered state must cross exactly three boundaries as the cut grows: the
+// old state below the hard-state record boundary, the new hard state with
+// the old log below the truncate boundary, the new hard state with the
+// durably shortened log below the entries boundary, and the full overwrite
+// only at the full length. The synced prefix stays byte-identical at every
+// cut.
+func TestCrashStorageOverlappingBatchEveryPrefixCutMatchesDisklogRecordOrder(t *testing.T) {
+	base := crashTestEntries(1, 1, "alpha", "bravo", "charlie")
+	hs1 := raft.HardState{Term: 1, VotedFor: 1}
+	hs2 := raft.HardState{Term: 2, VotedFor: 3}
+	overwrite := crashTestEntries(2, 2, "prime")
+	hsLen, truncLen, entriesLen := overlapRecordLens(t, base, &hs2, overwrite)
+	total := hsLen + truncLen + entriesLen
+	overwritten := []raftpb.Entry{
+		{Index: 1, Term: 1, Type: raftpb.EntryType_NORMAL, Data: []byte("alpha")},
+		{Index: 2, Term: 2, Type: raftpb.EntryType_NORMAL, Data: []byte("prime")},
+	}
+
+	for cut := 0; cut <= total; cut++ {
+		cs := mustCrashStorage(t, 1, crashAt(2, CrashBeforeSync, cut))
+		mustSaveOK(t, cs, &hs1, base)
+		syncedImage := cs.DurableBytes()
+		if err := cs.Save(&hs2, overwrite); !errors.Is(err, ErrCrashed) {
+			t.Fatalf("cut %d: Save() error = %v, want ErrCrashed", cut, err)
+		}
+		info, _ := cs.LastCrash()
+		if info.UnsyncedBytes != total || info.RetainedBytes != cut {
+			t.Fatalf("cut %d: LastCrash() = %+v, want %d dirty bytes with %d retained", cut, info, total, cut)
+		}
+		platter := cs.DurableBytes()
+		if len(platter) != len(syncedImage)+cut || !bytes.Equal(platter[:len(syncedImage)], syncedImage) {
+			t.Fatalf("cut %d: platter is %d bytes, want the %d synced bytes byte-identical plus %d retained", cut, len(platter), len(syncedImage), cut)
+		}
+		if err := cs.Recover(); err != nil {
+			t.Fatalf("cut %d: Recover() error = %v", cut, err)
+		}
+		wantHS, wantLog, wantDurable := hs1, base, len(syncedImage)
+		if cut >= hsLen {
+			wantHS = hs2 // the hard-state record survived complete
+			wantDurable += hsLen
+		}
+		if cut >= hsLen+truncLen {
+			wantLog = base[:1] // the truncate record survived: suffix durably gone
+			wantDurable += truncLen
+		}
+		if cut == total {
+			wantLog = overwritten // the entries record survived complete
+			wantDurable += entriesLen
+		}
+		hs, _ := cs.HardState()
+		if hs != wantHS {
+			t.Fatalf("cut %d: recovered HardState = %+v, want %+v", cut, hs, wantHS)
+		}
+		if got := storedLog(t, cs); !crashLogsEqual(got, wantLog) {
+			t.Fatalf("cut %d: recovered log = %s, want %s", cut, crashLogString(got), crashLogString(wantLog))
+		}
+		if got := len(cs.DurableBytes()); got != wantDurable {
+			t.Fatalf("cut %d: durable after recovery = %d bytes, want %d (torn tail trimmed)", cut, got, wantDurable)
+		}
+	}
+}
+
 // crashScriptDigest drives one storage through a fixed script of saves,
 // crashes, and recoveries — spanning a torn before-sync crash and an armed
 // after-send crash — and records every observable after every step.

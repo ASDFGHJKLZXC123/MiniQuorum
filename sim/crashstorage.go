@@ -14,19 +14,24 @@ import (
 
 // CrashStorage is the Phase 3 sim storage crash model: an in-memory
 // storage.Storage that models the disklog's sync boundary at byte
-// granularity. Every Save encodes its batch as framed records — a hard-state
-// record, then an entries record, mirroring the on-disk oneof order — into
-// an unsynced (dirty) buffer, then moves them to the durable byte log at the
-// sync barrier. A crash keeps durable bytes exactly as written (synced
-// records are never torn) and keeps only the scheduled prefix of the dirty
-// buffer, so a cut can land mid-record: a torn tail.
+// granularity. Every Save encodes its batch as framed records in the
+// disklog's exact replay order — a hard-state record, a logical truncate
+// record when the entries overwrite an existing suffix, then an entries
+// record — into an unsynced (dirty) buffer, then moves them to the durable
+// byte log at the sync barrier. A crash keeps durable bytes exactly as
+// written (synced records are never torn) and keeps only the scheduled
+// prefix of the dirty buffer, so a cut can land mid-record: a torn tail.
 //
 // Recovery scans the surviving bytes front to back, folds each complete
-// record into a fresh view in record order (an entries record logically
-// truncates the suffix from its first index, exactly like Storage.Save), and
-// drops a torn final record — the disklog torn-tail policy. Everything is
-// single-threaded and derives from plain data: no wall clock, no goroutines,
-// no map iteration, no ambient randomness anywhere in the model.
+// record into a fresh view in record order (a truncate record drops the
+// suffix from its index; an entries record logically truncates the suffix
+// from its first index, exactly like Storage.Save), and drops a torn final
+// record — the disklog torn-tail policy. A surviving complete truncate
+// record whose entries record tore away therefore recovers to a durably
+// shortened old log: the intermediate crash state the disklog's record
+// order makes reachable. Everything is single-threaded and derives from
+// plain data: no wall clock, no goroutines, no map iteration, no ambient
+// randomness anywhere in the model.
 //
 // While crashed, the read side keeps serving the surviving platter image so
 // the sim's omniscient invariants can inspect a down node's disk; Save fails
@@ -98,6 +103,14 @@ func (cs *CrashStorage) Save(hs *raft.HardState, entries []raftpb.Entry) error {
 		cs.unsynced = appendHardStateRecord(cs.unsynced, *hs)
 	}
 	if len(entries) > 0 {
+		// An overlapping batch stages a logical truncate record before its
+		// entries, the disklog's exact order, so a tear inside the entries
+		// record leaves the old suffix durably truncated with nothing in its
+		// place. Index 0 never stages one: the disklog rejects it before
+		// encoding, and here the entries record's own implicit cut covers it.
+		if first := entries[0].Index; first != 0 && first <= cs.view.LastIndex() {
+			cs.unsynced = appendTruncateRecord(cs.unsynced, first)
+		}
 		cs.unsynced = appendEntriesRecord(cs.unsynced, entries)
 	}
 	directive, ok := cs.pendingDirective(cs.saves)
@@ -234,12 +247,14 @@ func (cs *CrashStorage) crash(save uint64, point CrashPoint, retain int) {
 // Record framing mirrors the disklog's [len][crc32c][payload] shape with a
 // sim-local deterministic payload encoding (fixed-width little-endian; no
 // protobuf, so this packet does not touch proto/). One Save stages at most
-// two records: hard state, then entries.
+// three records, in the disklog's replay order: hard state, truncate (only
+// when the batch overwrites an existing suffix), then entries.
 const recordHeaderLen = 8
 
 const (
 	recordKindHardState byte = 1
 	recordKindEntries   byte = 2
+	recordKindTruncate  byte = 3
 )
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
@@ -256,6 +271,13 @@ func appendHardStateRecord(dst []byte, hs raft.HardState) []byte {
 	payload[0] = recordKindHardState
 	binary.LittleEndian.PutUint64(payload[1:9], hs.Term)
 	binary.LittleEndian.PutUint64(payload[9:17], uint64(hs.VotedFor))
+	return appendRecord(dst, payload)
+}
+
+func appendTruncateRecord(dst []byte, from uint64) []byte {
+	payload := make([]byte, 9)
+	payload[0] = recordKindTruncate
+	binary.LittleEndian.PutUint64(payload[1:9], from)
 	return appendRecord(dst, payload)
 }
 
@@ -276,32 +298,44 @@ func appendEntriesRecord(dst []byte, entries []raftpb.Entry) []byte {
 // parseRecords folds every complete record in data, in byte order, into a
 // fresh view, and returns the byte length of that complete prefix. Trailing
 // bytes that do not form a whole record are a torn tail: ignored here,
-// trimmed by Recover. The fold applies records exactly as Storage.Save
-// would, so an entries record truncates the suffix from its first index.
+// trimmed by Recover. The fold applies hard-state and entries records
+// exactly as Storage.Save would (an entries record truncates the suffix from
+// its first index) and honors a complete truncate record by itself — even
+// when the entries record that followed it tore away.
 func parseRecords(data []byte) (*storage.MemStorage, int, error) {
-	view := storage.NewMemStorage()
+	var state recoveredState
 	offset := 0
 	for {
 		rest := data[offset:]
 		if len(rest) < recordHeaderLen {
-			return view, offset, nil
+			return state.view(), offset, nil
 		}
 		payloadLen := int(binary.LittleEndian.Uint32(rest[0:4]))
 		if len(rest) < recordHeaderLen+payloadLen {
-			return view, offset, nil
+			return state.view(), offset, nil
 		}
 		payload := rest[recordHeaderLen : recordHeaderLen+payloadLen]
 		if crc32.Checksum(payload, castagnoli) != binary.LittleEndian.Uint32(rest[4:8]) {
 			return nil, 0, fmt.Errorf("sim: record at byte %d fails crc32c; synced bytes are never torn, so this is a codec bug", offset)
 		}
-		if err := applyRecordPayload(view, payload); err != nil {
+		if err := state.apply(payload); err != nil {
 			return nil, 0, err
 		}
 		offset += recordHeaderLen + payloadLen
 	}
 }
 
-func applyRecordPayload(view *storage.MemStorage, payload []byte) error {
+// recoveredState is the record fold target. It holds plain hard state and
+// entries because a truncate record is a pure suffix drop, which
+// Storage.Save cannot express; the other record kinds fold with Save's exact
+// cut-and-append semantics, so the materialized view is identical to folding
+// them through a MemStorage.
+type recoveredState struct {
+	hard    raft.HardState
+	entries []raftpb.Entry
+}
+
+func (s *recoveredState) apply(payload []byte) error {
 	if len(payload) == 0 {
 		return errors.New("sim: empty record payload")
 	}
@@ -310,20 +344,56 @@ func applyRecordPayload(view *storage.MemStorage, payload []byte) error {
 		if len(payload) != 17 {
 			return fmt.Errorf("sim: hard-state record payload is %d bytes, want 17", len(payload))
 		}
-		hs := raft.HardState{
+		s.hard = raft.HardState{
 			Term:     binary.LittleEndian.Uint64(payload[1:9]),
 			VotedFor: raft.NodeID(binary.LittleEndian.Uint64(payload[9:17])),
 		}
-		return view.Save(&hs, nil)
+		return nil
+	case recordKindTruncate:
+		if len(payload) != 9 {
+			return fmt.Errorf("sim: truncate record payload is %d bytes, want 9", len(payload))
+		}
+		from := binary.LittleEndian.Uint64(payload[1:9])
+		if from == 0 {
+			return errors.New("sim: truncate record from index 0")
+		}
+		s.entries = truncateFromIndex(s.entries, from)
+		return nil
 	case recordKindEntries:
 		entries, err := decodeEntriesBody(payload[1:])
 		if err != nil {
 			return err
 		}
-		return view.Save(nil, entries)
+		s.entries = append(truncateFromIndex(s.entries, entries[0].Index), entries...)
+		return nil
 	default:
 		return fmt.Errorf("sim: unknown record kind %d", payload[0])
 	}
+}
+
+// view materializes the folded state as a MemStorage so reads keep the
+// frozen bounds semantics. MemStorage.Save never fails.
+func (s *recoveredState) view() *storage.MemStorage {
+	view := storage.NewMemStorage()
+	_ = view.Save(&s.hard, nil)
+	if len(s.entries) > 0 {
+		_ = view.Save(nil, s.entries)
+	}
+	return view
+}
+
+// truncateFromIndex drops the suffix at index and above: the cut
+// Storage.Save applies before appending an overlapping batch, and the whole
+// effect of a truncate record.
+func truncateFromIndex(entries []raftpb.Entry, index uint64) []raftpb.Entry {
+	cut := len(entries)
+	for i := range entries {
+		if entries[i].Index >= index {
+			cut = i
+			break
+		}
+	}
+	return entries[:cut]
 }
 
 func decodeEntriesBody(body []byte) ([]raftpb.Entry, error) {
