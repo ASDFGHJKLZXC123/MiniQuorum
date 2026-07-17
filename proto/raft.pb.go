@@ -744,6 +744,246 @@ func (*SendResp) Descriptor() ([]byte, []int) {
 	return file_proto_raft_proto_rawDescGZIP(), []int{8}
 }
 
+// LogRecord is the payload of one framed disklog write-ahead-log record
+// (Phase 3). Storage-only: it is never sent on the wire.
+type LogRecord struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Body:
+	//
+	//	*LogRecord_HardState
+	//	*LogRecord_Entries
+	//	*LogRecord_Truncate
+	Body          isLogRecord_Body `protobuf_oneof:"body"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LogRecord) Reset() {
+	*x = LogRecord{}
+	mi := &file_proto_raft_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LogRecord) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LogRecord) ProtoMessage() {}
+
+func (x *LogRecord) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_raft_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LogRecord.ProtoReflect.Descriptor instead.
+func (*LogRecord) Descriptor() ([]byte, []int) {
+	return file_proto_raft_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *LogRecord) GetBody() isLogRecord_Body {
+	if x != nil {
+		return x.Body
+	}
+	return nil
+}
+
+func (x *LogRecord) GetHardState() *HardStateRecord {
+	if x != nil {
+		if x, ok := x.Body.(*LogRecord_HardState); ok {
+			return x.HardState
+		}
+	}
+	return nil
+}
+
+func (x *LogRecord) GetEntries() *EntriesRecord {
+	if x != nil {
+		if x, ok := x.Body.(*LogRecord_Entries); ok {
+			return x.Entries
+		}
+	}
+	return nil
+}
+
+func (x *LogRecord) GetTruncate() *TruncateRecord {
+	if x != nil {
+		if x, ok := x.Body.(*LogRecord_Truncate); ok {
+			return x.Truncate
+		}
+	}
+	return nil
+}
+
+type isLogRecord_Body interface {
+	isLogRecord_Body()
+}
+
+type LogRecord_HardState struct {
+	HardState *HardStateRecord `protobuf:"bytes,1,opt,name=hard_state,json=hardState,proto3,oneof"`
+}
+
+type LogRecord_Entries struct {
+	Entries *EntriesRecord `protobuf:"bytes,2,opt,name=entries,proto3,oneof"`
+}
+
+type LogRecord_Truncate struct {
+	Truncate *TruncateRecord `protobuf:"bytes,3,opt,name=truncate,proto3,oneof"`
+}
+
+func (*LogRecord_HardState) isLogRecord_Body() {}
+
+func (*LogRecord_Entries) isLogRecord_Body() {}
+
+func (*LogRecord_Truncate) isLogRecord_Body() {}
+
+type HardStateRecord struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	VotedFor      uint64                 `protobuf:"varint,2,opt,name=voted_for,json=votedFor,proto3" json:"voted_for,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HardStateRecord) Reset() {
+	*x = HardStateRecord{}
+	mi := &file_proto_raft_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HardStateRecord) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HardStateRecord) ProtoMessage() {}
+
+func (x *HardStateRecord) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_raft_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HardStateRecord.ProtoReflect.Descriptor instead.
+func (*HardStateRecord) Descriptor() ([]byte, []int) {
+	return file_proto_raft_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *HardStateRecord) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *HardStateRecord) GetVotedFor() uint64 {
+	if x != nil {
+		return x.VotedFor
+	}
+	return 0
+}
+
+type EntriesRecord struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Entries       []*Entry               `protobuf:"bytes,1,rep,name=entries,proto3" json:"entries,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *EntriesRecord) Reset() {
+	*x = EntriesRecord{}
+	mi := &file_proto_raft_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *EntriesRecord) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*EntriesRecord) ProtoMessage() {}
+
+func (x *EntriesRecord) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_raft_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use EntriesRecord.ProtoReflect.Descriptor instead.
+func (*EntriesRecord) Descriptor() ([]byte, []int) {
+	return file_proto_raft_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *EntriesRecord) GetEntries() []*Entry {
+	if x != nil {
+		return x.Entries
+	}
+	return nil
+}
+
+type TruncateRecord struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	FromIndex     uint64                 `protobuf:"varint,1,opt,name=from_index,json=fromIndex,proto3" json:"from_index,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TruncateRecord) Reset() {
+	*x = TruncateRecord{}
+	mi := &file_proto_raft_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TruncateRecord) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TruncateRecord) ProtoMessage() {}
+
+func (x *TruncateRecord) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_raft_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TruncateRecord.ProtoReflect.Descriptor instead.
+func (*TruncateRecord) Descriptor() ([]byte, []int) {
+	return file_proto_raft_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *TruncateRecord) GetFromIndex() uint64 {
+	if x != nil {
+		return x.FromIndex
+	}
+	return 0
+}
+
 var File_proto_raft_proto protoreflect.FileDescriptor
 
 const file_proto_raft_proto_rawDesc = "" +
@@ -798,7 +1038,21 @@ const file_proto_raft_proto_rawDesc = "" +
 	"\x04type\x18\x03 \x01(\x0e2\x15.miniquorum.EntryTypeR\x04type\x12\x12\n" +
 	"\x04data\x18\x04 \x01(\fR\x04data\"\n" +
 	"\n" +
-	"\bSendResp*=\n" +
+	"\bSendResp\"\xc2\x01\n" +
+	"\tLogRecord\x12<\n" +
+	"\n" +
+	"hard_state\x18\x01 \x01(\v2\x1b.miniquorum.HardStateRecordH\x00R\thardState\x125\n" +
+	"\aentries\x18\x02 \x01(\v2\x19.miniquorum.EntriesRecordH\x00R\aentries\x128\n" +
+	"\btruncate\x18\x03 \x01(\v2\x1a.miniquorum.TruncateRecordH\x00R\btruncateB\x06\n" +
+	"\x04body\"B\n" +
+	"\x0fHardStateRecord\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x1b\n" +
+	"\tvoted_for\x18\x02 \x01(\x04R\bvotedFor\"<\n" +
+	"\rEntriesRecord\x12+\n" +
+	"\aentries\x18\x01 \x03(\v2\x11.miniquorum.EntryR\aentries\"/\n" +
+	"\x0eTruncateRecord\x12\x1d\n" +
+	"\n" +
+	"from_index\x18\x01 \x01(\x04R\tfromIndex*=\n" +
 	"\tEntryType\x12\x1a\n" +
 	"\x16ENTRY_TYPE_UNSPECIFIED\x10\x00\x12\n" +
 	"\n" +
@@ -820,7 +1074,7 @@ func file_proto_raft_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_raft_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_proto_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_proto_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
 var file_proto_raft_proto_goTypes = []any{
 	(EntryType)(0),               // 0: miniquorum.EntryType
 	(*Message)(nil),              // 1: miniquorum.Message
@@ -832,23 +1086,31 @@ var file_proto_raft_proto_goTypes = []any{
 	(*InstallSnapshotResp)(nil),  // 7: miniquorum.InstallSnapshotResp
 	(*Entry)(nil),                // 8: miniquorum.Entry
 	(*SendResp)(nil),             // 9: miniquorum.SendResp
+	(*LogRecord)(nil),            // 10: miniquorum.LogRecord
+	(*HardStateRecord)(nil),      // 11: miniquorum.HardStateRecord
+	(*EntriesRecord)(nil),        // 12: miniquorum.EntriesRecord
+	(*TruncateRecord)(nil),       // 13: miniquorum.TruncateRecord
 }
 var file_proto_raft_proto_depIdxs = []int32{
-	2, // 0: miniquorum.Message.request_vote:type_name -> miniquorum.RequestVoteReq
-	3, // 1: miniquorum.Message.request_vote_resp:type_name -> miniquorum.RequestVoteResp
-	4, // 2: miniquorum.Message.append_entries:type_name -> miniquorum.AppendEntriesReq
-	5, // 3: miniquorum.Message.append_entries_resp:type_name -> miniquorum.AppendEntriesResp
-	6, // 4: miniquorum.Message.install_snapshot:type_name -> miniquorum.InstallSnapshotChunk
-	7, // 5: miniquorum.Message.install_snapshot_resp:type_name -> miniquorum.InstallSnapshotResp
-	8, // 6: miniquorum.AppendEntriesReq.entries:type_name -> miniquorum.Entry
-	0, // 7: miniquorum.Entry.type:type_name -> miniquorum.EntryType
-	1, // 8: miniquorum.Raft.Send:input_type -> miniquorum.Message
-	9, // 9: miniquorum.Raft.Send:output_type -> miniquorum.SendResp
-	9, // [9:10] is the sub-list for method output_type
-	8, // [8:9] is the sub-list for method input_type
-	8, // [8:8] is the sub-list for extension type_name
-	8, // [8:8] is the sub-list for extension extendee
-	0, // [0:8] is the sub-list for field type_name
+	2,  // 0: miniquorum.Message.request_vote:type_name -> miniquorum.RequestVoteReq
+	3,  // 1: miniquorum.Message.request_vote_resp:type_name -> miniquorum.RequestVoteResp
+	4,  // 2: miniquorum.Message.append_entries:type_name -> miniquorum.AppendEntriesReq
+	5,  // 3: miniquorum.Message.append_entries_resp:type_name -> miniquorum.AppendEntriesResp
+	6,  // 4: miniquorum.Message.install_snapshot:type_name -> miniquorum.InstallSnapshotChunk
+	7,  // 5: miniquorum.Message.install_snapshot_resp:type_name -> miniquorum.InstallSnapshotResp
+	8,  // 6: miniquorum.AppendEntriesReq.entries:type_name -> miniquorum.Entry
+	0,  // 7: miniquorum.Entry.type:type_name -> miniquorum.EntryType
+	11, // 8: miniquorum.LogRecord.hard_state:type_name -> miniquorum.HardStateRecord
+	12, // 9: miniquorum.LogRecord.entries:type_name -> miniquorum.EntriesRecord
+	13, // 10: miniquorum.LogRecord.truncate:type_name -> miniquorum.TruncateRecord
+	8,  // 11: miniquorum.EntriesRecord.entries:type_name -> miniquorum.Entry
+	1,  // 12: miniquorum.Raft.Send:input_type -> miniquorum.Message
+	9,  // 13: miniquorum.Raft.Send:output_type -> miniquorum.SendResp
+	13, // [13:14] is the sub-list for method output_type
+	12, // [12:13] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_proto_raft_proto_init() }
@@ -864,13 +1126,18 @@ func file_proto_raft_proto_init() {
 		(*Message_InstallSnapshot)(nil),
 		(*Message_InstallSnapshotResp)(nil),
 	}
+	file_proto_raft_proto_msgTypes[9].OneofWrappers = []any{
+		(*LogRecord_HardState)(nil),
+		(*LogRecord_Entries)(nil),
+		(*LogRecord_Truncate)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_raft_proto_rawDesc), len(file_proto_raft_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   9,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

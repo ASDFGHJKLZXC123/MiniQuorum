@@ -77,3 +77,26 @@ service Raft {
 }
 
 message SendResp {}
+
+// LogRecord is the payload of one framed disklog write-ahead-log record
+// (Phase 3). Storage-only: it is never sent on the wire.
+message LogRecord {
+  oneof body {
+    HardStateRecord hard_state = 1;
+    EntriesRecord entries = 2;
+    TruncateRecord truncate = 3;
+  }
+}
+
+message HardStateRecord {
+  uint64 term = 1;
+  uint64 voted_for = 2;
+}
+
+message EntriesRecord {
+  repeated Entry entries = 1;
+}
+
+message TruncateRecord {
+  uint64 from_index = 1;
+}

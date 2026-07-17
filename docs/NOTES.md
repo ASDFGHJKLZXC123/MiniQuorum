@@ -94,3 +94,24 @@ concurrently-failing `Execute` already returns — rather than a `NotLeader`
 response. A dead node is not "not the leader", and its hint may still name
 itself; an RPC error makes `mqctl` round-robin to another peer immediately,
 reusing the same `client_id`/`seq`, which dedup makes safe.
+
+## Disklog suffix truncation is logical, via TruncateRecord (Phase 3A)
+
+Of the two truncation options the phase spec authorizes,
+`internal/storage/disklog` implements the primary one: truncation as a log
+record, not a file rewrite. When `Save` receives entries whose first index
+is ≤ `LastIndex()`, it appends a `TruncateRecord{from_index}` frame ahead of
+the `EntriesRecord` in the same synced batch; recovery replays records in
+order and drops the mirrored suffix at `from_index` before appending the
+replacements. (Replay also treats an `EntriesRecord` overlapping existing
+indexes as an implicit truncate at its first index — the same rule
+`MemStorage.Save` applies — so both encodings of an overwrite agree.)
+
+This is the smaller option under segmented files: overwritten suffixes can
+span segment boundaries, so a physical truncate would need file deletions
+plus a tail rewrite plus directory syncs, while the logical record keeps
+segments strictly append-only and keeps one `Save` = one write + one fsync
+on one file. The single physical rewrite in the package is recovery's
+torn-tail handling, which truncates the final segment at the first bad tail
+record so discarded bytes cannot resurface as mid-log corruption after
+appends resume.
