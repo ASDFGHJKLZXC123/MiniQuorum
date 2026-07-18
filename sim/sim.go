@@ -12,7 +12,11 @@ import (
 	"container/heap"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
+	"sort"
+
+	"google.golang.org/protobuf/proto"
 
 	"miniquorum/internal/raft"
 	"miniquorum/internal/statemachine"
@@ -43,13 +47,13 @@ type Config struct {
 // simNode is the sim's per-node bookkeeping. storage outlives crashes; it
 // models the disk. node is nil while the node is crashed.
 //
-// generation is bumped on every crash. Tick events carry the generation they
-// were scheduled under (see scheduleTick); an event whose generation no
-// longer matches sn.generation is stale and is dropped without rescheduling.
-// This closes the window where a tick queued before a crash is still
-// in-flight when Restart runs: without the check, that stale tick would
-// later fire against the freshly restarted node and reschedule itself,
-// running a second tick stream alongside the one Restart started.
+// generation identifies the current process/tick-stream lifecycle. It is
+// bumped whenever a crash or fail-stop kills a stream and whenever restart
+// replaces a process. Tick events carry the generation they were scheduled
+// under (see scheduleTick); an event whose generation no longer matches
+// sn.generation is stale and is dropped without rescheduling. This closes
+// the window where a tick queued before any process-ending transition is
+// still in-flight when Restart builds and schedules a fresh stream.
 type simNode struct {
 	id         raft.NodeID
 	cfg        raft.Config
@@ -58,6 +62,15 @@ type simNode struct {
 	node       *raft.Node
 	halted     bool
 	generation uint64
+
+	// paused models a GC pause / VM freeze: while true, handleTick and
+	// handleMessage skip this node's effects entirely (no ticks, no
+	// deliveries), though tick events keep being rescheduled so ticking
+	// resumes on FaultResume without a discontinuity.
+	paused bool
+	// tickMultiplier is this node's clock-skew multiplier (0 means unset,
+	// treated as 1.0). See Sim.SetClockSkew and Sim.nextTickDelay.
+	tickMultiplier float64
 
 	applied         []raftpb.Entry
 	results         []statemachine.Result
@@ -85,6 +98,25 @@ type Sim struct {
 	minDelay     VirtualTime
 	maxDelay     VirtualTime
 
+	// faultRand backs the drop/duplicate decision draws; it is a stream
+	// independent of delayRand and every per-node jitter stream (see
+	// newRandStreams), so enabling network faults never perturbs delay or
+	// election-jitter draws.
+	faultRand *rand.Rand
+	// dropRate and dupRate are the sim-wide message drop/duplicate
+	// probabilities in [0,1], set by FaultDropRate/FaultDuplicateRate
+	// events. Both default to 0 (off), so a Sim built without fault events
+	// behaves exactly as before this packet.
+	dropRate float64
+	dupRate  float64
+
+	// restartAfterCrash contains only Save-ordinal crash directives whose
+	// serialized policy requests causal recovery. NewFaultSim populates it;
+	// newCrashSim leaves it nil so Phase 3's explicit recovery behavior is
+	// unchanged. It is lookup-only except for deleting a directive once it
+	// fires, so map iteration can never affect simulation order.
+	restartAfterCrash map[crashDirectiveKey]CrashPoint
+
 	invariants []InvariantFunc
 	leaders    *leaderTracker
 
@@ -108,6 +140,34 @@ func NewSim(cfg Config) (*Sim, error) {
 // changing the frozen public Config surface.
 func newCrashSim(cfg Config, schedule FaultSchedule) (*Sim, error) {
 	return newSim(cfg, schedule, true)
+}
+
+// NewFaultSim builds a Sim exactly like NewSim, but wires in the full
+// phase-4 fault model from schedule: schedule.Crashes install Phase 3
+// storage crash points (the same mechanism newCrashSim uses — the schedule
+// selects the crash point), and schedule.Events schedule the
+// network/partition/pause/skew/host-crash faults onto the event queue at
+// construction time, ordered by virtual time. Two Sims built from the same
+// Config and schedule fire every fault identically.
+func NewFaultSim(cfg Config, schedule FaultSchedule) (*Sim, error) {
+	if err := schedule.ValidateForCluster(cfg.NodeIDs); err != nil {
+		return nil, err
+	}
+	s, err := newSim(cfg, schedule, true)
+	if err != nil {
+		return nil, err
+	}
+	for _, directive := range schedule.Crashes {
+		if !directive.RestartAfterCrash {
+			continue
+		}
+		if s.restartAfterCrash == nil {
+			s.restartAfterCrash = make(map[crashDirectiveKey]CrashPoint)
+		}
+		s.restartAfterCrash[crashDirectiveKey{node: directive.Node, save: directive.Save}] = directive.Point
+	}
+	s.installFaultEvents(schedule.Events)
+	return s, nil
 }
 
 func newSim(cfg Config, schedule FaultSchedule, crashStorage bool) (*Sim, error) {
@@ -136,7 +196,7 @@ func newSim(cfg Config, schedule FaultSchedule, crashStorage bool) (*Sim, error)
 	}
 
 	order := append([]raft.NodeID(nil), cfg.NodeIDs...)
-	delayRand, perNode := newRandStreams(cfg.Seed, order)
+	delayRand, perNode, faultRand := newRandStreams(cfg.Seed, order)
 
 	s := &Sim{
 		seed:         cfg.Seed,
@@ -144,6 +204,7 @@ func newSim(cfg Config, schedule FaultSchedule, crashStorage bool) (*Sim, error)
 		nodes:        make(map[raft.NodeID]*simNode, len(order)),
 		partition:    make(map[partitionKey]struct{}),
 		delayRand:    delayRand,
+		faultRand:    faultRand,
 		tickInterval: tickInterval,
 		minDelay:     minDelay,
 		maxDelay:     maxDelay,
@@ -225,6 +286,101 @@ func (s *Sim) blocked(from, to raft.NodeID) bool {
 	return ok
 }
 
+// PartitionGroups splits groups into mutually unreachable clusters: every
+// pair of nodes drawn from two different groups is blocked in both
+// directions. Nodes within the same group are left fully connected. Unlike
+// the directed Partition, this is the symmetric group-split fault: it
+// catches bugs that only show up when neither side can reach the other, as
+// opposed to the asymmetric case where one direction stays open.
+func (s *Sim) PartitionGroups(groups [][]raft.NodeID) {
+	for i, left := range groups {
+		for _, right := range groups[i+1:] {
+			for _, from := range left {
+				for _, to := range right {
+					s.Partition(from, to)
+					s.Partition(to, from)
+				}
+			}
+		}
+	}
+}
+
+// HealGroups reverses a prior PartitionGroups split for the same groups.
+func (s *Sim) HealGroups(groups [][]raft.NodeID) {
+	for i, left := range groups {
+		for _, right := range groups[i+1:] {
+			for _, from := range left {
+				for _, to := range right {
+					s.Heal(from, to)
+					s.Heal(to, from)
+				}
+			}
+		}
+	}
+}
+
+// Pause freezes id: while paused, its ticks have no effect and no inbound
+// message is delivered to it, modeling a GC pause or VM freeze. Pausing an
+// unknown node is a no-op.
+func (s *Sim) Pause(id raft.NodeID) {
+	sn, ok := s.nodes[id]
+	if !ok {
+		return
+	}
+	sn.paused = true
+	s.record("pause node=%d", id)
+}
+
+// Resume reverses a prior Pause. Resuming an unknown node is a no-op.
+func (s *Sim) Resume(id raft.NodeID) {
+	sn, ok := s.nodes[id]
+	if !ok {
+		return
+	}
+	sn.paused = false
+	s.record("resume node=%d", id)
+}
+
+// SetClockSkew sets id's per-node tick-rate multiplier: a rate of
+// multiplier means id ticks multiplier times as often as the cluster
+// default, so its ticks fire every tickInterval/multiplier virtual
+// milliseconds instead of every tickInterval (e.g. with a 50ms base, 2.0
+// ticks every 25ms and 0.5 ticks every 100ms). multiplier must be in
+// [0.5, 2.0], per the phase-4 spec; setting an unknown node is a no-op.
+func (s *Sim) SetClockSkew(id raft.NodeID, multiplier float64) error {
+	if math.IsNaN(multiplier) || math.IsInf(multiplier, 0) {
+		return fmt.Errorf("sim: clock skew multiplier %v is not finite", multiplier)
+	}
+	if multiplier < minClockMultiplier || multiplier > maxClockMultiplier {
+		return fmt.Errorf("sim: clock skew multiplier %v outside [%v,%v]", multiplier, minClockMultiplier, maxClockMultiplier)
+	}
+	sn, ok := s.nodes[id]
+	if !ok {
+		return nil
+	}
+	sn.tickMultiplier = multiplier
+	s.record("clockskew node=%d multiplier=%v", id, multiplier)
+	return nil
+}
+
+// nextTickDelay returns the virtual-millisecond gap until sn's next tick,
+// applying its clock-skew multiplier (1.0 if unset): a higher multiplier is
+// a faster tick rate, so the interval is tickInterval/multiplier (2x ticks
+// twice as often, at half the interval; 0.5x ticks half as often, at double
+// the interval). Deterministic float64 arithmetic only: no wall clock, no
+// randomness.
+func (s *Sim) nextTickDelay(sn *simNode) VirtualTime {
+	mult := sn.tickMultiplier
+	if mult == 0 {
+		mult = 1
+	}
+	scaled := VirtualTime(math.Round(float64(s.tickInterval) / mult))
+	if scaled < 1 {
+		scaled = 1
+	}
+	return scaled
+}
+
 // ScheduleCrash discards node id's live *raft.Node at virtual time at. Its
 // sim storage survives, per the sim crash model.
 func (s *Sim) ScheduleCrash(id raft.NodeID, at VirtualTime) {
@@ -275,8 +431,10 @@ func (s *Sim) Leaderships() map[uint64][]raft.NodeID {
 
 // Propose synchronously supplies a client proposal to one simulated node and
 // processes the resulting Ready through the same persistence/send/apply/
-// Advance path as ticks and inbound messages. A down or fail-stopped node is
-// reported as not leader.
+// Advance path as ticks and inbound messages. A down, fail-stopped, or
+// paused node is reported as not leader: a paused node receives nothing
+// (mirroring handleTick/handleMessage), so its Propose is rejected before
+// touching raft.Node at all, not queued for after it resumes.
 func (s *Sim) Propose(id raft.NodeID, data []byte) (index, term uint64, isLeader bool) {
 	return s.propose(id, data, nil)
 }
@@ -287,7 +445,7 @@ func (s *Sim) Propose(id raft.NodeID, data []byte) (index, term uint64, isLeader
 // a single-node proposal that commits in the same synchronous Ready batch.
 func (s *Sim) propose(id raft.NodeID, data []byte, onProposed func(index, term uint64)) (index, term uint64, isLeader bool) {
 	sn, ok := s.nodes[id]
-	if !ok || sn.node == nil || sn.halted {
+	if !ok || sn.node == nil || sn.halted || sn.paused {
 		s.record("propose node=%d reject(unavailable)", id)
 		return 0, 0, false
 	}
@@ -373,16 +531,106 @@ func (s *Sim) scheduleTick(id raft.NodeID, at VirtualTime) {
 }
 
 // tickIsStale reports whether ev (an eventTick) was scheduled under a
-// generation of its node that a subsequent crash has since invalidated.
+// process/tick-stream generation that a crash, fail-stop, or replacement
+// has since invalidated.
 func (s *Sim) tickIsStale(ev *event) bool {
 	sn := s.nodes[ev.node]
 	return sn == nil || ev.generation != sn.generation
 }
 
+// scheduleMessage applies the sim-wide drop/duplicate faults and enqueues
+// the survivor(s). A dropped message is never delivered. A duplicated
+// message is enqueued twice, each copy with its own independently drawn
+// delay (the delay draw already reorders; duplication reuses the same
+// mechanism a second time), so the two deliveries need not arrive adjacent
+// or in send order.
 func (s *Sim) scheduleMessage(m *raftpb.Message) {
+	if s.dropRate > 0 && s.faultRand.Float64() < s.dropRate {
+		s.record("msg %d->%d drop(fault)", m.GetFrom(), m.GetTo())
+		return
+	}
+	s.enqueueMessage(m)
+	if s.dupRate > 0 && s.faultRand.Float64() < s.dupRate {
+		s.record("msg %d->%d duplicate(fault)", m.GetFrom(), m.GetTo())
+		dup, ok := proto.Clone(m).(*raftpb.Message)
+		if !ok {
+			panic("sim: proto.Clone(*raftpb.Message) returned a different type")
+		}
+		s.enqueueMessage(dup)
+	}
+}
+
+// enqueueMessage draws a fresh independent delay and pushes m onto the event
+// queue. Called once per delivery: twice for a duplicated message, each call
+// its own draw from delayRand.
+func (s *Sim) enqueueMessage(m *raftpb.Message) {
 	span := int64(s.maxDelay - s.minDelay + 1)
 	delay := s.minDelay + VirtualTime(s.delayRand.Int63n(span))
 	s.pushAt(s.now+delay, &event{kind: eventMessage, msg: m})
+}
+
+// installFaultEvents pushes every schedule event onto the event queue at its
+// virtual time, stably sorted by time first so that events sharing a time
+// keep the schedule's original relative order (the queue's (time,seq)
+// tie-break then makes that order deterministic against ticks and messages
+// scheduled at the same instant).
+func (s *Sim) installFaultEvents(events []FaultEvent) {
+	ordered := append([]FaultEvent(nil), events...)
+	sortFaultEvents(ordered)
+	for i := range ordered {
+		ev := ordered[i]
+		s.pushAt(ev.Time, &event{kind: eventFault, fault: &ev})
+	}
+}
+
+func sortFaultEvents(events []FaultEvent) {
+	sort.SliceStable(events, func(i, j int) bool { return events[i].Time < events[j].Time })
+}
+
+// applyFault dispatches one fault event to the Sim mechanism it mirrors.
+// NewFaultSim's ValidateForCluster call already rejects any event or crash
+// directive naming a node outside this run's cluster before it can reach the
+// queue, so every Node/From/To below is guaranteed to resolve; the "unknown
+// node" branches here are just a defensive backstop for the (schedule-
+// bypassing) direct s.nodes lookups in FaultCrash/FaultRestart, not a
+// silent-skip path for a malformed artifact.
+func (s *Sim) applyFault(f *FaultEvent) {
+	switch f.Kind {
+	case FaultDropRate:
+		s.dropRate = f.Rate
+		s.record("fault droprate=%v", f.Rate)
+	case FaultDuplicateRate:
+		s.dupRate = f.Rate
+		s.record("fault duprate=%v", f.Rate)
+	case FaultPartition:
+		s.Partition(f.From, f.To)
+		s.record("fault partition %d->%d", f.From, f.To)
+	case FaultHeal:
+		s.Heal(f.From, f.To)
+		s.record("fault heal %d->%d", f.From, f.To)
+	case FaultPartitionGroups:
+		s.PartitionGroups(f.Groups)
+		s.record("fault partition_groups groups=%v", f.Groups)
+	case FaultHealGroups:
+		s.HealGroups(f.Groups)
+		s.record("fault heal_groups groups=%v", f.Groups)
+	case FaultPause:
+		s.Pause(f.Node)
+	case FaultResume:
+		s.Resume(f.Node)
+	case FaultClockSkew:
+		if err := s.SetClockSkew(f.Node, f.Multiplier); err != nil {
+			s.record("fault clockskew node=%d error=%v", f.Node, err)
+		}
+	case FaultCrash:
+		if _, ok := s.nodes[f.Node]; ok {
+			s.handleCrash(f.Node)
+		}
+	case FaultRestart:
+		if _, ok := s.nodes[f.Node]; ok {
+			s.handleRestart(f.Node)
+		}
+	}
 }
 
 func (s *Sim) record(format string, args ...any) {
