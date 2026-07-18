@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 
 	"miniquorum/internal/raft"
 )
@@ -89,7 +90,14 @@ type CrashDirective struct {
 // generated schedule is stamped with the version that produced it so a
 // committed corpus file is self-describing: a generator change never
 // silently reinterprets an old file's meaning, per the phase-4 spec.
-const FaultScheduleGeneratorVersion = 1
+//
+// v2 replaced v1's independently-drawn pause/resume, partition/heal, and
+// partition-groups/heal-groups events (which could draw a lone Resume/Heal
+// with no preceding Pause/Partition for the same target -- a guaranteed
+// no-op) with matched (open, close) pairs on the same target, and paired
+// every generated Save-ordinal crash directive with a later FaultRestart for
+// the same node so a node it crashes is never left stranded.
+const FaultScheduleGeneratorVersion = 2
 
 // FaultKind identifies one schedulable fault in FaultSchedule.Events. The
 // zero value is intentionally not a valid kind (see FaultSchedule.Validate),
@@ -126,8 +134,8 @@ const (
 	// FaultResume un-freezes a node previously paused by FaultPause.
 	FaultResume
 	// FaultClockSkew sets Node's per-node tick-rate multiplier in
-	// [0.5, 2.0]: 0.5 ticks twice as often as the cluster default, 2.0 half
-	// as often.
+	// [0.5, 2.0]: 2.0 ticks twice as often as the cluster default (half the
+	// interval), 0.5 ticks half as often (double the interval).
 	FaultClockSkew
 	// FaultCrash discards Node's live *raft.Node at this event's virtual
 	// time, mirroring Sim.ScheduleCrash. Node's sim storage survives.
@@ -215,19 +223,33 @@ type FaultSchedule struct {
 	Events  []FaultEvent
 }
 
-// Validate reports a structural problem in the schedule: an out-of-range
-// rate or clock-skew multiplier, a degenerate partition, or an unknown fault
-// kind. It does not know the target Sim's node set, so it cannot catch a
-// Node/From/To that names a node absent from that run; callers that apply
-// events against unknown nodes skip them defensively instead of panicking.
+// Validate reports a structural problem in the schedule: a negative event
+// time, an unsupported generator version, a non-finite or out-of-range rate
+// or clock-skew multiplier, a degenerate or malformed partition group split,
+// an unknown fault kind, or a malformed crash directive (bad Save ordinal,
+// non-schedulable Point, out-of-range RetainUnsynced, or a duplicate
+// (Node,Save) pair). It does not know the target Sim's node set, so it
+// cannot catch a Node/From/To/group-member/crash-directive that names a node
+// absent from that run — construct with NewFaultSim, which layers
+// ValidateForCluster's cluster-membership checks on top of Validate once the
+// node set is known, instead of silently skipping an unreachable target.
 func (s FaultSchedule) Validate() error {
+	if s.Version != 0 && s.Version != FaultScheduleGeneratorVersion {
+		return fmt.Errorf("sim: fault schedule version %d unsupported (want 0 for a hand-written scripted schedule, or %d)", s.Version, FaultScheduleGeneratorVersion)
+	}
 	for i, e := range s.Events {
+		if e.Time < 0 {
+			return fmt.Errorf("sim: fault event %d (%s): negative time %d", i, e.Kind, e.Time)
+		}
 		switch e.Kind {
 		case FaultDropRate, FaultDuplicateRate:
-			if e.Rate < 0 || e.Rate > 1 {
-				return fmt.Errorf("sim: fault event %d (%s): rate %v outside [0,1]", i, e.Kind, e.Rate)
+			if err := validateUnitRate(e.Rate); err != nil {
+				return fmt.Errorf("sim: fault event %d (%s): %w", i, e.Kind, err)
 			}
 		case FaultClockSkew:
+			if math.IsNaN(e.Multiplier) || math.IsInf(e.Multiplier, 0) {
+				return fmt.Errorf("sim: fault event %d (%s): multiplier %v is not finite", i, e.Kind, e.Multiplier)
+			}
 			if e.Multiplier < minClockMultiplier || e.Multiplier > maxClockMultiplier {
 				return fmt.Errorf("sim: fault event %d (%s): multiplier %v outside [%v,%v]", i, e.Kind, e.Multiplier, minClockMultiplier, maxClockMultiplier)
 			}
@@ -236,13 +258,144 @@ func (s FaultSchedule) Validate() error {
 				return fmt.Errorf("sim: fault event %d (%s): From and To are both %d", i, e.Kind, e.From)
 			}
 		case FaultPartitionGroups, FaultHealGroups:
-			if len(e.Groups) < 2 {
-				return fmt.Errorf("sim: fault event %d (%s): need at least 2 groups, got %d", i, e.Kind, len(e.Groups))
+			if err := validatePartitionGroups(e.Groups); err != nil {
+				return fmt.Errorf("sim: fault event %d (%s): %w", i, e.Kind, err)
 			}
 		case FaultPause, FaultResume, FaultCrash, FaultRestart:
 			// Node-only; nothing further to check structurally.
 		default:
 			return fmt.Errorf("sim: fault event %d: unknown fault kind %d", i, int(e.Kind))
+		}
+	}
+	if err := validateCrashDirectives(s.Crashes); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateUnitRate rejects a NaN/±Inf rate before it could otherwise slip
+// past a plain range comparison: NaN compares false against every bound, so
+// `rate < 0 || rate > 1` alone silently accepts it.
+func validateUnitRate(rate float64) error {
+	if math.IsNaN(rate) || math.IsInf(rate, 0) {
+		return fmt.Errorf("rate %v is not finite", rate)
+	}
+	if rate < 0 || rate > 1 {
+		return fmt.Errorf("rate %v outside [0,1]", rate)
+	}
+	return nil
+}
+
+// validatePartitionGroups rejects a degenerate group split: fewer than 2
+// groups, an empty group, a node repeated within one group, or a node that
+// appears in more than one group (the groups must be disjoint for
+// PartitionGroups/HealGroups's "every cross-group pair" semantics to be
+// well-defined).
+func validatePartitionGroups(groups [][]raft.NodeID) error {
+	if len(groups) < 2 {
+		return fmt.Errorf("need at least 2 groups, got %d", len(groups))
+	}
+	seen := make(map[raft.NodeID]int, len(groups))
+	for gi, group := range groups {
+		if len(group) == 0 {
+			return fmt.Errorf("group %d is empty", gi)
+		}
+		local := make(map[raft.NodeID]struct{}, len(group))
+		for _, id := range group {
+			if _, dup := local[id]; dup {
+				return fmt.Errorf("group %d contains duplicate node %d", gi, id)
+			}
+			local[id] = struct{}{}
+			if prior, dup := seen[id]; dup {
+				return fmt.Errorf("node %d appears in both group %d and group %d, groups must be disjoint", id, prior, gi)
+			}
+			seen[id] = gi
+		}
+	}
+	return nil
+}
+
+type crashDirectiveKey struct {
+	node raft.NodeID
+	save uint64
+}
+
+// validateCrashDirectives structurally validates every Crashes entry: the
+// same checks NewCrashStorage applies per-node once construction reaches it
+// (Save is 1-based, Point is schedulable, RetainUnsynced is at least the
+// RetainAllUnsynced sentinel), plus a duplicate-(Node,Save) check across the
+// whole schedule. Running these at Validate() time means a malformed
+// directive naming a node absent from the run's cluster is still caught
+// (schedule.For(id) would otherwise never surface it to any real node's
+// NewCrashStorage call, silently dropping the directive instead of
+// rejecting it).
+func validateCrashDirectives(directives []CrashDirective) error {
+	seen := make(map[crashDirectiveKey]struct{}, len(directives))
+	for i, d := range directives {
+		if d.Save == 0 {
+			return fmt.Errorf("sim: crash directive %d (node %d): Save 0; ordinals are 1-based", i, d.Node)
+		}
+		if d.Point == CrashHostInitiated || d.Point > CrashAfterSend {
+			return fmt.Errorf("sim: crash directive %d (node %d): non-schedulable point %s", i, d.Node, d.Point)
+		}
+		if d.RetainUnsynced < RetainAllUnsynced {
+			return fmt.Errorf("sim: crash directive %d (node %d): RetainUnsynced %d below minimum %d", i, d.Node, d.RetainUnsynced, RetainAllUnsynced)
+		}
+		key := crashDirectiveKey{d.Node, d.Save}
+		if _, dup := seen[key]; dup {
+			return fmt.Errorf("sim: crash directive %d: duplicate directive for node %d at save %d", i, d.Node, d.Save)
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
+}
+
+// ValidateForCluster runs Validate and additionally rejects any
+// Node/From/To/group-member/crash-directive that names a node outside
+// nodeIDs. NewFaultSim calls this once the run's cluster membership is
+// known, so a schedule that targets a nonexistent node is a construction-time
+// error — never a fault that silently no-ops because no real node's id
+// matched it.
+func (s FaultSchedule) ValidateForCluster(nodeIDs []raft.NodeID) error {
+	if err := s.Validate(); err != nil {
+		return err
+	}
+	known := make(map[raft.NodeID]struct{}, len(nodeIDs))
+	for _, id := range nodeIDs {
+		known[id] = struct{}{}
+	}
+	member := func(id raft.NodeID) error {
+		if _, ok := known[id]; !ok {
+			return fmt.Errorf("node %d is not a member of the cluster", id)
+		}
+		return nil
+	}
+	for i, e := range s.Events {
+		switch e.Kind {
+		case FaultPause, FaultResume, FaultClockSkew, FaultCrash, FaultRestart:
+			if err := member(e.Node); err != nil {
+				return fmt.Errorf("sim: fault event %d (%s): %w", i, e.Kind, err)
+			}
+		case FaultPartition, FaultHeal:
+			if err := member(e.From); err != nil {
+				return fmt.Errorf("sim: fault event %d (%s): From: %w", i, e.Kind, err)
+			}
+			if err := member(e.To); err != nil {
+				return fmt.Errorf("sim: fault event %d (%s): To: %w", i, e.Kind, err)
+			}
+		case FaultPartitionGroups, FaultHealGroups:
+			for _, group := range e.Groups {
+				for _, id := range group {
+					if err := member(id); err != nil {
+						return fmt.Errorf("sim: fault event %d (%s): group member: %w", i, e.Kind, err)
+					}
+				}
+			}
+		}
+	}
+	for i, d := range s.Crashes {
+		if err := member(d.Node); err != nil {
+			return fmt.Errorf("sim: crash directive %d: %w", i, err)
 		}
 	}
 	return nil

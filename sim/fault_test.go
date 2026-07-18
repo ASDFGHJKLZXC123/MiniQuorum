@@ -2,6 +2,8 @@ package sim
 
 import (
 	"container/heap"
+	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -188,16 +190,25 @@ func TestResumeRestoresTicksAndDeliveries(t *testing.T) {
 // TestSetClockSkewRejectsOutOfRangeMultiplier verifies the 0.5x-2x bound.
 func TestSetClockSkewRejectsOutOfRangeMultiplier(t *testing.T) {
 	s := newTestSim(t, 1, 2)
-	for _, bad := range []float64{0, 0.49, 2.01, 5} {
+	for _, bad := range []float64{0, 0.49, 2.01, 5, math.NaN(), math.Inf(1), math.Inf(-1)} {
 		if err := s.SetClockSkew(1, bad); err == nil {
 			t.Fatalf("SetClockSkew(%v) error = nil, want out-of-range rejection", bad)
 		}
 	}
+	// A NaN multiplier must never reach sn.tickMultiplier: NaN compares
+	// false against every bound, so a plain range check alone would let it
+	// through and nextTickDelay would then cast a NaN float64 to
+	// VirtualTime, an implementation-defined conversion.
+	if got := s.nodes[1].tickMultiplier; got != 0 {
+		t.Fatalf("tickMultiplier after every SetClockSkew rejection = %v, want unchanged 0 (unset)", got)
+	}
 }
 
 // TestClockSkewScalesTickInterval verifies nextTickDelay applies the
-// per-node multiplier deterministically: a 2x node ticks half as often (a
-// doubled interval), a 0.5x node ticks twice as often (a halved interval).
+// per-node multiplier deterministically: a 2x node ticks twice as often (a
+// halved interval), a 0.5x node ticks half as often (a doubled interval) —
+// per the phase-4 contract's "0.5x-2x per-node tick-rate multiplier" (with a
+// 50ms base, 2x ticks every 25ms and 0.5x ticks every 100ms).
 func TestClockSkewScalesTickInterval(t *testing.T) {
 	s := newTestSim(t, 1, 2)
 	base := s.nextTickDelay(s.nodes[1])
@@ -205,19 +216,75 @@ func TestClockSkewScalesTickInterval(t *testing.T) {
 	if err := s.SetClockSkew(1, 2.0); err != nil {
 		t.Fatalf("SetClockSkew(2.0) error = %v", err)
 	}
-	if got, want := s.nextTickDelay(s.nodes[1]), base*2; got != want {
-		t.Fatalf("nextTickDelay at 2x = %d, want %d", got, want)
+	if got, want := s.nextTickDelay(s.nodes[1]), base/2; got != want {
+		t.Fatalf("nextTickDelay at 2x = %d, want %d (2x is a faster tick rate: half the interval)", got, want)
 	}
 
 	if err := s.SetClockSkew(1, 0.5); err != nil {
 		t.Fatalf("SetClockSkew(0.5) error = %v", err)
 	}
-	if got, want := s.nextTickDelay(s.nodes[1]), base/2; got != want {
-		t.Fatalf("nextTickDelay at 0.5x = %d, want %d", got, want)
+	if got, want := s.nextTickDelay(s.nodes[1]), base*2; got != want {
+		t.Fatalf("nextTickDelay at 0.5x = %d, want %d (0.5x is a slower tick rate: double the interval)", got, want)
 	}
 	// node 2 is unaffected by node 1's skew.
 	if got := s.nextTickDelay(s.nodes[2]); got != base {
 		t.Fatalf("unrelated node's nextTickDelay = %d, want unchanged %d", got, base)
+	}
+}
+
+// TestClockSkewMatchesPhase4ExampleNumbers pins the phase-4 spec's own
+// worked example: with the 50ms default base interval, a 2x multiplier
+// ticks every 25ms and a 0.5x multiplier ticks every 100ms.
+func TestClockSkewMatchesPhase4ExampleNumbers(t *testing.T) {
+	s := newTestSim(t, 1)
+	if s.tickInterval != 50 {
+		t.Fatalf("default tickInterval = %d, want 50 (phase-4 spec's example base)", s.tickInterval)
+	}
+
+	if err := s.SetClockSkew(1, 2.0); err != nil {
+		t.Fatalf("SetClockSkew(2.0) error = %v", err)
+	}
+	if got := s.nextTickDelay(s.nodes[1]); got != 25 {
+		t.Fatalf("nextTickDelay at 2x with a 50ms base = %d, want 25", got)
+	}
+
+	if err := s.SetClockSkew(1, 0.5); err != nil {
+		t.Fatalf("SetClockSkew(0.5) error = %v", err)
+	}
+	if got := s.nextTickDelay(s.nodes[1]); got != 100 {
+		t.Fatalf("nextTickDelay at 0.5x with a 50ms base = %d, want 100", got)
+	}
+}
+
+// TestProposeOnPausedNodeIsRejectedNotPersistedSentOrApplied verifies "a
+// paused node receives nothing" extends to Propose: pausing a real elected
+// leader and proposing to it must reject before touching raft.Node at all,
+// not persist, not enqueue a message, not grow the leader's log.
+func TestProposeOnPausedNodeIsRejectedNotPersistedSentOrApplied(t *testing.T) {
+	s := phase1Sim(t, 2026071801)
+	_, leader := requireLeaderAtHighestTerm(t, s, 3*phase1Window)
+
+	beforeQueue := s.queue.Len()
+	beforeLog := s.Log(leader)
+	beforeLastApplied := s.LastApplied(leader)
+
+	s.Pause(leader)
+	index, term, ok := s.Propose(leader, []byte("data"))
+
+	if ok || index != 0 || term != 0 {
+		t.Fatalf("Propose(paused leader) = (index=%d, term=%d, isLeader=%t), want (0, 0, false)", index, term, ok)
+	}
+	if got := s.trace[len(s.trace)-1]; !strings.Contains(got, "reject(unavailable)") {
+		t.Fatalf("last trace entry = %q, want a reject(unavailable) record", got)
+	}
+	if got := s.queue.Len(); got != beforeQueue {
+		t.Fatalf("queue len = %d, want unchanged %d (a paused Propose must not send anything)", got, beforeQueue)
+	}
+	if got := s.Log(leader); !reflect.DeepEqual(got, beforeLog) {
+		t.Fatalf("leader log after a paused Propose = %v, want unchanged %v", got, beforeLog)
+	}
+	if got := s.LastApplied(leader); got != beforeLastApplied {
+		t.Fatalf("leader LastApplied after a paused Propose = %d, want unchanged %d", got, beforeLastApplied)
 	}
 }
 
@@ -333,6 +400,67 @@ func TestFaultScheduleSelectsCrashPointAndScriptedRestartRebuildsNode(t *testing
 	}
 }
 
+// TestHandleRestartOnLiveNodeIsRejectedNotDuplicateTickStream is a
+// regression for a duplicate-tick-stream bug: restarting a node that never
+// crashed (sn.node != nil, not halted) used to rebuild a fresh *raft.Node
+// and schedule an independent second tick stream alongside the one already
+// running, since only a real crash bumps the generation that invalidates a
+// stale pending tick. Restart must reject a live node instead.
+func TestHandleRestartOnLiveNodeIsRejectedNotDuplicateTickStream(t *testing.T) {
+	s := newTestSim(t, 1, 2)
+	beforeQueue := s.queue.Len()
+
+	s.handleRestart(1) // node 1 never crashed; must be rejected, not rebuilt
+
+	if got := s.trace[len(s.trace)-1]; !strings.Contains(got, "restart node=1 skip(live)") {
+		t.Fatalf("last trace entry = %q, want a rejected live-restart record", got)
+	}
+	if got := s.queue.Len(); got != beforeQueue {
+		t.Fatalf("queue len = %d, want unchanged %d (a rejected restart must not schedule a second tick stream)", got, beforeQueue)
+	}
+
+	const ticks = 5
+	if err := s.Run(s.tickInterval * ticks); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	var fired int
+	for _, line := range s.trace {
+		if strings.Contains(line, "tick node=1") && !strings.Contains(line, "skip") {
+			fired++
+		}
+	}
+	if fired != ticks {
+		t.Fatalf("successful tick node=1 count over %d intervals = %d, want exactly %d (one tick stream)\ntrace: %v", ticks, fired, ticks, s.trace)
+	}
+}
+
+// TestFaultRestartOnLiveNodeDoesNotDuplicateTickStream is the schedule-driven
+// counterpart: a FaultRestart event targeting a node that never crashed must
+// have the same reject-not-rebuild behavior when it fires off the event
+// queue, not just when handleRestart is called directly.
+func TestFaultRestartOnLiveNodeDoesNotDuplicateTickStream(t *testing.T) {
+	schedule := FaultSchedule{Events: []FaultEvent{{Time: 10, Kind: FaultRestart, Node: 1}}}
+	s, err := NewFaultSim(Config{Seed: 1, NodeIDs: []raft.NodeID{1, 2}}, schedule)
+	if err != nil {
+		t.Fatalf("NewFaultSim() error = %v", err)
+	}
+
+	const ticks = 5
+	if err := s.Run(s.tickInterval * ticks); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	var fired int
+	for _, line := range s.trace {
+		if strings.Contains(line, "tick node=1") && !strings.Contains(line, "skip") {
+			fired++
+		}
+	}
+	if fired != ticks {
+		t.Fatalf("successful tick node=1 count over %d intervals = %d, want exactly %d (one tick stream)\ntrace: %v", ticks, fired, ticks, s.trace)
+	}
+}
+
 // ---------------------------------------------------------------------
 // FaultSchedule: validation, serialization/versioning, random generation,
 // scripted mode, and same-seed deterministic replay.
@@ -352,7 +480,14 @@ func TestFaultScheduleValidateRejectsMalformedEvents(t *testing.T) {
 		{"heal from==to", FaultEvent{Kind: FaultHeal, From: 2, To: 2}},
 		{"partition groups too few", FaultEvent{Kind: FaultPartitionGroups, Groups: [][]raft.NodeID{{1, 2}}}},
 		{"heal groups too few", FaultEvent{Kind: FaultHealGroups, Groups: nil}},
+		{"partition groups empty group", FaultEvent{Kind: FaultPartitionGroups, Groups: [][]raft.NodeID{{1}, {}}}},
+		{"partition groups duplicate node within a group", FaultEvent{Kind: FaultPartitionGroups, Groups: [][]raft.NodeID{{1, 1}, {2}}}},
+		{"partition groups node in two groups", FaultEvent{Kind: FaultPartitionGroups, Groups: [][]raft.NodeID{{1, 2}, {2, 3}}}},
 		{"unknown kind", FaultEvent{Kind: FaultKind(999)}},
+		{"negative time", FaultEvent{Time: -1, Kind: FaultPause, Node: 1}},
+		{"NaN drop rate", FaultEvent{Kind: FaultDropRate, Rate: math.NaN()}},
+		{"+Inf duplicate rate", FaultEvent{Kind: FaultDuplicateRate, Rate: math.Inf(1)}},
+		{"NaN clock skew multiplier", FaultEvent{Kind: FaultClockSkew, Multiplier: math.NaN()}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -361,6 +496,97 @@ func TestFaultScheduleValidateRejectsMalformedEvents(t *testing.T) {
 				t.Fatalf("Validate() error = nil, want rejection for %+v", tc.ev)
 			}
 		})
+	}
+}
+
+// TestFaultScheduleValidateRejectsUnsupportedVersion is the "exact supported
+// generator version" requirement: only 0 (a hand-written scripted schedule
+// that predates versioning) and the current FaultScheduleGeneratorVersion
+// are accepted — anything else (including a future or garbage version) is
+// rejected rather than silently reinterpreted.
+func TestFaultScheduleValidateRejectsUnsupportedVersion(t *testing.T) {
+	for _, bad := range []int{-1, FaultScheduleGeneratorVersion + 1, 999} {
+		schedule := FaultSchedule{Version: bad}
+		if err := schedule.Validate(); err == nil {
+			t.Fatalf("Validate() error = nil for Version %d, want rejection", bad)
+		}
+	}
+	for _, good := range []int{0, FaultScheduleGeneratorVersion} {
+		schedule := FaultSchedule{Version: good}
+		if err := schedule.Validate(); err != nil {
+			t.Fatalf("Validate() error = %v for Version %d, want nil", err, good)
+		}
+	}
+}
+
+// TestFaultScheduleValidateRejectsMalformedCrashDirectives covers the
+// CrashDirective half of "other malformed values": a 0 Save ordinal, a
+// non-schedulable Point (CrashHostInitiated, or anything past CrashAfterSend),
+// a RetainUnsynced below the RetainAllUnsynced sentinel, and a duplicate
+// (Node,Save) pair across the schedule.
+func TestFaultScheduleValidateRejectsMalformedCrashDirectives(t *testing.T) {
+	cases := []struct {
+		name       string
+		directives []CrashDirective
+	}{
+		{"save 0", []CrashDirective{{Node: 1, Save: 0, Point: CrashBeforeSync, RetainUnsynced: RetainAllUnsynced}}},
+		{"host-initiated point", []CrashDirective{{Node: 1, Save: 5, Point: CrashHostInitiated, RetainUnsynced: RetainAllUnsynced}}},
+		{"point beyond CrashAfterSend", []CrashDirective{{Node: 1, Save: 5, Point: CrashPoint(99), RetainUnsynced: RetainAllUnsynced}}},
+		{"retain below sentinel", []CrashDirective{{Node: 1, Save: 5, Point: CrashBeforeSync, RetainUnsynced: -2}}},
+		{"duplicate (node,save)", []CrashDirective{
+			{Node: 1, Save: 5, Point: CrashBeforeSync, RetainUnsynced: RetainAllUnsynced},
+			{Node: 1, Save: 5, Point: CrashAfterSend, RetainUnsynced: RetainAllUnsynced},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			schedule := FaultSchedule{Crashes: tc.directives}
+			if err := schedule.Validate(); err == nil {
+				t.Fatalf("Validate() error = nil, want rejection for %+v", tc.directives)
+			}
+		})
+	}
+}
+
+// TestFaultScheduleValidateForClusterRejectsUnknownNodes is the cluster-
+// membership requirement: Validate alone cannot catch a Node/From/To/group
+// member/crash-directive that names a node outside the run, since it never
+// sees the cluster; ValidateForCluster must reject every such case instead
+// of the schedule silently no-oping when applyFault's node lookup misses.
+func TestFaultScheduleValidateForClusterRejectsUnknownNodes(t *testing.T) {
+	cluster := []raft.NodeID{1, 2, 3}
+	const ghost = raft.NodeID(99)
+	cases := []struct {
+		name     string
+		schedule FaultSchedule
+	}{
+		{"pause targets unknown node", FaultSchedule{Events: []FaultEvent{{Kind: FaultPause, Node: ghost}}}},
+		{"clock skew targets unknown node", FaultSchedule{Events: []FaultEvent{{Kind: FaultClockSkew, Node: ghost, Multiplier: 1}}}},
+		{"partition From unknown", FaultSchedule{Events: []FaultEvent{{Kind: FaultPartition, From: ghost, To: 1}}}},
+		{"partition To unknown", FaultSchedule{Events: []FaultEvent{{Kind: FaultPartition, From: 1, To: ghost}}}},
+		{"partition groups member unknown", FaultSchedule{Events: []FaultEvent{{Kind: FaultPartitionGroups, Groups: [][]raft.NodeID{{1}, {ghost}}}}}},
+		{"crash directive targets unknown node", FaultSchedule{Crashes: []CrashDirective{{Node: ghost, Save: 1, Point: CrashBeforeSync, RetainUnsynced: RetainAllUnsynced}}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.schedule.Validate(); err != nil {
+				t.Fatalf("Validate() error = %v, want nil (this is a ValidateForCluster-only defect)", err)
+			}
+			if err := tc.schedule.ValidateForCluster(cluster); err == nil {
+				t.Fatalf("ValidateForCluster() error = nil, want rejection of node %d absent from %v", ghost, cluster)
+			}
+		})
+	}
+}
+
+// TestNewFaultSimRejectsUnknownClusterNode is the construction-time
+// integration proof: NewFaultSim must refuse to build a Sim from a schedule
+// naming a node outside cfg.NodeIDs instead of building one that would later
+// silently skip that fault at apply time.
+func TestNewFaultSimRejectsUnknownClusterNode(t *testing.T) {
+	schedule := FaultSchedule{Events: []FaultEvent{{Time: 10, Kind: FaultPause, Node: 99}}}
+	if _, err := NewFaultSim(Config{Seed: 1, NodeIDs: []raft.NodeID{1, 2}}, schedule); err == nil {
+		t.Fatal("NewFaultSim() error = nil, want rejection of a fault event targeting a node outside the cluster")
 	}
 }
 
@@ -388,8 +614,14 @@ func TestFaultScheduleValidateAcceptsWellFormedEvents(t *testing.T) {
 // byte-identical schedule.
 func TestGenerateFaultScheduleDeterministic(t *testing.T) {
 	nodeIDs := []raft.NodeID{1, 2, 3}
-	first := GenerateFaultSchedule(20260716, nodeIDs, 5000)
-	second := GenerateFaultSchedule(20260716, nodeIDs, 5000)
+	first, err := GenerateFaultSchedule(20260716, nodeIDs, 5000)
+	if err != nil {
+		t.Fatalf("GenerateFaultSchedule() error = %v", err)
+	}
+	second, err := GenerateFaultSchedule(20260716, nodeIDs, 5000)
+	if err != nil {
+		t.Fatalf("GenerateFaultSchedule() error = %v", err)
+	}
 
 	if !reflect.DeepEqual(first, second) {
 		t.Fatalf("same-seed schedules diverged:\nfirst:  %+v\nsecond: %+v", first, second)
@@ -404,9 +636,83 @@ func TestGenerateFaultScheduleDeterministic(t *testing.T) {
 		t.Fatalf("generated schedule Version = %d, want %d", first.Version, FaultScheduleGeneratorVersion)
 	}
 
-	third := GenerateFaultSchedule(999999, nodeIDs, 5000)
+	third, err := GenerateFaultSchedule(999999, nodeIDs, 5000)
+	if err != nil {
+		t.Fatalf("GenerateFaultSchedule() error = %v", err)
+	}
 	if reflect.DeepEqual(first, third) {
 		t.Fatal("different seeds produced identical schedules, want the seed to actually drive generation")
+	}
+}
+
+// TestGenerateFaultScheduleRejectsEmptyNodeIDs verifies the empty-cluster
+// case returns a deterministic error instead of panicking on the first
+// node-indexed random draw (order[r.Intn(len(order))] with len(order)==0).
+func TestGenerateFaultScheduleRejectsEmptyNodeIDs(t *testing.T) {
+	if _, err := GenerateFaultSchedule(1, nil, 5000); err == nil {
+		t.Fatal("GenerateFaultSchedule(nil nodeIDs) error = nil, want rejection")
+	}
+	if _, err := GenerateFaultSchedule(1, []raft.NodeID{}, 5000); err == nil {
+		t.Fatal("GenerateFaultSchedule(empty nodeIDs) error = nil, want rejection")
+	}
+}
+
+// nodeCrashedInTrace reports whether trace records id crashing by any
+// mechanism: a host-initiated FaultCrash ("crash node=%d"), a storage crash
+// mid-Save ("node=%d save_crash"), or the CrashAfterSend backstop firing on
+// a later Save ("node=%d after_send_crash").
+func nodeCrashedInTrace(trace []string, id raft.NodeID) bool {
+	patterns := []string{
+		fmt.Sprintf("crash node=%d", id),
+		fmt.Sprintf("node=%d save_crash", id),
+		fmt.Sprintf("node=%d after_send_crash", id),
+	}
+	for _, line := range trace {
+		for _, p := range patterns {
+			if strings.Contains(line, p) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestGenerateFaultScheduleNeverStrandsACrashedNode is the "must exercise
+// crash and restart behavior, not strand a crashed node forever" coverage
+// requirement: across a battery of generated seeds, any node observed
+// crashing during the run (by either the host-level FaultCrash pair or a
+// storage-level Save-ordinal directive) must be back up (a live *raft.Node)
+// by the run's end, because every generated crash is now paired with a
+// later FaultRestart for the same node.
+func TestGenerateFaultScheduleNeverStrandsACrashedNode(t *testing.T) {
+	nodeIDs := []raft.NodeID{1, 2, 3}
+	const until = VirtualTime(20000)
+	var sawAnyCrash bool
+	for seed := int64(1); seed <= 25; seed++ {
+		schedule, err := GenerateFaultSchedule(seed, nodeIDs, until)
+		if err != nil {
+			t.Fatalf("seed %d: GenerateFaultSchedule() error = %v", seed, err)
+		}
+		s, err := NewFaultSim(Config{Seed: seed, NodeIDs: nodeIDs}, schedule)
+		if err != nil {
+			t.Fatalf("seed %d: NewFaultSim() error = %v", seed, err)
+		}
+		if err := s.Run(until); err != nil {
+			t.Fatalf("seed %d: Run() error = %v", seed, err)
+		}
+
+		for _, id := range nodeIDs {
+			if !nodeCrashedInTrace(s.Trace(), id) {
+				continue
+			}
+			sawAnyCrash = true
+			if s.nodes[id].node == nil {
+				t.Fatalf("seed %d: node %d crashed during the run and was never rebuilt by t=%d (stranded)", seed, id, until)
+			}
+		}
+	}
+	if !sawAnyCrash {
+		t.Fatal("no generated seed crashed any node across 25 seeds; this test proves nothing without at least one observed crash")
 	}
 }
 
@@ -414,7 +720,10 @@ func TestGenerateFaultScheduleDeterministic(t *testing.T) {
 // requirement: a schedule (random or scripted) must round-trip through the
 // file encoding with every field, including Version, preserved.
 func TestEncodeDecodeFaultScheduleRoundTrip(t *testing.T) {
-	original := GenerateFaultSchedule(20260717, []raft.NodeID{1, 2, 3}, 5000)
+	original, err := GenerateFaultSchedule(20260717, []raft.NodeID{1, 2, 3}, 5000)
+	if err != nil {
+		t.Fatalf("GenerateFaultSchedule() error = %v", err)
+	}
 
 	data, err := EncodeFaultSchedule(original)
 	if err != nil {
@@ -495,7 +804,10 @@ func TestScriptedFaultScheduleHandWrittenLiteralWorks(t *testing.T) {
 // byte-identical traces.
 func TestNewFaultSimSameSeedByteIdenticalTrace(t *testing.T) {
 	nodeIDs := []raft.NodeID{1, 2, 3}
-	schedule := GenerateFaultSchedule(20260718, nodeIDs, 4000)
+	schedule, err := GenerateFaultSchedule(20260718, nodeIDs, 4000)
+	if err != nil {
+		t.Fatalf("GenerateFaultSchedule() error = %v", err)
+	}
 	cfg := Config{Seed: 20260718, NodeIDs: nodeIDs}
 
 	run := func() []string {

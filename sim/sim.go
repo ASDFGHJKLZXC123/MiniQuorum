@@ -139,7 +139,7 @@ func newCrashSim(cfg Config, schedule FaultSchedule) (*Sim, error) {
 // construction time, ordered by virtual time. Two Sims built from the same
 // Config and schedule fire every fault identically.
 func NewFaultSim(cfg Config, schedule FaultSchedule) (*Sim, error) {
-	if err := schedule.Validate(); err != nil {
+	if err := schedule.ValidateForCluster(cfg.NodeIDs); err != nil {
 		return nil, err
 	}
 	s, err := newSim(cfg, schedule, true)
@@ -320,11 +320,16 @@ func (s *Sim) Resume(id raft.NodeID) {
 	s.record("resume node=%d", id)
 }
 
-// SetClockSkew sets id's per-node tick-rate multiplier: its ticks fire every
-// tickInterval*multiplier virtual milliseconds instead of every
-// tickInterval. multiplier must be in [0.5, 2.0], per the phase-4 spec;
-// setting an unknown node is a no-op.
+// SetClockSkew sets id's per-node tick-rate multiplier: a rate of
+// multiplier means id ticks multiplier times as often as the cluster
+// default, so its ticks fire every tickInterval/multiplier virtual
+// milliseconds instead of every tickInterval (e.g. with a 50ms base, 2.0
+// ticks every 25ms and 0.5 ticks every 100ms). multiplier must be in
+// [0.5, 2.0], per the phase-4 spec; setting an unknown node is a no-op.
 func (s *Sim) SetClockSkew(id raft.NodeID, multiplier float64) error {
+	if math.IsNaN(multiplier) || math.IsInf(multiplier, 0) {
+		return fmt.Errorf("sim: clock skew multiplier %v is not finite", multiplier)
+	}
 	if multiplier < minClockMultiplier || multiplier > maxClockMultiplier {
 		return fmt.Errorf("sim: clock skew multiplier %v outside [%v,%v]", multiplier, minClockMultiplier, maxClockMultiplier)
 	}
@@ -338,14 +343,17 @@ func (s *Sim) SetClockSkew(id raft.NodeID, multiplier float64) error {
 }
 
 // nextTickDelay returns the virtual-millisecond gap until sn's next tick,
-// applying its clock-skew multiplier (1.0 if unset). Deterministic
-// float64 arithmetic only: no wall clock, no randomness.
+// applying its clock-skew multiplier (1.0 if unset): a higher multiplier is
+// a faster tick rate, so the interval is tickInterval/multiplier (2x ticks
+// twice as often, at half the interval; 0.5x ticks half as often, at double
+// the interval). Deterministic float64 arithmetic only: no wall clock, no
+// randomness.
 func (s *Sim) nextTickDelay(sn *simNode) VirtualTime {
 	mult := sn.tickMultiplier
 	if mult == 0 {
 		mult = 1
 	}
-	scaled := VirtualTime(math.Round(float64(s.tickInterval) * mult))
+	scaled := VirtualTime(math.Round(float64(s.tickInterval) / mult))
 	if scaled < 1 {
 		scaled = 1
 	}
@@ -402,11 +410,13 @@ func (s *Sim) Leaderships() map[uint64][]raft.NodeID {
 
 // Propose synchronously supplies a client proposal to one simulated node and
 // processes the resulting Ready through the same persistence/send/apply/
-// Advance path as ticks and inbound messages. A down or fail-stopped node is
-// reported as not leader.
+// Advance path as ticks and inbound messages. A down, fail-stopped, or
+// paused node is reported as not leader: a paused node receives nothing
+// (mirroring handleTick/handleMessage), so its Propose is rejected before
+// touching raft.Node at all, not queued for after it resumes.
 func (s *Sim) Propose(id raft.NodeID, data []byte) (index, term uint64, isLeader bool) {
 	sn, ok := s.nodes[id]
-	if !ok || sn.node == nil || sn.halted {
+	if !ok || sn.node == nil || sn.halted || sn.paused {
 		s.record("propose node=%d reject(unavailable)", id)
 		return 0, 0, false
 	}
@@ -542,10 +552,12 @@ func sortFaultEvents(events []FaultEvent) {
 }
 
 // applyFault dispatches one fault event to the Sim mechanism it mirrors.
-// Unknown target nodes are skipped defensively (Validate cannot check node
-// membership against a schedule-agnostic node set); every other structural
-// problem was already rejected by FaultSchedule.Validate before this event
-// could reach the queue.
+// NewFaultSim's ValidateForCluster call already rejects any event or crash
+// directive naming a node outside this run's cluster before it can reach the
+// queue, so every Node/From/To below is guaranteed to resolve; the "unknown
+// node" branches here are just a defensive backstop for the (schedule-
+// bypassing) direct s.nodes lookups in FaultCrash/FaultRestart, not a
+// silent-skip path for a malformed artifact.
 func (s *Sim) applyFault(f *FaultEvent) {
 	switch f.Kind {
 	case FaultDropRate:

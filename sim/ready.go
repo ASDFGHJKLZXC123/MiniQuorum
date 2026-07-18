@@ -84,6 +84,19 @@ func (s *Sim) handleCrash(id raft.NodeID) {
 
 func (s *Sim) handleRestart(id raft.NodeID) {
 	sn := s.nodes[id]
+	if sn.node != nil && !sn.halted {
+		// Restart only ever follows a crash (sn.node == nil) or a fail-stop
+		// (sn.halted, whose tick stream already died out with no reschedule
+		// in handleTick's skip(down) path). A still-ticking live node has
+		// exactly one pending tick event outstanding under its current
+		// generation; rebuilding it here without discarding that node would
+		// schedule a second, independent tick stream at the bottom of this
+		// function (generation is only bumped by a real crash), so a
+		// restart racing a live node is rejected instead of silently
+		// running two tick streams for one node.
+		s.record("restart node=%d skip(live)", id)
+		return
+	}
 	if store, ok := sn.storage.(*CrashStorage); ok && store.Crashed() {
 		if err := store.Recover(); err != nil {
 			sn.halted = true
