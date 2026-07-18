@@ -274,8 +274,14 @@ func TestPhase3EveryUnsyncedFinalFramePrefixRecoversAndRejoins(t *testing.T) {
 		t.Fatalf("marshal command: %v", err)
 	}
 	base := []raftpb.Entry{{Index: 1, Term: 1, Type: raftpb.EntryType_NOOP}}
-	final := raftpb.Entry{Index: 2, Term: 1, Type: raftpb.EntryType_NORMAL, Data: data}
-	finalRecordBytes := recordBytesFor(t, nil, []raftpb.Entry{final})
+	// Generated messages contain non-copyable runtime state (guide decision
+	// #14), so the final entry is rebuilt as a fresh literal at every use
+	// instead of copying one canonical raftpb.Entry value around.
+	finalEntries := func() []raftpb.Entry {
+		return []raftpb.Entry{{Index: 2, Term: 1, Type: raftpb.EntryType_NORMAL, Data: data}}
+	}
+	final := finalEntries()
+	finalRecordBytes := recordBytesFor(t, nil, finalEntries())
 
 	for cut := 0; cut <= finalRecordBytes; cut++ {
 		t.Run(fmt.Sprintf("cut-%d", cut), func(t *testing.T) {
@@ -284,7 +290,7 @@ func TestPhase3EveryUnsyncedFinalFramePrefixRecoversAndRejoins(t *testing.T) {
 			}}}
 			s := newPhase3Sim(t, int64(20260718000+cut), schedule)
 			hard := raft.HardState{Term: 1}
-			full := append(cloneSimEntries(base), final)
+			full := append(cloneSimEntries(base), finalEntries()...)
 			for _, id := range []raft.NodeID{1, 2} {
 				if err := s.nodes[id].storage.Save(&hard, full); err != nil {
 					t.Fatalf("node %d preload Save() error = %v", id, err)
@@ -295,7 +301,7 @@ func TestPhase3EveryUnsyncedFinalFramePrefixRecoversAndRejoins(t *testing.T) {
 				t.Fatalf("node 3 base Save() error = %v", err)
 			}
 			synced := torn.DurableBytes()
-			if err := torn.Save(nil, []raftpb.Entry{final}); !errors.Is(err, ErrCrashed) {
+			if err := torn.Save(nil, finalEntries()); !errors.Is(err, ErrCrashed) {
 				t.Fatalf("node 3 final Save() error = %v, want ErrCrashed", err)
 			}
 			platter := torn.DurableBytes()
@@ -311,11 +317,38 @@ func TestPhase3EveryUnsyncedFinalFramePrefixRecoversAndRejoins(t *testing.T) {
 			s.handleRestart(3)
 			awaitPhase3ValueConvergence(t, s, []byte("torn"), []byte("rejoined"), 12*phase1Window)
 			for _, id := range s.order {
-				if !simHasExactEntry(s.Log(id), &final) {
+				if !simHasExactEntry(s.Log(id), &final[0]) {
 					t.Fatalf("cut %d node %d log = %s, want re-replicated final entry", cut, id, simEntries(s.Log(id)))
 				}
 			}
 		})
+	}
+}
+
+// runPhase3RestartStorm schedules a simultaneous crash of every node plus a
+// restart two ticks later, then drives the scheduler until both waves have
+// executed. Before returning it asserts each node's storage actually
+// registered a host-initiated crash and that each node's applied progress
+// reset to zero — so any state observed afterwards can only have been rebuilt
+// by post-restart replay, never inherited from the pre-crash process.
+func runPhase3RestartStorm(t *testing.T, s *Sim) {
+	t.Helper()
+	crashAt := s.Now()
+	for _, id := range s.order {
+		s.ScheduleCrash(id, crashAt)
+		s.ScheduleRestart(id, crashAt+2*phase1TickInterval)
+	}
+	if err := s.Run(crashAt + 2*phase1TickInterval); err != nil {
+		t.Fatalf("restart storm: %v", err)
+	}
+	for _, id := range s.order {
+		info, ok := phase3Store(t, s, id).LastCrash()
+		if !ok || info.Point != CrashHostInitiated {
+			t.Fatalf("node %d storm crash = %+v, %t, want an executed host-initiated crash", id, info, ok)
+		}
+		if got := s.LastApplied(id); got != 0 {
+			t.Fatalf("node %d applied index right after restart = %d, want 0 (volatile state must not survive)", id, got)
+		}
 	}
 }
 
@@ -331,20 +364,25 @@ func TestPhase3AllNodeRestartStormConvergesHashes(t *testing.T) {
 		awaitAppliedEverywhere(t, s, lastIndex, lastTerm, 3*phase1Window)
 	}
 
-	crashAt := s.Now()
-	for _, id := range s.order {
-		s.ScheduleCrash(id, crashAt)
-		s.ScheduleRestart(id, crashAt+2*phase1TickInterval)
-	}
+	runPhase3RestartStorm(t, s)
 	awaitPhase3Convergence(t, s, lastIndex, lastTerm, 15*phase1Window)
 	for _, id := range s.order {
-		value, err := s.nodes[id].sm.Read([]byte("storm-4"))
-		if err != nil || !value.Found || !bytes.Equal(value.Value, []byte("value-4")) {
-			t.Fatalf("node %d storm-4 = %#v, %v, want value-4", id, value, err)
+		for seq := 1; seq <= 4; seq++ {
+			value, err := s.nodes[id].sm.Read([]byte(fmt.Sprintf("storm-%d", seq)))
+			if err != nil || !value.Found || !bytes.Equal(value.Value, []byte(fmt.Sprintf("value-%d", seq))) {
+				t.Fatalf("node %d storm-%d = %#v, %v, want value-%d rebuilt by replay", id, seq, value, err, seq)
+			}
 		}
 	}
 }
 
+// TestPhase3RecoveryRebuildsDedupAndRetryMutatesOnce is the acked-write /
+// crash / same-sequence-retry gate. The retry proposal is deliberately
+// resolved through requireLeaderAtHighestTerm: at the instant that helper
+// returns, its leader's durable term is the cluster-wide maximum, and any
+// message that could depose it would first have required a higher durable
+// term (persist-before-send) — so the synchronous Propose that follows can
+// never land on a stale leader.
 func TestPhase3RecoveryRebuildsDedupAndRetryMutatesOnce(t *testing.T) {
 	s := newPhase3Sim(t, 20260717042, FaultSchedule{})
 	_, leader := requireLeaderAtHighestTerm(t, s, 3*phase1Window)
@@ -352,19 +390,17 @@ func TestPhase3RecoveryRebuildsDedupAndRetryMutatesOnce(t *testing.T) {
 	originalIndex, originalTerm := proposeCommand(t, s, leader, original)
 	awaitAppliedEverywhere(t, s, originalIndex, originalTerm, 3*phase1Window)
 
-	crashAt := s.Now()
-	for _, id := range s.order {
-		s.ScheduleCrash(id, crashAt)
-		s.ScheduleRestart(id, crashAt+2*phase1TickInterval)
-	}
-		awaitPhase3Convergence(t, s, originalIndex, originalTerm, 15*phase1Window)
+	runPhase3RestartStorm(t, s)
+	awaitPhase3Convergence(t, s, originalIndex, originalTerm, 15*phase1Window)
 
-	interveningIndex, interveningTerm, _ := proposePhase3CommandToLeader(t, s, &raftpb.Command{
+	_, interveningLeader := requireLeaderAtHighestTerm(t, s, 3*phase1Window)
+	interveningIndex, interveningTerm := proposeCommand(t, s, interveningLeader, &raftpb.Command{
 		ClientId: 88, Seq: 1, Op: raftpb.Op_PUT, Key: []byte("dedup-recovery"), Value: []byte("v2"),
-	}, 3*phase1Window)
+	})
 	awaitAppliedEverywhere(t, s, interveningIndex, interveningTerm, 3*phase1Window)
 	retry := proto.Clone(original).(*raftpb.Command)
-	retryIndex, retryTerm, retryLeader := proposePhase3CommandToLeader(t, s, retry, 3*phase1Window)
+	_, retryLeader := requireLeaderAtHighestTerm(t, s, 3*phase1Window)
+	retryIndex, retryTerm := proposeCommand(t, s, retryLeader, retry)
 	awaitAppliedEverywhere(t, s, retryIndex, retryTerm, 3*phase1Window)
 
 	for _, id := range s.order {
@@ -372,45 +408,26 @@ func TestPhase3RecoveryRebuildsDedupAndRetryMutatesOnce(t *testing.T) {
 		if err != nil || !got.Found || !bytes.Equal(got.Value, []byte("v2")) {
 			t.Fatalf("node %d value after same-sequence retry = %#v, %v, want intervening v2 (v1 would prove double mutation)", id, got, err)
 		}
-	}
-	matching := 0
-	for i := range s.nodes[retryLeader].applied {
-		entry := &s.nodes[retryLeader].applied[i]
-		if entry.Type != raftpb.EntryType_NORMAL {
-			continue
-		}
-		var command raftpb.Command
-		if err := proto.Unmarshal(entry.Data, &command); err == nil && command.ClientId == original.ClientId && command.Seq == original.Seq {
-			matching++
-		}
-	}
-	if matching != 2 {
-		t.Fatalf("recovered leader applied-log occurrences for client=%d seq=%d = %d, want recovered original plus retry", original.ClientId, original.Seq, matching)
-	}
-}
-
-func proposePhase3CommandToLeader(t *testing.T, s *Sim, command *raftpb.Command, within VirtualTime) (uint64, uint64, raft.NodeID) {
-	t.Helper()
-	data, err := proto.Marshal(command)
-	if err != nil {
-		t.Fatalf("marshal command: %v", err)
-	}
-	deadline := s.Now() + within
-	for s.Now() <= deadline {
-		for _, id := range s.order {
-			if index, term, ok := s.Propose(id, data); ok {
-				return index, term, id
+		// Every node's post-restart applied stream was rebuilt from zero by the
+		// storm, so it must contain the recovered original and the retry — and
+		// nothing else — for this client sequence. The retry occurrence proves
+		// the entry re-committed; the unchanged v2 value above proves dedup
+		// (rebuilt purely by replay) turned that second apply into a no-op.
+		matching := 0
+		for i := range s.nodes[id].applied {
+			entry := &s.nodes[id].applied[i]
+			if entry.Type != raftpb.EntryType_NORMAL {
+				continue
+			}
+			var command raftpb.Command
+			if err := proto.Unmarshal(entry.Data, &command); err == nil && command.ClientId == original.ClientId && command.Seq == original.Seq {
+				matching++
 			}
 		}
-		if s.queue.Len() == 0 {
-			break
-		}
-		if err := phase3StepOne(s); err != nil {
-			t.Fatalf("find leader invariant: %v", err)
+		if matching != 2 {
+			t.Fatalf("node %d applied-log occurrences for client=%d seq=%d = %d, want recovered original plus retry", id, original.ClientId, original.Seq, matching)
 		}
 	}
-	t.Fatalf("no node accepted command before t=%d", deadline)
-	return 0, 0, 0
 }
 
 func TestPhase3FiveHundredSeedsWithCrashFaults(t *testing.T) {
@@ -427,7 +444,10 @@ func TestPhase3FiveHundredSeedsWithCrashFaults(t *testing.T) {
 			t.Fatalf("seed %d baseline: %v", seed, err)
 		}
 		baselineStore := phase3Store(t, baseline, target)
-		for {
+		for drive := 0; ; drive++ {
+			if drive > 100 {
+				t.Fatalf("seed %d target %d never persisted a term within 100 direct ticks", seed, target)
+			}
 			baseline.nodes[target].node.Tick()
 			baseline.processReady(baseline.nodes[target], baseline.nodes[target].node.Ready())
 			hard, _ := baselineStore.HardState()
@@ -449,7 +469,10 @@ func TestPhase3FiveHundredSeedsWithCrashFaults(t *testing.T) {
 		}
 		s.RegisterInvariant(SingleLeaderPerTerm)
 		store := phase3Store(t, s, target)
-		for !store.Crashed() {
+		for drive := 0; !store.Crashed(); drive++ {
+			if drive > 100 {
+				t.Fatalf("seed %d target %d never crashed within 100 direct ticks; planned save %d at %s", seed, target, crashSave, point)
+			}
 			s.nodes[target].node.Tick()
 			s.processReady(s.nodes[target], s.nodes[target].node.Ready())
 		}
@@ -458,21 +481,12 @@ func TestPhase3FiveHundredSeedsWithCrashFaults(t *testing.T) {
 			t.Fatalf("seed %d crash = %+v, want persistence-bearing save %d at %s", seed, info, crashSave, point)
 		}
 		s.handleRestart(target)
-		if err := s.Run(6 * phase1Window); err != nil {
-			t.Fatalf("seed %d election after crash: %v", seed, err)
-		}
-		term := s.HighestTerm()
-		leaders := s.Leaderships()[term]
-		if len(leaders) != 1 {
-			t.Fatalf("seed %d leaders in highest term %d = %v, want one", seed, term, leaders)
-		}
-		index, proposalTerm, ok := s.Propose(leaders[0], []byte(fmt.Sprintf("phase3-seed-%d", seed)))
+		_, postCrashLeader := requireLeaderAtHighestTerm(t, s, 6*phase1Window)
+		index, proposalTerm, ok := s.Propose(postCrashLeader, []byte(fmt.Sprintf("phase3-seed-%d", seed)))
 		if !ok {
-			t.Fatalf("seed %d leader %d rejected proposal", seed, leaders[0])
+			t.Fatalf("seed %d leader %d rejected proposal", seed, postCrashLeader)
 		}
-		if err := s.Run(s.Now() + 3*phase1Window); err != nil {
-			t.Fatalf("seed %d replication after crash: %v", seed, err)
-		}
+		awaitAppliedEverywhere(t, s, index, proposalTerm, 6*phase1Window)
 		for _, id := range s.order {
 			if !simContainsEntry(s.AppliedEntries(id), index, proposalTerm, raftpb.EntryType_NORMAL, []byte(fmt.Sprintf("phase3-seed-%d", seed))) {
 				t.Fatalf("seed %d node %d did not apply post-crash proposal (%d,%d)", seed, id, index, proposalTerm)
@@ -524,6 +538,15 @@ func healAll(s *Sim) {
 	}
 }
 
+// awaitPhase3Convergence steps the scheduler until every node is up, holds
+// the committed sentinel (index, term) in its durable log, has RE-APPLIED at
+// least through that index via the ordinary Ready.CommittedEntries path, and
+// all state-machine hashes agree. The lastApplied floor is load-bearing:
+// after an all-node restart every state machine is factory-fresh, so equal
+// hashes plus a durable-log check alone would be satisfied before a single
+// entry replays. The sim host advances lastApplied nowhere except its
+// processReady apply loop, so this predicate can only pass once recovery
+// replay has actually happened on every node.
 func awaitPhase3Convergence(t *testing.T, s *Sim, committedIndex, committedTerm uint64, within VirtualTime) {
 	t.Helper()
 	deadline := s.Now() + within
@@ -532,7 +555,9 @@ func awaitPhase3Convergence(t *testing.T, s *Sim, committedIndex, committedTerm 
 		var hash uint64
 		for position, id := range s.order {
 			sn := s.nodes[id]
-			if sn.node == nil || sn.halted || sn.sm == nil || !phase3HasIndexTerm(s.Log(id), committedIndex, committedTerm) {
+			if sn.node == nil || sn.halted || sn.sm == nil ||
+				!phase3HasIndexTerm(s.Log(id), committedIndex, committedTerm) ||
+				sn.lastApplied < committedIndex {
 				converged = false
 				break
 			}

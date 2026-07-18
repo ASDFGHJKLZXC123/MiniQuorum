@@ -76,27 +76,12 @@ func (s *Sim) handleRestart(id raft.NodeID) {
 			return
 		}
 	}
-	hs, err := sn.storage.HardState()
+	init, err := recoveredInitialState(sn.storage)
 	if err != nil {
 		sn.halted = true
-		s.record("restart node=%d hardstate_error=%v fail-stop", id, err)
+		s.record("restart node=%d recovery_error=%v fail-stop", id, err)
 		return
 	}
-	var entries []raftpb.Entry
-	if first, last := sn.storage.FirstIndex(), sn.storage.LastIndex(); last >= first {
-		if last == ^uint64(0) {
-			sn.halted = true
-			s.record("restart node=%d entries_error=index_overflow fail-stop", id)
-			return
-		}
-		entries, err = sn.storage.Entries(first, last+1)
-		if err != nil {
-			sn.halted = true
-			s.record("restart node=%d entries_error=%v fail-stop", id, err)
-			return
-		}
-	}
-	init := raft.InitialState{HardState: hs, Entries: entries}
 	sn.node = raft.NewNode(sn.cfg, init, sn.rnd)
 	sn.halted = false
 	if sn.newStateMachine != nil {

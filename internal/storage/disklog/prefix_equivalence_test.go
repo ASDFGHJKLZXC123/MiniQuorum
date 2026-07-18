@@ -42,7 +42,8 @@ func TestDisklogSimPrefixEquivalenceHardStateTruncateEntries(t *testing.T) {
 	// Measure the sim codec's corresponding logical record boundaries only
 	// through CrashStorage's public behavior. Physical byte counts differ by
 	// design; the survivor states at complete record boundaries must not.
-	hsLen := simBatchBytes(t, &nextHard, nil)
+	baseHardLen := simBatchBytes(t, &baseHard, nil)
+	nextHardLen := simBatchBytes(t, &nextHard, nil)
 	entriesLen := simBatchBytes(t, nil, overwrite)
 	probe := mustSimStorage(t, sim.FaultSchedule{Crashes: []sim.CrashDirective{{
 		Node: 1, Save: 2, Point: sim.CrashBeforeSync, RetainUnsynced: sim.RetainAllUnsynced,
@@ -55,32 +56,47 @@ func TestDisklogSimPrefixEquivalenceHardStateTruncateEntries(t *testing.T) {
 	if !ok {
 		t.Fatal("probe LastCrash() reported no crash")
 	}
-	truncateLen := info.UnsyncedBytes - hsLen - entriesLen
+	truncateLen := info.UnsyncedBytes - nextHardLen - entriesLen
 	if truncateLen <= 0 {
-		t.Fatalf("sim overlapping batch = %d bytes, want a truncate record beyond hard=%d and entries=%d", info.UnsyncedBytes, hsLen, entriesLen)
+		t.Fatalf("sim overlapping batch = %d bytes, want a truncate record beyond hard=%d and entries=%d", info.UnsyncedBytes, nextHardLen, entriesLen)
 	}
 
-	diskCuts := []int{
-		frames[2].offset,
-		frames[2].offset + frames[2].length,
-		frames[3].offset + frames[3].length,
-		frames[4].offset + frames[4].length,
+	// Every complete-record survivor boundary of the two-batch history, from
+	// the empty log through the fully durable second batch. crashSave selects
+	// which Save the sim crash cuts; the retention length walks that batch's
+	// staged records one whole record at a time.
+	boundaries := []struct {
+		name      string
+		diskCut   int
+		crashSave uint64
+		simRetain int
+	}{
+		{"empty log", 0, 1, 0},
+		{"first hard state", frames[0].offset + frames[0].length, 1, baseHardLen},
+		{"first batch complete", frames[2].offset, 2, 0},
+		{"second hard state", frames[2].offset + frames[2].length, 2, nextHardLen},
+		{"hard state plus truncate", frames[3].offset + frames[3].length, 2, nextHardLen + truncateLen},
+		{"complete batch", frames[4].offset + frames[4].length, 2, nextHardLen + truncateLen + entriesLen},
 	}
-	simCuts := []int{0, hsLen, hsLen + truncateLen, hsLen + truncateLen + entriesLen}
-	names := []string{"prior batch", "hard state", "hard state plus truncate", "complete batch"}
-	for boundary := range names {
-		t.Run(names[boundary], func(t *testing.T) {
+	for _, boundary := range boundaries {
+		t.Run(boundary.name, func(t *testing.T) {
 			dir := t.TempDir()
-			writeSegmentBytes(t, dir, segment[:diskCuts[boundary]])
+			writeSegmentBytes(t, dir, segment[:boundary.diskCut])
 			recoveredDisk := mustOpen(t, dir, Options{})
 			defer func() { _ = recoveredDisk.Close() }()
 
 			recoveredSim := mustSimStorage(t, sim.FaultSchedule{Crashes: []sim.CrashDirective{{
-				Node: 1, Save: 2, Point: sim.CrashBeforeSync, RetainUnsynced: simCuts[boundary],
+				Node: 1, Save: boundary.crashSave, Point: sim.CrashBeforeSync, RetainUnsynced: boundary.simRetain,
 			}}})
-			mustSimSave(t, recoveredSim, &baseHard, baseEntries)
-			if err := recoveredSim.Save(&nextHard, overwrite); !errors.Is(err, sim.ErrCrashed) {
-				t.Fatalf("sim Save() error = %v, want ErrCrashed", err)
+			if boundary.crashSave == 1 {
+				if err := recoveredSim.Save(&baseHard, baseEntries); !errors.Is(err, sim.ErrCrashed) {
+					t.Fatalf("sim Save() error = %v, want ErrCrashed", err)
+				}
+			} else {
+				mustSimSave(t, recoveredSim, &baseHard, baseEntries)
+				if err := recoveredSim.Save(&nextHard, overwrite); !errors.Is(err, sim.ErrCrashed) {
+					t.Fatalf("sim Save() error = %v, want ErrCrashed", err)
+				}
 			}
 			if err := recoveredSim.Recover(); err != nil {
 				t.Fatalf("sim Recover() error = %v", err)
