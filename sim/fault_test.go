@@ -8,7 +8,11 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/protobuf/proto"
+
 	"miniquorum/internal/raft"
+	"miniquorum/internal/statemachine"
+	"miniquorum/internal/statemachine/mapsm"
 	raftpb "miniquorum/proto"
 )
 
@@ -441,6 +445,222 @@ func TestCrashDirectiveRestartAfterCrashIsCausalAtRunBoundary(t *testing.T) {
 			}
 		})
 	}
+}
+
+// failFirstMatchingApply wraps the ordinary map state machine and injects
+// exactly one Apply error for marker. The shared failed flag means a fresh
+// state machine built by restart accepts the durably logged command, so the
+// regression can observe the restarted tick stream for several ticks rather
+// than immediately fail-stopping on the same entry again.
+type failFirstMatchingApply struct {
+	statemachine.StateMachine
+	marker string
+	failed *bool
+}
+
+func (sm *failFirstMatchingApply) Apply(entry *raftpb.Entry) (statemachine.Result, error) {
+	if entry.GetType() == raftpb.EntryType_NORMAL && string(entry.GetData()) == sm.marker && !*sm.failed {
+		*sm.failed = true
+		return statemachine.Result{}, fmt.Errorf("forced apply failure")
+	}
+	return sm.StateMachine.Apply(entry)
+}
+
+// TestApplyErrorRestartInvalidatesPendingTickStream reaches an Apply
+// fail-stop through ordinary single-node election and public Sim.Propose.
+// Propose runs between scheduled ticks, so the old tick is still queued when
+// public ScheduleRestart rebuilds the halted process. That old event must be
+// stale, while exactly one new-generation tick continues rescheduling.
+func TestApplyErrorRestartInvalidatesPendingTickStream(t *testing.T) {
+	s := newTestSim(t, 1)
+	commandData, err := proto.Marshal(&raftpb.Command{
+		ClientId: 1,
+		Seq:      1,
+		Op:       raftpb.Op_PUT,
+		Key:      []byte("tick-stream"),
+		Value:    []byte("apply-error"),
+	})
+	if err != nil {
+		t.Fatalf("marshal command: %v", err)
+	}
+
+	var failed bool
+	var factoryCalls int
+	s.setStateMachineFactory(func() statemachine.StateMachine {
+		factoryCalls++
+		return &failFirstMatchingApply{
+			StateMachine: mapsm.New(),
+			marker:       string(commandData),
+			failed:       &failed,
+		}
+	})
+
+	var proposed bool
+	var generationBeforeFailure uint64
+	for attempt := 0; attempt < phase1MaxTimeout+1; attempt++ {
+		runFor(t, s, s.tickInterval)
+		generationBeforeFailure = s.nodes[1].generation
+		index, term, isLeader := s.Propose(1, commandData)
+		if !isLeader {
+			continue
+		}
+		if index == 0 || term == 0 {
+			t.Fatalf("leader proposal = (index=%d term=%d), want non-zero identity", index, term)
+		}
+		proposed = true
+		break
+	}
+	if !proposed || !failed || !s.nodes[1].halted {
+		t.Fatalf("ordinary proposal did not reach injected Apply fail-stop: proposed=%t failed=%t halted=%t trace=%v", proposed, failed, s.nodes[1].halted, s.Trace())
+	}
+	trace := s.Trace()
+	if len(trace) < 2 || !strings.Contains(trace[len(trace)-2], "propose node=1") || !strings.Contains(trace[len(trace)-1], "apply_error") {
+		t.Fatalf("fail-stop was not reached directly through Propose: trace tail=%v", trace[max(0, len(trace)-3):])
+	}
+
+	assertFailStopRestartHasOneTickStream(t, s, 1, generationBeforeFailure)
+	if factoryCalls != 2 {
+		t.Fatalf("state-machine factory calls = %d, want 2 (initial process plus restarted process)", factoryCalls)
+	}
+}
+
+// TestSaveErrorRestartInvalidatesPendingTickStream covers the other
+// fail-stop class with ready_test.go's smallest existing storage seam. An
+// arbitrary non-ErrCrashed Save error cannot be configured through public
+// Sim construction, so this host-level test injects spyStorage, then uses
+// public ScheduleRestart for the lifecycle edge under test.
+func TestSaveErrorRestartInvalidatesPendingTickStream(t *testing.T) {
+	s, err := NewSim(Config{
+		Seed:            1,
+		NodeIDs:         []raft.NodeID{1},
+		ElectionTickMin: 1,
+		ElectionTickMax: 1,
+	})
+	if err != nil {
+		t.Fatalf("NewSim() error = %v", err)
+	}
+	sn := s.nodes[1]
+	sn.sm = mapsm.New()
+	sn.node.Tick()
+	rd := sn.node.Ready()
+	if rd.HardState == nil || len(rd.Entries) == 0 || len(rd.CommittedEntries) == 0 {
+		t.Fatalf("single-node election Ready is vacuous: %+v", rd)
+	}
+	rd.Messages = append(rd.Messages, heartbeatMessage(1, 1, 1))
+
+	spy := newSpyStorage()
+	spy.failSave = true
+	sn.storage = spy
+	generationBeforeFailure := sn.generation
+	queueBeforeFailure := s.queue.Len()
+
+	s.processReady(sn, rd)
+
+	if !sn.halted || !strings.Contains(s.trace[len(s.trace)-1], "save_error") {
+		t.Fatalf("non-ErrCrashed Save did not fail-stop the process: halted=%t trace=%v", sn.halted, s.Trace())
+	}
+	if s.queue.Len() != queueBeforeFailure {
+		t.Fatalf("queue len after failed Save = %d, want unchanged %d (no send for failed Ready)", s.queue.Len(), queueBeforeFailure)
+	}
+	if applied := sn.sm.AppliedIndex(); applied != 0 {
+		t.Fatalf("state machine applied through index %d, want 0 (no apply for failed Ready)", applied)
+	}
+	stillPending := sn.node.Ready()
+	if stillPending.HardState == nil || len(stillPending.Entries) != len(rd.Entries) || len(stillPending.CommittedEntries) != len(rd.CommittedEntries) {
+		t.Fatalf("Ready was advanced after failed Save: pending=(hardstate=%t entries=%d committed=%d), want (%t,%d,%d)", stillPending.HardState != nil, len(stillPending.Entries), len(stillPending.CommittedEntries), rd.HardState != nil, len(rd.Entries), len(rd.CommittedEntries))
+	}
+	spy.failSave = false
+
+	assertFailStopRestartHasOneTickStream(t, s, 1, generationBeforeFailure)
+}
+
+// assertFailStopRestartHasOneTickStream verifies the lifecycle invariant
+// shared by Apply and Save fail-stops. A tick event is a live stream exactly
+// when its generation matches the node's current generation: firing it will
+// schedule the stream's successor. Stale physical events may remain in the
+// heap, but must be observed once as stale and must never reschedule.
+func assertFailStopRestartHasOneTickStream(t *testing.T, s *Sim, id raft.NodeID, generationBeforeFailure uint64) {
+	t.Helper()
+	sn := s.nodes[id]
+	if !sn.halted {
+		t.Fatalf("node %d is not halted before restart", id)
+	}
+	queuedBeforeRestart := pendingTickEvents(s, id)
+	if len(queuedBeforeRestart) != 1 {
+		t.Fatalf("pending physical ticks before restart = %d, want 1 non-vacuous pre-fail-stop tick", len(queuedBeforeRestart))
+	}
+	stale := queuedBeforeRestart[0]
+	if stale.time <= s.Now() {
+		t.Fatalf("pre-fail-stop tick time = %d, want later than current time %d", stale.time, s.Now())
+	}
+	generationAfterFailure := sn.generation
+	failStopInvalidated := generationAfterFailure != generationBeforeFailure
+
+	s.ScheduleRestart(id, s.Now())
+	if err := s.Run(s.Now()); err != nil {
+		t.Fatalf("Run(restart at t=%d) error = %v", s.Now(), err)
+	}
+	if sn.node == nil || sn.halted {
+		t.Fatalf("node %d after public ScheduleRestart: live=%t halted=%t, want live and running", id, sn.node != nil, sn.halted)
+	}
+	live := livePendingTickEvents(s, id)
+	if len(live) != 1 {
+		t.Fatalf("live pending ticks after public ScheduleRestart = %d, want exactly 1; physical ticks=%d generations=(before_failure=%d after_failure=%d current=%d) trace=%v", len(live), len(pendingTickEvents(s, id)), generationBeforeFailure, generationAfterFailure, sn.generation, s.Trace())
+	}
+	if !failStopInvalidated {
+		t.Fatalf("fail-stop left generation at %d, want the killed tick stream structurally invalidated", generationAfterFailure)
+	}
+	if sn.generation == generationAfterFailure {
+		t.Fatalf("restart left generation at %d, want process replacement to start a new tick-stream generation", sn.generation)
+	}
+	if stale.generation == sn.generation {
+		t.Fatalf("pre-restart tick generation %d is still current after restart", stale.generation)
+	}
+
+	for tick := 1; tick <= 5; tick++ {
+		live = livePendingTickEvents(s, id)
+		if len(live) != 1 {
+			t.Fatalf("before subsequent tick %d: live pending ticks = %d, want 1", tick, len(live))
+		}
+		if err := s.Run(live[0].time); err != nil {
+			t.Fatalf("Run(subsequent tick %d at t=%d) error = %v", tick, live[0].time, err)
+		}
+		if got := len(livePendingTickEvents(s, id)); got != 1 {
+			t.Fatalf("after subsequent tick %d: live pending ticks = %d, want 1; trace=%v", tick, got, s.Trace())
+		}
+	}
+
+	staleMarker := fmt.Sprintf("tick node=%d skip(stale gen=%d", id, stale.generation)
+	var staleSkips int
+	for _, line := range s.Trace() {
+		if strings.Contains(line, staleMarker) {
+			staleSkips++
+		}
+	}
+	if staleSkips != 1 {
+		t.Fatalf("pre-restart tick stale-skip count = %d, want exactly 1 (stale tick must drain once without rescheduling); marker=%q trace=%v", staleSkips, staleMarker, s.Trace())
+	}
+}
+
+func pendingTickEvents(s *Sim, id raft.NodeID) []*event {
+	var ticks []*event
+	for _, ev := range s.queue {
+		if ev.kind == eventTick && ev.node == id {
+			ticks = append(ticks, ev)
+		}
+	}
+	return ticks
+}
+
+func livePendingTickEvents(s *Sim, id raft.NodeID) []*event {
+	sn := s.nodes[id]
+	var ticks []*event
+	for _, ev := range pendingTickEvents(s, id) {
+		if ev.generation == sn.generation {
+			ticks = append(ticks, ev)
+		}
+	}
+	return ticks
 }
 
 // TestHandleRestartOnLiveNodeIsRejectedNotDuplicateTickStream is a

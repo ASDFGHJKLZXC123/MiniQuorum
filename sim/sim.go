@@ -47,13 +47,13 @@ type Config struct {
 // simNode is the sim's per-node bookkeeping. storage outlives crashes; it
 // models the disk. node is nil while the node is crashed.
 //
-// generation is bumped on every crash. Tick events carry the generation they
-// were scheduled under (see scheduleTick); an event whose generation no
-// longer matches sn.generation is stale and is dropped without rescheduling.
-// This closes the window where a tick queued before a crash is still
-// in-flight when Restart runs: without the check, that stale tick would
-// later fire against the freshly restarted node and reschedule itself,
-// running a second tick stream alongside the one Restart started.
+// generation identifies the current process/tick-stream lifecycle. It is
+// bumped whenever a crash or fail-stop kills a stream and whenever restart
+// replaces a process. Tick events carry the generation they were scheduled
+// under (see scheduleTick); an event whose generation no longer matches
+// sn.generation is stale and is dropped without rescheduling. This closes
+// the window where a tick queued before any process-ending transition is
+// still in-flight when Restart builds and schedules a fresh stream.
 type simNode struct {
 	id         raft.NodeID
 	cfg        raft.Config
@@ -512,7 +512,8 @@ func (s *Sim) scheduleTick(id raft.NodeID, at VirtualTime) {
 }
 
 // tickIsStale reports whether ev (an eventTick) was scheduled under a
-// generation of its node that a subsequent crash has since invalidated.
+// process/tick-stream generation that a crash, fail-stop, or replacement
+// has since invalidated.
 func (s *Sim) tickIsStale(ev *event) bool {
 	sn := s.nodes[ev.node]
 	return sn == nil || ev.generation != sn.generation

@@ -85,33 +85,26 @@ func (s *Sim) handleCrash(id raft.NodeID) {
 func (s *Sim) handleRestart(id raft.NodeID) {
 	sn := s.nodes[id]
 	if sn.node != nil && !sn.halted {
-		// Restart only ever follows a crash (sn.node == nil) or a fail-stop
-		// (sn.halted, whose tick stream already died out with no reschedule
-		// in handleTick's skip(down) path). A still-ticking live node has
-		// exactly one pending tick event outstanding under its current
-		// generation; rebuilding it here without discarding that node would
-		// schedule a second, independent tick stream at the bottom of this
-		// function (generation is only bumped by a real crash), so a
-		// restart racing a live node is rejected instead of silently
-		// running two tick streams for one node.
+		// Restart only follows a crash (sn.node == nil) or a fail-stop
+		// (sn.halted). A still-running process owns one current-generation
+		// pending tick, so replacing it would create a second stream.
 		s.record("restart node=%d skip(live)", id)
 		return
 	}
 	if store, ok := sn.storage.(*CrashStorage); ok && store.Crashed() {
 		if err := store.Recover(); err != nil {
-			sn.halted = true
+			s.markProcessHalted(sn)
 			s.record("restart node=%d recovery_error=%v fail-stop", id, err)
 			return
 		}
 	}
 	init, err := recoveredInitialState(sn.storage)
 	if err != nil {
-		sn.halted = true
+		s.markProcessHalted(sn)
 		s.record("restart node=%d recovery_error=%v fail-stop", id, err)
 		return
 	}
-	sn.node = raft.NewNode(sn.cfg, init, sn.rnd)
-	sn.halted = false
+	s.replaceProcess(sn, raft.NewNode(sn.cfg, init, sn.rnd))
 	if sn.newStateMachine != nil {
 		sn.sm = sn.newStateMachine()
 		sn.applied = nil
@@ -125,11 +118,37 @@ func (s *Sim) handleRestart(id raft.NodeID) {
 func (s *Sim) markProcessCrashed(sn *simNode) {
 	sn.node = nil
 	sn.halted = false
-	sn.generation++
+	s.invalidateTickStream(sn)
 	// A crashed process cannot also be "paused" (frozen but alive); clear it
 	// so a later restart starts fresh rather than inheriting a stale freeze
 	// from before the crash.
 	sn.paused = false
+}
+
+// markProcessHalted enters fail-stop and invalidates any pending tick owned
+// by the process. This matters when the error is reached from a message or
+// proposal: unlike a tick handler, those paths leave the process's next tick
+// queued. Restart may run before that event drains, but its old generation
+// can no longer become active or reschedule itself.
+func (s *Sim) markProcessHalted(sn *simNode) {
+	if !sn.halted {
+		s.invalidateTickStream(sn)
+	}
+	sn.halted = true
+}
+
+// replaceProcess installs a rebuilt raft.Node under a fresh tick-stream
+// generation. Crashes and fail-stops invalidate the stream they kill;
+// replacement invalidates the process identity once more so every tick
+// scheduled before this rebuild is structurally stale.
+func (s *Sim) replaceProcess(sn *simNode, node *raft.Node) {
+	s.invalidateTickStream(sn)
+	sn.node = node
+	sn.halted = false
+}
+
+func (s *Sim) invalidateTickStream(sn *simNode) {
+	sn.generation++
 }
 
 // processReady applies the frozen Ready contract in the mandated order:
@@ -148,7 +167,7 @@ func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 			s.scheduleRestartAfterStorageCrash(sn.id, info)
 			return
 		}
-		sn.halted = true
+		s.markProcessHalted(sn)
 		s.record("node=%d save_error %v fail-stop", sn.id, err)
 		return
 	}
@@ -169,7 +188,7 @@ func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 			var err error
 			result, err = sn.sm.Apply(&rd.CommittedEntries[i])
 			if err != nil {
-				sn.halted = true
+				s.markProcessHalted(sn)
 				s.record("node=%d apply_error index=%d %v fail-stop", sn.id, rd.CommittedEntries[i].Index, err)
 				return
 			}
