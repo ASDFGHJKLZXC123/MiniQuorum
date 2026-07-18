@@ -16,6 +16,7 @@ const (
 	eventMessage
 	eventCrash
 	eventRestart
+	eventWorkload
 )
 
 // event is one entry in the sim's event queue. seq is assigned at schedule
@@ -27,6 +28,8 @@ type event struct {
 	kind eventKind
 	node raft.NodeID     // target node for tick/crash/restart
 	msg  *raftpb.Message // payload for eventMessage
+
+	workload *workloadEvent // payload for eventWorkload
 
 	// generation is the target node's simNode.generation at schedule time.
 	// Only meaningful for eventTick; see simNode.generation and

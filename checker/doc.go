@@ -1,2 +1,3 @@
-// Package checker is reserved for the Phase 4 checker.
+// Package checker records MiniQuorum client histories and checks them for
+// linearizability with Porcupine.
 package checker
