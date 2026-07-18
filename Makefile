@@ -16,7 +16,7 @@ test:
 	go test ./... -race
 
 boundary:
-	go test ./internal/boundary -run '^TestRaftBoundary$$' -count=1
+	go test ./internal/boundary -count=1
 
 SEED ?= 1
 

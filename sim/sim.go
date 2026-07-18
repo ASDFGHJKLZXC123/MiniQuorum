@@ -86,6 +86,7 @@ type Sim struct {
 	now   VirtualTime
 	seq   uint64
 	queue eventQueue
+	seed  int64
 
 	order []raft.NodeID
 	nodes map[raft.NodeID]*simNode
@@ -120,6 +121,9 @@ type Sim struct {
 	leaders    *leaderTracker
 
 	trace []string
+
+	workload *simWorkload
+	runErr   error
 }
 
 // NewSim builds a Sim with cfg.NodeIDs as a fully connected cluster, each
@@ -195,6 +199,7 @@ func newSim(cfg Config, schedule FaultSchedule, crashStorage bool) (*Sim, error)
 	delayRand, perNode, faultRand := newRandStreams(cfg.Seed, order)
 
 	s := &Sim{
+		seed:         cfg.Seed,
 		order:        order,
 		nodes:        make(map[raft.NodeID]*simNode, len(order)),
 		partition:    make(map[partitionKey]struct{}),
@@ -431,6 +436,14 @@ func (s *Sim) Leaderships() map[uint64][]raft.NodeID {
 // (mirroring handleTick/handleMessage), so its Propose is rejected before
 // touching raft.Node at all, not queued for after it resumes.
 func (s *Sim) Propose(id raft.NodeID, data []byte) (index, term uint64, isLeader bool) {
+	return s.propose(id, data, nil)
+}
+
+// propose is the shared simulator proposal path. onProposed, when non-nil,
+// runs after Raft assigns the log position but before Ready can apply it. That
+// ordering mirrors the production waiter's registration guarantee and covers
+// a single-node proposal that commits in the same synchronous Ready batch.
+func (s *Sim) propose(id raft.NodeID, data []byte, onProposed func(index, term uint64)) (index, term uint64, isLeader bool) {
 	sn, ok := s.nodes[id]
 	if !ok || sn.node == nil || sn.halted || sn.paused {
 		s.record("propose node=%d reject(unavailable)", id)
@@ -438,6 +451,9 @@ func (s *Sim) Propose(id raft.NodeID, data []byte) (index, term uint64, isLeader
 	}
 	index, term, isLeader = sn.node.Propose(data)
 	s.record("propose node=%d index=%d term=%d leader=%t", id, index, term, isLeader)
+	if isLeader && onProposed != nil {
+		onProposed(index, term)
+	}
 	s.processReady(sn, sn.node.Ready())
 	return index, term, isLeader
 }
@@ -491,6 +507,9 @@ func (s *Sim) Run(until VirtualTime) error {
 		ev := heap.Pop(&s.queue).(*event)
 		s.now = ev.time
 		s.handleEvent(ev)
+		if s.runErr != nil {
+			return s.runErr
+		}
 		for _, inv := range s.invariants {
 			if err := inv(s); err != nil {
 				return err

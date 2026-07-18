@@ -23,6 +23,8 @@ func (s *Sim) handleEvent(ev *event) {
 		s.handleCrash(ev.node)
 	case eventRestart:
 		s.handleRestart(ev.node)
+	case eventWorkload:
+		s.handleWorkloadEvent(ev.workload)
 	case eventFault:
 		s.applyFault(ev.fault)
 	}
@@ -193,6 +195,7 @@ func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 				return
 			}
 		}
+		s.observeWorkloadApply(sn.id, &rd.CommittedEntries[i], result)
 		sn.applied = append(sn.applied, raftpb.Entry{
 			Index: rd.CommittedEntries[i].Index,
 			Term:  rd.CommittedEntries[i].Term,

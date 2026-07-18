@@ -16,6 +16,7 @@ const (
 	eventMessage
 	eventCrash
 	eventRestart
+	eventWorkload
 	// eventFault dispatches one FaultSchedule.Events entry through
 	// Sim.applyFault; see event.fault.
 	eventFault
@@ -30,6 +31,8 @@ type event struct {
 	kind eventKind
 	node raft.NodeID     // target node for tick/crash/restart
 	msg  *raftpb.Message // payload for eventMessage
+
+	workload *workloadEvent // payload for eventWorkload
 
 	// generation is the target node's simNode.generation at schedule time.
 	// Only meaningful for eventTick; see simNode.generation and
