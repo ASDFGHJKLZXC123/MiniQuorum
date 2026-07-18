@@ -5,6 +5,8 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/anishathalye/porcupine"
+
 	"miniquorum/checker"
 )
 
@@ -131,7 +133,7 @@ func TestRunnerCollapsesNotLeaderAndLeadershipLostRetriesUsingSameSequence(t *te
 	}
 }
 
-func TestRunnerTimeoutKeepsSessionAndManualRetryUsesSameSequence(t *testing.T) {
+func TestRunnerTimeoutRetryCompletesSameLogicalRecordAndAdvancesSession(t *testing.T) {
 	runner := oneClientRunner(t, 20)
 	host := &fakeHost{statuses: []SubmitStatus{SubmitAccepted, SubmitAccepted}}
 	if err := runner.Start(host); err != nil {
@@ -140,6 +142,10 @@ func TestRunnerTimeoutKeepsSessionAndManualRetryUsesSameSequence(t *testing.T) {
 	start, _ := host.lastScheduled(EventStart)
 	if err := runner.Handle(host, start.event); err != nil {
 		t.Fatalf("Handle(start): %v", err)
+	}
+	initialHistory := runner.History()
+	if len(initialHistory) != 1 {
+		t.Fatalf("history after invocation = %#v, want one logical record", initialHistory)
 	}
 	deadline, ok := host.lastScheduled(EventDeadline)
 	if !ok {
@@ -173,10 +179,55 @@ func TestRunnerTimeoutKeepsSessionAndManualRetryUsesSameSequence(t *testing.T) {
 	if len(host.submissions) != 2 {
 		t.Fatalf("submission count = %d, want retry", len(host.submissions))
 	}
-	if host.submissions[1].AttemptID.Seq != host.submissions[0].AttemptID.Seq {
-		t.Fatalf("retry seq = %d, want original %d", host.submissions[1].AttemptID.Seq, host.submissions[0].AttemptID.Seq)
+	first, retry := host.submissions[0], host.submissions[1]
+	if retry.AttemptID.Seq != first.AttemptID.Seq || retry.AttemptID.ClientID != first.AttemptID.ClientID {
+		t.Fatalf("retry identity = %+v, want original logical identity %+v", retry.AttemptID, first.AttemptID)
+	}
+	if retry.AttemptID.Attempt <= first.AttemptID.Attempt ||
+		retry.Command.GetClientId() != first.Command.GetClientId() ||
+		retry.Command.GetSeq() != first.Command.GetSeq() ||
+		retry.Command.GetOp() != first.Command.GetOp() ||
+		!reflect.DeepEqual(retry.Command.GetKey(), first.Command.GetKey()) ||
+		!reflect.DeepEqual(retry.Command.GetValue(), first.Command.GetValue()) {
+		t.Fatalf("retry changed logical command: first=%+v retry=%+v", first, retry)
 	}
 	if clients := runner.Clients(); clients[0].NextSeq != 1 || clients[0].OutstandingSeq != 1 {
 		t.Fatalf("client advanced after timeout retry: %#v", clients[0])
+	}
+
+	host.now++
+	completionTime := host.now
+	if err := runner.Handle(host, Event{
+		Kind:      EventApplied,
+		AttemptID: retry.AttemptID,
+		Output:    checker.Output{OK: true},
+	}); err != nil {
+		t.Fatalf("Handle(applied retry): %v", err)
+	}
+
+	history = runner.History()
+	if len(history) != 1 {
+		t.Fatalf("history after retry completion = %#v, want exactly one logical record", history)
+	}
+	operation := history[0]
+	if operation.ClientID != first.AttemptID.ClientID || operation.Seq != first.AttemptID.Seq ||
+		operation.InvokeTime != initialHistory[0].InvokeTime || operation.ReturnTime == nil ||
+		*operation.ReturnTime != completionTime || !reflect.DeepEqual(operation.Input, initialHistory[0].Input) {
+		t.Fatalf("completed logical record = %#v, initial record = %#v", operation, initialHistory[0])
+	}
+	events := history.PorcupineEvents()
+	if len(events) != 2 || events[0].Kind != porcupine.CallEvent || events[1].Kind != porcupine.ReturnEvent || events[0].Id != events[1].Id {
+		t.Fatalf("Porcupine events = %#v, want exactly one matching call/return", events)
+	}
+	if output, ok := events[1].Value.(checker.Output); !ok || output.Unknown {
+		t.Fatalf("retry completion output = %#v, want observed non-unknown return", events[1].Value)
+	}
+	clients = runner.Clients()
+	if len(clients) != 1 || clients[0].NextSeq != 2 || clients[0].Generated != 1 ||
+		clients[0].Completed != 1 || clients[0].OutstandingSeq != 0 || clients[0].TimedOut {
+		t.Fatalf("client after retry completion = %#v, want session advanced to seq 2", clients)
+	}
+	if !runner.Done() {
+		t.Fatal("runner is not done after the retried logical operation completed")
 	}
 }

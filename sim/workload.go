@@ -200,7 +200,7 @@ func (s *Sim) observeWorkloadApply(node raft.NodeID, entry *raftpb.Entry, result
 		output := checker.Output{}
 		if entry.GetTerm() == pendingAttempt.term {
 			kind = workloadpkg.EventApplied
-			output = checker.Output{OK: true, Value: append([]byte(nil), result.Value...), Found: result.Found}
+			output = successfulWorkloadOutput(result)
 		}
 		s.pushAt(s.now, &event{
 			kind: eventWorkload,
@@ -210,6 +210,14 @@ func (s *Sim) observeWorkloadApply(node raft.NodeID, entry *raftpb.Entry, result
 				Output:    output,
 			}},
 		})
+	}
+}
+
+func successfulWorkloadOutput(result statemachine.Result) checker.Output {
+	return checker.Output{
+		OK:    true,
+		Value: append([]byte(nil), result.Value...),
+		Found: result.Found,
 	}
 }
 

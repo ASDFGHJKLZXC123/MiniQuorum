@@ -93,23 +93,122 @@ func TestSimWorkloadTimeoutRemainsOpenAndRetryKeepsSequence(t *testing.T) {
 		}
 	}
 	before := len(s.WorkloadAttempts())
-	if err := s.ScheduleWorkloadRetry(clients[0].ClientID, 101); err != nil {
+	selectedClient := clients[0].ClientID
+	selectedBefore := historyOperationForClient(t, history, selectedClient)
+	if err := s.Run(1000); err != nil {
+		t.Fatalf("Run(elect leader after timeout): %v", err)
+	}
+	if err := s.ScheduleWorkloadRetry(selectedClient, s.Now()+1); err != nil {
 		t.Fatalf("ScheduleWorkloadRetry: %v", err)
 	}
-	if err := s.Run(150); err != nil {
+	if err := s.Run(2500); err != nil {
 		t.Fatalf("Run(retry): %v", err)
 	}
 	after := s.WorkloadAttempts()
 	if len(after) <= before {
 		t.Fatalf("attempt count after explicit retry = %d, want > %d", len(after), before)
 	}
+	acceptedRetry := false
 	for _, attempt := range after[before:] {
-		if attempt.AttemptID.ClientID == clients[0].ClientID && attempt.AttemptID.Seq != 1 {
+		if attempt.AttemptID.ClientID != selectedClient {
+			continue
+		}
+		if attempt.AttemptID.Seq != selectedBefore.Seq {
 			t.Fatalf("timeout retry advanced sequence: %#v", attempt.AttemptID)
 		}
+		if attempt.Status == workloadpkg.SubmitAccepted {
+			acceptedRetry = true
+		}
 	}
-	if got := s.WorkloadHistory(); len(got) != 2 || got[0].ReturnTime != nil {
-		t.Fatalf("retry created or completed a logical record unexpectedly: %#v", got)
+	if !acceptedRetry {
+		t.Fatalf("no same-sequence retry was accepted: attempts=%#v", after[before:])
+	}
+	completedHistory := s.WorkloadHistory()
+	if len(completedHistory) != len(history) {
+		t.Fatalf("retry changed logical history length from %d to %d: %#v", len(history), len(completedHistory), completedHistory)
+	}
+	selectedAfter := historyOperationForClient(t, completedHistory, selectedClient)
+	if selectedAfter.Seq != selectedBefore.Seq || selectedAfter.InvokeTime != selectedBefore.InvokeTime ||
+		!reflect.DeepEqual(selectedAfter.Input, selectedBefore.Input) || selectedAfter.ReturnTime == nil {
+		t.Fatalf("retry did not complete the original logical record: before=%#v after=%#v", selectedBefore, selectedAfter)
+	}
+	for _, client := range s.WorkloadClients() {
+		if client.ClientID == selectedClient && (client.NextSeq != 2 || client.Completed != 1 || client.OutstandingSeq != 0 || client.TimedOut) {
+			t.Fatalf("selected client did not advance after retry completion: %#v", client)
+		}
+	}
+	if !checker.Check(completedHistory) {
+		t.Fatal("Porcupine rejected timeout/retry/completion history")
+	}
+}
+
+func TestRaftAppliedHistoryDistinguishesMissingKeyFromPresentEmptyValue(t *testing.T) {
+	s := phase2StateMachineSim(t, 2026071642)
+	_, leader := requireLeaderAtHighestTerm(t, s, 3*phase1Window)
+
+	putInput := checker.Input{Op: raftpb.Op_PUT, Key: []byte("empty"), Value: []byte{}}
+	putInvoke := s.Now()
+	putIndex, putTerm := proposeCommand(t, s, leader, &raftpb.Command{
+		ClientId: 7001,
+		Seq:      1,
+		Op:       putInput.Op,
+		Key:      putInput.Key,
+		Value:    putInput.Value,
+	})
+	putResult := awaitAppliedResult(t, s, leader, putIndex, putTerm, 3*phase1Window)
+	putReturn := s.Now()
+	runFor(t, s, phase1TickInterval)
+
+	presentInput := checker.Input{Op: raftpb.Op_GET, Key: []byte("empty")}
+	presentInvoke := s.Now()
+	presentIndex, presentTerm := proposeCommand(t, s, leader, &raftpb.Command{
+		ClientId: 7002,
+		Seq:      1,
+		Op:       presentInput.Op,
+		Key:      presentInput.Key,
+	})
+	presentResult := awaitAppliedResult(t, s, leader, presentIndex, presentTerm, 3*phase1Window)
+	presentReturn := s.Now()
+	runFor(t, s, phase1TickInterval)
+
+	missingInput := checker.Input{Op: raftpb.Op_GET, Key: []byte("missing")}
+	missingInvoke := s.Now()
+	missingIndex, missingTerm := proposeCommand(t, s, leader, &raftpb.Command{
+		ClientId: 7003,
+		Seq:      1,
+		Op:       missingInput.Op,
+		Key:      missingInput.Key,
+	})
+	missingResult := awaitAppliedResult(t, s, leader, missingIndex, missingTerm, 3*phase1Window)
+	missingReturn := s.Now()
+
+	presentOutput := successfulWorkloadOutput(presentResult)
+	missingOutput := successfulWorkloadOutput(missingResult)
+	if !presentOutput.Found || len(presentOutput.Value) != 0 {
+		t.Fatalf("Raft-applied GET(empty) output = %#v, want found empty value", presentOutput)
+	}
+	if missingOutput.Found || len(missingOutput.Value) != 0 {
+		t.Fatalf("Raft-applied GET(missing) output = %#v, want absent", missingOutput)
+	}
+
+	history := checker.History{
+		completedHistoryOperation(7001, 1, putInvoke, putReturn, putInput, successfulWorkloadOutput(putResult)),
+		completedHistoryOperation(7002, 1, presentInvoke, presentReturn, presentInput, presentOutput),
+		completedHistoryOperation(7003, 1, missingInvoke, missingReturn, missingInput, missingOutput),
+	}
+	if !checker.Check(history) {
+		t.Fatalf("checker rejected actual Raft-applied empty/missing history: %#v", history)
+	}
+
+	presentConflatedWithMissing := append(checker.History(nil), history...)
+	presentConflatedWithMissing[1].Output.Found = false
+	if checker.Check(presentConflatedWithMissing) {
+		t.Fatal("checker accepted a present empty value reported as missing")
+	}
+	missingConflatedWithEmpty := append(checker.History(nil), history...)
+	missingConflatedWithEmpty[2].Output.Found = true
+	if checker.Check(missingConflatedWithEmpty) {
+		t.Fatal("checker accepted a missing key reported as a present empty value")
 	}
 }
 
@@ -245,16 +344,50 @@ func assertRetryCommandsKeepIdentity(t *testing.T, attempts []workloadpkg.Attemp
 		clientID uint64
 		seq      uint64
 	}
-	commands := make(map[logicalKey]*raftpb.Command)
+	firstAttempts := make(map[logicalKey]workloadpkg.AttemptRecord)
+	retries := 0
 	for _, attempt := range attempts {
 		key := logicalKey{clientID: attempt.AttemptID.ClientID, seq: attempt.AttemptID.Seq}
-		first, ok := commands[key]
+		first, ok := firstAttempts[key]
 		if !ok {
-			commands[key] = attempt.Command
+			firstAttempts[key] = attempt
 			continue
 		}
-		if first.GetClientId() != attempt.Command.GetClientId() || first.GetSeq() != attempt.Command.GetSeq() || first.GetOp() != attempt.Command.GetOp() || !bytes.Equal(first.GetKey(), attempt.Command.GetKey()) || !bytes.Equal(first.GetValue(), attempt.Command.GetValue()) {
-			t.Fatalf("logical operation %+v changed across retry: first=%+v retry=%+v", key, first, attempt.Command)
+		retries++
+		if attempt.AttemptID.Attempt <= first.AttemptID.Attempt {
+			t.Fatalf("logical operation %+v retry attempt = %d, want > first attempt %d", key, attempt.AttemptID.Attempt, first.AttemptID.Attempt)
 		}
+		if first.Command.GetClientId() != attempt.Command.GetClientId() || first.Command.GetSeq() != attempt.Command.GetSeq() || first.Command.GetOp() != attempt.Command.GetOp() || !bytes.Equal(first.Command.GetKey(), attempt.Command.GetKey()) || !bytes.Equal(first.Command.GetValue(), attempt.Command.GetValue()) {
+			t.Fatalf("logical operation %+v changed across retry: first=%+v retry=%+v", key, first.Command, attempt.Command)
+		}
+	}
+	if retries == 0 {
+		t.Fatal("retry identity assertion was vacuous: workload produced no repeated logical operation")
+	}
+}
+
+func historyOperationForClient(t *testing.T, history checker.History, clientID uint64) checker.Operation {
+	t.Helper()
+	var matches []checker.Operation
+	for _, operation := range history {
+		if operation.ClientID == clientID {
+			matches = append(matches, operation)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("client %d history records = %d, want exactly one: %#v", clientID, len(matches), matches)
+	}
+	return matches[0]
+}
+
+func completedHistoryOperation(clientID, seq uint64, invoke, returnAt VirtualTime, input checker.Input, output checker.Output) checker.Operation {
+	returnTime := int64(returnAt)
+	return checker.Operation{
+		ClientID:   clientID,
+		Seq:        seq,
+		InvokeTime: int64(invoke),
+		ReturnTime: &returnTime,
+		Input:      input,
+		Output:     output,
 	}
 }
