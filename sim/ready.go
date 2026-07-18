@@ -23,6 +23,8 @@ func (s *Sim) handleEvent(ev *event) {
 		s.handleCrash(ev.node)
 	case eventRestart:
 		s.handleRestart(ev.node)
+	case eventFault:
+		s.applyFault(ev.fault)
 	}
 }
 
@@ -32,11 +34,20 @@ func (s *Sim) handleTick(id raft.NodeID) {
 		s.record("tick node=%d skip(down)", id)
 		return
 	}
+	if sn.paused {
+		// A GC pause / VM freeze does not stop the wall clock: the node's
+		// tick schedule keeps advancing underneath it so ticking resumes at
+		// the right cadence on FaultResume, but the tick itself has no
+		// effect while frozen.
+		s.record("tick node=%d skip(paused)", id)
+		s.scheduleTick(id, s.now+s.nextTickDelay(sn))
+		return
+	}
 	sn.node.Tick()
 	s.record("tick node=%d", id)
 	s.processReady(sn, sn.node.Ready())
 	if sn.node != nil && !sn.halted {
-		s.scheduleTick(id, s.now+s.tickInterval)
+		s.scheduleTick(id, s.now+s.nextTickDelay(sn))
 	}
 }
 
@@ -49,6 +60,10 @@ func (s *Sim) handleMessage(m *raftpb.Message) {
 	sn, ok := s.nodes[to]
 	if !ok || sn.node == nil || sn.halted {
 		s.record("msg %d->%d drop(unreachable)", from, to)
+		return
+	}
+	if sn.paused {
+		s.record("msg %d->%d drop(paused)", from, to)
 		return
 	}
 	sn.node.Step(m)
@@ -69,21 +84,27 @@ func (s *Sim) handleCrash(id raft.NodeID) {
 
 func (s *Sim) handleRestart(id raft.NodeID) {
 	sn := s.nodes[id]
+	if sn.node != nil && !sn.halted {
+		// Restart only follows a crash (sn.node == nil) or a fail-stop
+		// (sn.halted). A still-running process owns one current-generation
+		// pending tick, so replacing it would create a second stream.
+		s.record("restart node=%d skip(live)", id)
+		return
+	}
 	if store, ok := sn.storage.(*CrashStorage); ok && store.Crashed() {
 		if err := store.Recover(); err != nil {
-			sn.halted = true
+			s.markProcessHalted(sn)
 			s.record("restart node=%d recovery_error=%v fail-stop", id, err)
 			return
 		}
 	}
 	init, err := recoveredInitialState(sn.storage)
 	if err != nil {
-		sn.halted = true
+		s.markProcessHalted(sn)
 		s.record("restart node=%d recovery_error=%v fail-stop", id, err)
 		return
 	}
-	sn.node = raft.NewNode(sn.cfg, init, sn.rnd)
-	sn.halted = false
+	s.replaceProcess(sn, raft.NewNode(sn.cfg, init, sn.rnd))
 	if sn.newStateMachine != nil {
 		sn.sm = sn.newStateMachine()
 		sn.applied = nil
@@ -91,12 +112,42 @@ func (s *Sim) handleRestart(id raft.NodeID) {
 		sn.lastApplied = 0
 	}
 	s.record("restart node=%d", id)
-	s.scheduleTick(id, s.now+s.tickInterval)
+	s.scheduleTick(id, s.now+s.nextTickDelay(sn))
 }
 
 func (s *Sim) markProcessCrashed(sn *simNode) {
 	sn.node = nil
 	sn.halted = false
+	s.invalidateTickStream(sn)
+	// A crashed process cannot also be "paused" (frozen but alive); clear it
+	// so a later restart starts fresh rather than inheriting a stale freeze
+	// from before the crash.
+	sn.paused = false
+}
+
+// markProcessHalted enters fail-stop and invalidates any pending tick owned
+// by the process. This matters when the error is reached from a message or
+// proposal: unlike a tick handler, those paths leave the process's next tick
+// queued. Restart may run before that event drains, but its old generation
+// can no longer become active or reschedule itself.
+func (s *Sim) markProcessHalted(sn *simNode) {
+	if !sn.halted {
+		s.invalidateTickStream(sn)
+	}
+	sn.halted = true
+}
+
+// replaceProcess installs a rebuilt raft.Node under a fresh tick-stream
+// generation. Crashes and fail-stops invalidate the stream they kill;
+// replacement invalidates the process identity once more so every tick
+// scheduled before this rebuild is structurally stale.
+func (s *Sim) replaceProcess(sn *simNode, node *raft.Node) {
+	s.invalidateTickStream(sn)
+	sn.node = node
+	sn.halted = false
+}
+
+func (s *Sim) invalidateTickStream(sn *simNode) {
 	sn.generation++
 }
 
@@ -107,11 +158,16 @@ func (s *Sim) markProcessCrashed(sn *simNode) {
 func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 	if err := sn.storage.Save(rd.HardState, rd.Entries); err != nil {
 		if errors.Is(err, ErrCrashed) {
+			var info CrashInfo
+			if store, ok := sn.storage.(*CrashStorage); ok {
+				info, _ = store.LastCrash()
+			}
 			s.markProcessCrashed(sn)
 			s.record("node=%d save_crash %v", sn.id, err)
+			s.scheduleRestartAfterStorageCrash(sn.id, info)
 			return
 		}
-		sn.halted = true
+		s.markProcessHalted(sn)
 		s.record("node=%d save_error %v fail-stop", sn.id, err)
 		return
 	}
@@ -123,6 +179,7 @@ func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 		info, _ := store.LastCrash()
 		s.markProcessCrashed(sn)
 		s.record("node=%d after_send_crash save=%d", sn.id, info.Save)
+		s.scheduleRestartAfterStorageCrash(sn.id, info)
 		return
 	}
 	for i := range rd.CommittedEntries {
@@ -131,7 +188,7 @@ func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 			var err error
 			result, err = sn.sm.Apply(&rd.CommittedEntries[i])
 			if err != nil {
-				sn.halted = true
+				s.markProcessHalted(sn)
 				s.record("node=%d apply_error index=%d %v fail-stop", sn.id, rd.CommittedEntries[i].Index, err)
 				return
 			}
@@ -150,6 +207,25 @@ func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 	}
 	sn.node.Advance()
 	s.record("node=%d ready hardstate=%v msgs=%d committed=%d", sn.id, rd.HardState != nil, len(rd.Messages), len(rd.CommittedEntries))
+}
+
+// scheduleRestartAfterStorageCrash causally bridges a serialized crash
+// directive to host recovery. It is called only after CrashStorage reports
+// the crash that actually fired. A matching RestartAfterCrash directive is
+// consumed and enqueues eventRestart at s.now, so even a crash on the run's
+// final virtual-time boundary is recovered before Run returns. Queueing the
+// restart (rather than rebuilding inline) leaves the current tick/message/
+// proposal handler seeing a down process and therefore prevents it from
+// scheduling a second tick stream.
+func (s *Sim) scheduleRestartAfterStorageCrash(id raft.NodeID, info CrashInfo) {
+	key := crashDirectiveKey{node: id, save: info.Save}
+	point, ok := s.restartAfterCrash[key]
+	if !ok || point != info.Point {
+		return
+	}
+	delete(s.restartAfterCrash, key)
+	s.pushAt(s.now, &event{kind: eventRestart, node: id})
+	s.record("node=%d restart_after_crash save=%d scheduled", id, info.Save)
 }
 
 func recoveredInitialState(store storageReader) (raft.InitialState, error) {

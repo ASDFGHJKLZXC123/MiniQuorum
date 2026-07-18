@@ -16,6 +16,9 @@ const (
 	eventMessage
 	eventCrash
 	eventRestart
+	// eventFault dispatches one FaultSchedule.Events entry through
+	// Sim.applyFault; see event.fault.
+	eventFault
 )
 
 // event is one entry in the sim's event queue. seq is assigned at schedule
@@ -32,6 +35,10 @@ type event struct {
 	// Only meaningful for eventTick; see simNode.generation and
 	// Sim.tickIsStale.
 	generation uint64
+
+	// fault is the payload for eventFault: one FaultSchedule.Events entry,
+	// dispatched by Sim.applyFault when this event is popped.
+	fault *FaultEvent
 }
 
 // eventQueue is a deterministic min-heap on (time, seq). It implements
