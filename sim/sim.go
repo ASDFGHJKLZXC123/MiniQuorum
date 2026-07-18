@@ -59,10 +59,11 @@ type simNode struct {
 	halted     bool
 	generation uint64
 
-	applied     []raftpb.Entry
-	results     []statemachine.Result
-	lastApplied uint64
-	sm          statemachine.StateMachine
+	applied         []raftpb.Entry
+	results         []statemachine.Result
+	lastApplied     uint64
+	sm              statemachine.StateMachine
+	newStateMachine func() statemachine.StateMachine
 }
 
 type partitionKey struct{ from, to raft.NodeID }
@@ -94,6 +95,18 @@ type Sim struct {
 // tick interval out. All randomness (message delay, per-node election
 // jitter) derives from cfg.Seed.
 func NewSim(cfg Config) (*Sim, error) {
+	return newSim(cfg, FaultSchedule{}, false)
+}
+
+// newCrashSim builds the same scheduler as NewSim but gives every node a
+// CrashStorage driven by schedule. It is intentionally package-private: the
+// Phase 3 matrix and later in-package fault harnesses share it without
+// changing the frozen public Config surface.
+func newCrashSim(cfg Config, schedule FaultSchedule) (*Sim, error) {
+	return newSim(cfg, schedule, true)
+}
+
+func newSim(cfg Config, schedule FaultSchedule, crashStorage bool) (*Sim, error) {
 	if len(cfg.NodeIDs) == 0 {
 		return nil, errors.New("sim: Config.NodeIDs must not be empty")
 	}
@@ -149,10 +162,18 @@ func NewSim(cfg Config) (*Sim, error) {
 			HeartbeatTicks:  cfg.HeartbeatTicks,
 		}
 		rnd := perNode[id]
+		var store storage.Storage = storage.NewMemStorage()
+		if crashStorage {
+			var err error
+			store, err = NewCrashStorage(id, schedule)
+			if err != nil {
+				return nil, err
+			}
+		}
 		sn := &simNode{
 			id:      id,
 			cfg:     rc,
-			storage: storage.NewMemStorage(),
+			storage: store,
 			rnd:     rnd,
 			node:    raft.NewNode(rc, raft.InitialState{}, rnd),
 		}
@@ -162,6 +183,21 @@ func NewSim(cfg Config) (*Sim, error) {
 		s.scheduleTick(id, s.tickInterval)
 	}
 	return s, nil
+}
+
+// setStateMachineFactory installs a fresh deterministic state machine on
+// every node and remembers how to replace it after a simulated process
+// restart. The factory runs synchronously on the simulator thread.
+func (s *Sim) setStateMachineFactory(factory func() statemachine.StateMachine) {
+	for _, id := range s.order {
+		sn := s.nodes[id]
+		sn.newStateMachine = factory
+		if factory == nil {
+			sn.sm = nil
+			continue
+		}
+		sn.sm = factory()
+	}
 }
 
 // RegisterInvariant adds an invariant check run, in registration order,

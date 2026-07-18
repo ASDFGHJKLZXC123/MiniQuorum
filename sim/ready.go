@@ -1,6 +1,9 @@
 package sim
 
 import (
+	"errors"
+	"fmt"
+
 	"miniquorum/internal/raft"
 	"miniquorum/internal/statemachine"
 	raftpb "miniquorum/proto"
@@ -32,7 +35,9 @@ func (s *Sim) handleTick(id raft.NodeID) {
 	sn.node.Tick()
 	s.record("tick node=%d", id)
 	s.processReady(sn, sn.node.Ready())
-	s.scheduleTick(id, s.now+s.tickInterval)
+	if sn.node != nil && !sn.halted {
+		s.scheduleTick(id, s.now+s.tickInterval)
+	}
 }
 
 func (s *Sim) handleMessage(m *raftpb.Message) {
@@ -53,24 +58,46 @@ func (s *Sim) handleMessage(m *raftpb.Message) {
 
 func (s *Sim) handleCrash(id raft.NodeID) {
 	sn := s.nodes[id]
-	sn.node = nil
-	sn.halted = false
-	sn.generation++
+	if store, ok := sn.storage.(*CrashStorage); ok && !store.Crashed() {
+		if err := store.Crash(); err != nil {
+			s.record("crash node=%d storage_error=%v", id, err)
+		}
+	}
+	s.markProcessCrashed(sn)
 	s.record("crash node=%d", id)
 }
 
 func (s *Sim) handleRestart(id raft.NodeID) {
 	sn := s.nodes[id]
-	hs, _ := sn.storage.HardState()
-	var entries []raftpb.Entry
-	if first, last := sn.storage.FirstIndex(), sn.storage.LastIndex(); last >= first {
-		entries, _ = sn.storage.Entries(first, last+1)
+	if store, ok := sn.storage.(*CrashStorage); ok && store.Crashed() {
+		if err := store.Recover(); err != nil {
+			sn.halted = true
+			s.record("restart node=%d recovery_error=%v fail-stop", id, err)
+			return
+		}
 	}
-	init := raft.InitialState{HardState: hs, Entries: entries}
+	init, err := recoveredInitialState(sn.storage)
+	if err != nil {
+		sn.halted = true
+		s.record("restart node=%d recovery_error=%v fail-stop", id, err)
+		return
+	}
 	sn.node = raft.NewNode(sn.cfg, init, sn.rnd)
 	sn.halted = false
+	if sn.newStateMachine != nil {
+		sn.sm = sn.newStateMachine()
+		sn.applied = nil
+		sn.results = nil
+		sn.lastApplied = 0
+	}
 	s.record("restart node=%d", id)
 	s.scheduleTick(id, s.now+s.tickInterval)
+}
+
+func (s *Sim) markProcessCrashed(sn *simNode) {
+	sn.node = nil
+	sn.halted = false
+	sn.generation++
 }
 
 // processReady applies the frozen Ready contract in the mandated order:
@@ -79,6 +106,11 @@ func (s *Sim) handleRestart(id raft.NodeID) {
 // send, no apply, no Advance.
 func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 	if err := sn.storage.Save(rd.HardState, rd.Entries); err != nil {
+		if errors.Is(err, ErrCrashed) {
+			s.markProcessCrashed(sn)
+			s.record("node=%d save_crash %v", sn.id, err)
+			return
+		}
 		sn.halted = true
 		s.record("node=%d save_error %v fail-stop", sn.id, err)
 		return
@@ -86,6 +118,12 @@ func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 	for _, m := range rd.Messages {
 		s.observeLeader(m)
 		s.scheduleMessage(m)
+	}
+	if store, ok := sn.storage.(*CrashStorage); ok && store.CrashIfArmed() {
+		info, _ := store.LastCrash()
+		s.markProcessCrashed(sn)
+		s.record("node=%d after_send_crash save=%d", sn.id, info.Save)
+		return
 	}
 	for i := range rd.CommittedEntries {
 		var result statemachine.Result
@@ -112,6 +150,32 @@ func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 	}
 	sn.node.Advance()
 	s.record("node=%d ready hardstate=%v msgs=%d committed=%d", sn.id, rd.HardState != nil, len(rd.Messages), len(rd.CommittedEntries))
+}
+
+func recoveredInitialState(store storageReader) (raft.InitialState, error) {
+	hard, err := store.HardState()
+	if err != nil {
+		return raft.InitialState{}, err
+	}
+	first, last := store.FirstIndex(), store.LastIndex()
+	var entries []raftpb.Entry
+	if last >= first {
+		if last == ^uint64(0) {
+			return raft.InitialState{}, fmt.Errorf("sim: last index overflows half-open range")
+		}
+		entries, err = store.Entries(first, last+1)
+		if err != nil {
+			return raft.InitialState{}, err
+		}
+	}
+	return raft.InitialState{HardState: hard, Entries: entries}, nil
+}
+
+type storageReader interface {
+	HardState() (raft.HardState, error)
+	Entries(lo, hi uint64) ([]raftpb.Entry, error)
+	FirstIndex() uint64
+	LastIndex() uint64
 }
 
 // observeLeader records term/leader observations strictly from a
