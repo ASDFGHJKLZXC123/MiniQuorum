@@ -23,6 +23,8 @@ func (s *Sim) handleEvent(ev *event) {
 		s.handleCrash(ev.node)
 	case eventRestart:
 		s.handleRestart(ev.node)
+	case eventFault:
+		s.applyFault(ev.fault)
 	}
 }
 
@@ -32,11 +34,20 @@ func (s *Sim) handleTick(id raft.NodeID) {
 		s.record("tick node=%d skip(down)", id)
 		return
 	}
+	if sn.paused {
+		// A GC pause / VM freeze does not stop the wall clock: the node's
+		// tick schedule keeps advancing underneath it so ticking resumes at
+		// the right cadence on FaultResume, but the tick itself has no
+		// effect while frozen.
+		s.record("tick node=%d skip(paused)", id)
+		s.scheduleTick(id, s.now+s.nextTickDelay(sn))
+		return
+	}
 	sn.node.Tick()
 	s.record("tick node=%d", id)
 	s.processReady(sn, sn.node.Ready())
 	if sn.node != nil && !sn.halted {
-		s.scheduleTick(id, s.now+s.tickInterval)
+		s.scheduleTick(id, s.now+s.nextTickDelay(sn))
 	}
 }
 
@@ -49,6 +60,10 @@ func (s *Sim) handleMessage(m *raftpb.Message) {
 	sn, ok := s.nodes[to]
 	if !ok || sn.node == nil || sn.halted {
 		s.record("msg %d->%d drop(unreachable)", from, to)
+		return
+	}
+	if sn.paused {
+		s.record("msg %d->%d drop(paused)", from, to)
 		return
 	}
 	sn.node.Step(m)
@@ -91,13 +106,17 @@ func (s *Sim) handleRestart(id raft.NodeID) {
 		sn.lastApplied = 0
 	}
 	s.record("restart node=%d", id)
-	s.scheduleTick(id, s.now+s.tickInterval)
+	s.scheduleTick(id, s.now+s.nextTickDelay(sn))
 }
 
 func (s *Sim) markProcessCrashed(sn *simNode) {
 	sn.node = nil
 	sn.halted = false
 	sn.generation++
+	// A crashed process cannot also be "paused" (frozen but alive); clear it
+	// so a later restart starts fresh rather than inheriting a stale freeze
+	// from before the crash.
+	sn.paused = false
 }
 
 // processReady applies the frozen Ready contract in the mandated order:
