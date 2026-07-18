@@ -3,6 +3,7 @@ package sim
 import (
 	"errors"
 	"math/rand"
+	"sort"
 
 	"miniquorum/internal/raft"
 )
@@ -20,15 +21,16 @@ import (
 //
 // Every pause/resume, partition/heal, partition-groups/heal-groups, and
 // host crash/restart is generated as one matched (open, close) pair on the
-// same target, so no generated transition can be a guaranteed no-op (a
-// Resume with no preceding Pause on that node, or a Heal with no preceding
-// Partition on that pair, changes nothing). Host FaultCrash/FaultRestart
-// pairs are event-time-scheduled, so they always fire by `until` regardless
-// of runtime dynamics; the storage-level Save-ordinal Crashes directives
-// below remain best-effort (whether a given Save ordinal is actually
-// reached depends on election/heartbeat timing this generator does not
-// model), but each is paired with its own later FaultRestart so a node it
-// does crash is never left stranded.
+// same target. The six intervals are globally non-overlapping in schedule
+// order, so a directed partition can never open an edge already owned by a
+// group partition (or vice versa), and every generated stateful open is a
+// real transition under the generator's own schedule state. Host
+// FaultCrash/FaultRestart pairs are event-time-scheduled, so they always
+// fire by `until` regardless of runtime dynamics. Storage-level Save-ordinal
+// Crashes directives remain conditional on the runtime reaching that Save,
+// but each carries RestartAfterCrash: NewFaultSim schedules its restart only
+// after observing that exact directive fire, at the same virtual time, so
+// recovery is causal and cannot precede or miss a late crash.
 //
 // Bumping the algorithm below (new fault kinds, different draw order or
 // parameter ranges) must bump FaultScheduleGeneratorVersion, since it
@@ -54,30 +56,39 @@ func GenerateFaultSchedule(seed int64, nodeIDs []raft.NodeID, until VirtualTime)
 	}
 
 	const pairCount = 6
+	pairs := make([][2]FaultEvent, 0, pairCount)
 	for i := 0; i < pairCount; i++ {
 		t1, t2 := randTimePair(r, until)
 		switch kinds[r.Intn(len(kinds))] {
 		case pairPauseResume:
 			node := order[r.Intn(len(order))]
-			schedule.Events = append(schedule.Events,
+			pairs = append(pairs, [2]FaultEvent{
 				FaultEvent{Time: t1, Kind: FaultPause, Node: node},
-				FaultEvent{Time: t2, Kind: FaultResume, Node: node})
+				FaultEvent{Time: t2, Kind: FaultResume, Node: node},
+			})
 		case pairPartitionHeal:
 			from, to := randomDistinctPair(r, order)
-			schedule.Events = append(schedule.Events,
+			pairs = append(pairs, [2]FaultEvent{
 				FaultEvent{Time: t1, Kind: FaultPartition, From: from, To: to},
-				FaultEvent{Time: t2, Kind: FaultHeal, From: from, To: to})
+				FaultEvent{Time: t2, Kind: FaultHeal, From: from, To: to},
+			})
 		case pairGroupsHealGroups:
 			groups := randomGroupSplit(r, order)
-			schedule.Events = append(schedule.Events,
+			pairs = append(pairs, [2]FaultEvent{
 				FaultEvent{Time: t1, Kind: FaultPartitionGroups, Groups: groups},
-				FaultEvent{Time: t2, Kind: FaultHealGroups, Groups: groups})
+				FaultEvent{Time: t2, Kind: FaultHealGroups, Groups: groups},
+			})
 		case pairCrashRestart:
 			node := order[r.Intn(len(order))]
-			schedule.Events = append(schedule.Events,
+			pairs = append(pairs, [2]FaultEvent{
 				FaultEvent{Time: t1, Kind: FaultCrash, Node: node},
-				FaultEvent{Time: t2, Kind: FaultRestart, Node: node})
+				FaultEvent{Time: t2, Kind: FaultRestart, Node: node},
+			})
 		}
+	}
+	normalizeFaultPairTimes(pairs)
+	for _, pair := range pairs {
+		schedule.Events = append(schedule.Events, pair[0], pair[1])
 	}
 
 	// drop-rate/duplicate-rate/clock-skew are safe to draw independently:
@@ -105,26 +116,47 @@ func GenerateFaultSchedule(seed int64, nodeIDs []raft.NodeID, until VirtualTime)
 	// a generated schedule also exercises "the schedule selects the crash
 	// point." Save ordinals are spaced far enough apart (per distinct node)
 	// that these two directives can never collide on (Node, Save), which
-	// NewCrashStorage would otherwise reject. Each directive's node gets a
-	// FaultRestart late in the run: if the storage crash does fire, the
-	// node is rebuilt instead of stranded; if it never fires, the restart
-	// targets a still-live node and is safely rejected as a no-op.
+	// NewCrashStorage would otherwise reject. RestartAfterCrash makes the
+	// recovery conditional on this directive actually firing; it does not
+	// guess a virtual time from the Save ordinal.
 	const crashCount = 2
 	points := []CrashPoint{CrashBeforeSync, CrashAfterSyncBeforeSend, CrashAfterSend}
 	for i := 0; i < crashCount; i++ {
 		node := order[i%len(order)]
 		save := uint64(5 + i*25 + r.Intn(20))
 		schedule.Crashes = append(schedule.Crashes, CrashDirective{
-			Node:           node,
-			Save:           save,
-			Point:          points[r.Intn(len(points))],
-			RetainUnsynced: RetainAllUnsynced,
+			Node:              node,
+			Save:              save,
+			Point:             points[r.Intn(len(points))],
+			RetainUnsynced:    RetainAllUnsynced,
+			RestartAfterCrash: true,
 		})
-		schedule.Events = append(schedule.Events, FaultEvent{Time: lateRestartTime(r, until), Kind: FaultRestart, Node: node})
 	}
 
 	sortFaultEvents(schedule.Events)
 	return schedule, nil
+}
+
+// normalizeFaultPairTimes turns independently drawn pair endpoints into a
+// globally non-overlapping interval sequence. Sorting all 2N endpoints and
+// assigning consecutive endpoints to pair i proves, by construction,
+//
+//	open[i] <= close[i] <= open[i+1].
+//
+// Equal endpoints are safe for tiny horizons: pairs are appended in this
+// same order and sortFaultEvents is stable, so close[i] is processed before
+// open[i+1]. The original interleaved random draws still choose pair kinds,
+// targets, and endpoint distribution; this step only removes overlap.
+func normalizeFaultPairTimes(pairs [][2]FaultEvent) {
+	times := make([]VirtualTime, 0, len(pairs)*2)
+	for i := range pairs {
+		times = append(times, pairs[i][0].Time, pairs[i][1].Time)
+	}
+	sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
+	for i := range pairs {
+		pairs[i][0].Time = times[2*i]
+		pairs[i][1].Time = times[2*i+1]
+	}
 }
 
 func randVirtualTime(r *rand.Rand, until VirtualTime) VirtualTime {
@@ -148,23 +180,6 @@ func randTimePair(r *rand.Rand, until VirtualTime) (VirtualTime, VirtualTime) {
 	}
 	t2 := t1 + 1 + VirtualTime(r.Int63n(int64(remaining)))
 	return t1, t2
-}
-
-// lateRestartTime picks a virtual time in the last quarter of the run (or 0
-// if until is degenerate): a generated storage crash directive uses low
-// Save ordinals that are likely, but not certain, to have fired by then, so
-// its paired FaultRestart gets the widest reasonable window to actually
-// find the node crashed and rebuild it.
-func lateRestartTime(r *rand.Rand, until VirtualTime) VirtualTime {
-	if until <= 0 {
-		return 0
-	}
-	windowStart := until - until/4
-	if windowStart >= until {
-		return until - 1
-	}
-	span := int64(until - windowStart)
-	return windowStart + VirtualTime(r.Int63n(span))
 }
 
 // randomDistinctPair picks two different node IDs from order. order must

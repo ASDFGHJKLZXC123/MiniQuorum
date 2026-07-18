@@ -400,6 +400,49 @@ func TestFaultScheduleSelectsCrashPointAndScriptedRestartRebuildsNode(t *testing
 	}
 }
 
+// TestCrashDirectiveRestartAfterCrashIsCausalAtRunBoundary proves the host
+// side of the generated-crash guarantee without relying on Save timing or a
+// seed sample. At every Phase 3 crash point, the first Save's serialized
+// policy must enqueue recovery at that same virtual time. Run(0) therefore
+// recovers it even though there is no later heuristic restart window.
+func TestCrashDirectiveRestartAfterCrashIsCausalAtRunBoundary(t *testing.T) {
+	for _, point := range []CrashPoint{CrashBeforeSync, CrashAfterSyncBeforeSend, CrashAfterSend} {
+		t.Run(point.String(), func(t *testing.T) {
+			schedule := FaultSchedule{Crashes: []CrashDirective{{
+				Node:              1,
+				Save:              1,
+				Point:             point,
+				RetainUnsynced:    RetainAllUnsynced,
+				RestartAfterCrash: true,
+			}}}
+			s, err := NewFaultSim(Config{Seed: 1, NodeIDs: []raft.NodeID{1, 2, 3}}, schedule)
+			if err != nil {
+				t.Fatalf("NewFaultSim() error = %v", err)
+			}
+			store := phase3Store(t, s, 1)
+
+			s.handleTick(1)
+			info, crashed := store.LastCrash()
+			if !crashed || info.Save != 1 || info.Point != point {
+				t.Fatalf("LastCrash() = %+v, %t, want save 1 at %s", info, crashed, point)
+			}
+			if s.nodes[1].node != nil || !store.Crashed() {
+				t.Fatalf("before queued recovery: node_live=%t storage_crashed=%t, want false/true", s.nodes[1].node != nil, store.Crashed())
+			}
+
+			if err := s.Run(0); err != nil {
+				t.Fatalf("Run(0) error = %v", err)
+			}
+			if s.nodes[1].node == nil || store.Crashed() {
+				t.Fatalf("after same-time causal recovery: node_live=%t storage_crashed=%t, want true/false; trace=%v", s.nodes[1].node != nil, store.Crashed(), s.Trace())
+			}
+			if _, pending := s.restartAfterCrash[crashDirectiveKey{node: 1, save: 1}]; pending {
+				t.Fatal("fired RestartAfterCrash directive remains pending, want it consumed exactly once")
+			}
+		})
+	}
+}
+
 // TestHandleRestartOnLiveNodeIsRejectedNotDuplicateTickStream is a
 // regression for a duplicate-tick-stream bug: restarting a node that never
 // crashed (sn.node != nil, not halted) used to rebuild a fresh *raft.Node
@@ -645,6 +688,203 @@ func TestGenerateFaultScheduleDeterministic(t *testing.T) {
 	}
 }
 
+// TestGenerateFaultScheduleSeed1PartitionOpensAreMeaningful pins the
+// verifier's seed-1 counterexample. A group partition used to block 3->1
+// before two directed 3->1 partitions opened, making both directed opens
+// redundant. Replay the generated schedule as an edge-state machine and
+// require every partition open to transition every edge it owns from open
+// to blocked (and every matching heal to transition it back).
+func TestGenerateFaultScheduleSeed1PartitionOpensAreMeaningful(t *testing.T) {
+	schedule, err := GenerateFaultSchedule(1, []raft.NodeID{1, 2, 3}, 5000)
+	if err != nil {
+		t.Fatalf("GenerateFaultSchedule() error = %v", err)
+	}
+
+	ordered := append([]FaultEvent(nil), schedule.Events...)
+	sortFaultEvents(ordered)
+	blocked := make(map[partitionKey]struct{})
+	var directedOpens, groupOpens int
+	for i := range ordered {
+		ev := ordered[i]
+		var edges []partitionKey
+		switch ev.Kind {
+		case FaultPartition:
+			directedOpens++
+			edges = []partitionKey{{from: ev.From, to: ev.To}}
+		case FaultPartitionGroups:
+			groupOpens++
+			edges = partitionGroupEdges(ev.Groups)
+		case FaultHeal:
+			edges = []partitionKey{{from: ev.From, to: ev.To}}
+		case FaultHealGroups:
+			edges = partitionGroupEdges(ev.Groups)
+		default:
+			continue
+		}
+
+		opening := ev.Kind == FaultPartition || ev.Kind == FaultPartitionGroups
+		for _, edge := range edges {
+			_, alreadyBlocked := blocked[edge]
+			if opening && alreadyBlocked {
+				t.Fatalf("event %d at t=%d (%s) redundantly opens already-blocked edge %d->%d; schedule=%+v", i, ev.Time, ev.Kind, edge.from, edge.to, schedule)
+			}
+			if !opening && !alreadyBlocked {
+				t.Fatalf("event %d at t=%d (%s) closes already-open edge %d->%d; schedule=%+v", i, ev.Time, ev.Kind, edge.from, edge.to, schedule)
+			}
+			if opening {
+				blocked[edge] = struct{}{}
+			} else {
+				delete(blocked, edge)
+			}
+		}
+	}
+	if directedOpens == 0 || groupOpens == 0 {
+		t.Fatalf("seed-1 regression is vacuous: directed opens=%d group opens=%d; schedule=%+v", directedOpens, groupOpens, schedule)
+	}
+	if len(blocked) != 0 {
+		t.Fatalf("generated partition schedule leaves %d blocked edges after all closes; schedule=%+v", len(blocked), schedule)
+	}
+}
+
+// TestGeneratedTransitionIntervalsAreStructurallyNonOverlapping checks the
+// generator's transition structure directly, rather than inferring safety
+// from a few end-of-run node states. At most one Pause/Partition/GroupSplit/
+// Crash interval may be open at a time, its next stateful event must be the
+// matching close on the same target, and all four interval kinds must be
+// observed across the property matrix.
+func TestGeneratedTransitionIntervalsAreStructurallyNonOverlapping(t *testing.T) {
+	horizons := []VirtualTime{0, 1, 2, 11, 250, 5000}
+	observed := make(map[FaultKind]int)
+	for seed := int64(1); seed <= 256; seed++ {
+		for _, until := range horizons {
+			schedule, err := GenerateFaultSchedule(seed, []raft.NodeID{1, 2, 3}, until)
+			if err != nil {
+				t.Fatalf("seed %d until %d: GenerateFaultSchedule() error = %v", seed, until, err)
+			}
+			assertGeneratedTransitionIntervals(t, seed, until, schedule, observed)
+		}
+	}
+	for _, kind := range []FaultKind{FaultPause, FaultPartition, FaultPartitionGroups, FaultCrash} {
+		if observed[kind] == 0 {
+			t.Fatalf("property matrix observed no %s openings; coverage is vacuous", kind)
+		}
+	}
+}
+
+// TestGeneratedStorageCrashRecoveryPolicyIsStructural verifies the random
+// generator marks every Save-ordinal crash for causal recovery. Together
+// with TestCrashDirectiveRestartAfterCrashIsCausalAtRunBoundary, this is a
+// generator-wide structural argument: whether a directive fires is runtime-
+// dependent, but recovery is no longer time-guessed once it does fire.
+func TestGeneratedStorageCrashRecoveryPolicyIsStructural(t *testing.T) {
+	var directives int
+	for seed := int64(1); seed <= 256; seed++ {
+		for _, until := range []VirtualTime{0, 1, 250, 5000} {
+			schedule, err := GenerateFaultSchedule(seed, []raft.NodeID{1, 2, 3}, until)
+			if err != nil {
+				t.Fatalf("seed %d until %d: GenerateFaultSchedule() error = %v", seed, until, err)
+			}
+			if len(schedule.Crashes) == 0 {
+				t.Fatalf("seed %d until %d: generated no storage crash directives", seed, until)
+			}
+			for i, directive := range schedule.Crashes {
+				directives++
+				if !directive.RestartAfterCrash {
+					t.Fatalf("seed %d until %d: crash directive %d lacks causal recovery policy: %+v", seed, until, i, directive)
+				}
+			}
+		}
+	}
+	if directives == 0 {
+		t.Fatal("generated crash-policy property observed no directives")
+	}
+}
+
+func assertGeneratedTransitionIntervals(t *testing.T, seed int64, until VirtualTime, schedule FaultSchedule, observed map[FaultKind]int) {
+	t.Helper()
+	ordered := append([]FaultEvent(nil), schedule.Events...)
+	sortFaultEvents(ordered)
+	var active *FaultEvent
+	var opens, closes int
+	for i := range ordered {
+		ev := ordered[i]
+		if isGeneratedOpening(ev.Kind) {
+			if active != nil {
+				t.Fatalf("seed %d until %d: %s at t=%d overlaps active %s at t=%d; schedule=%+v", seed, until, ev.Kind, ev.Time, active.Kind, active.Time, schedule)
+			}
+			copy := ev
+			active = &copy
+			opens++
+			observed[ev.Kind]++
+			continue
+		}
+		if !isGeneratedClosing(ev.Kind) {
+			continue
+		}
+		if active == nil {
+			t.Fatalf("seed %d until %d: unmatched %s at t=%d; schedule=%+v", seed, until, ev.Kind, ev.Time, schedule)
+		}
+		if !closesGeneratedOpening(*active, ev) {
+			t.Fatalf("seed %d until %d: %s at t=%d does not close active %s at t=%d on the same target; schedule=%+v", seed, until, ev.Kind, ev.Time, active.Kind, active.Time, schedule)
+		}
+		active = nil
+		closes++
+	}
+	if active != nil {
+		t.Fatalf("seed %d until %d: %s at t=%d remains open; schedule=%+v", seed, until, active.Kind, active.Time, schedule)
+	}
+	if opens != 6 || closes != 6 {
+		t.Fatalf("seed %d until %d: matched transition counts=(opens=%d closes=%d), want (6,6); schedule=%+v", seed, until, opens, closes, schedule)
+	}
+}
+
+func isGeneratedOpening(kind FaultKind) bool {
+	switch kind {
+	case FaultPause, FaultPartition, FaultPartitionGroups, FaultCrash:
+		return true
+	default:
+		return false
+	}
+}
+
+func isGeneratedClosing(kind FaultKind) bool {
+	switch kind {
+	case FaultResume, FaultHeal, FaultHealGroups, FaultRestart:
+		return true
+	default:
+		return false
+	}
+}
+
+func closesGeneratedOpening(open, close FaultEvent) bool {
+	switch open.Kind {
+	case FaultPause:
+		return close.Kind == FaultResume && close.Node == open.Node
+	case FaultPartition:
+		return close.Kind == FaultHeal && close.From == open.From && close.To == open.To
+	case FaultPartitionGroups:
+		return close.Kind == FaultHealGroups && reflect.DeepEqual(close.Groups, open.Groups)
+	case FaultCrash:
+		return close.Kind == FaultRestart && close.Node == open.Node
+	default:
+		return false
+	}
+}
+
+func partitionGroupEdges(groups [][]raft.NodeID) []partitionKey {
+	var edges []partitionKey
+	for i, left := range groups {
+		for _, right := range groups[i+1:] {
+			for _, from := range left {
+				for _, to := range right {
+					edges = append(edges, partitionKey{from: from, to: to}, partitionKey{from: to, to: from})
+				}
+			}
+		}
+	}
+	return edges
+}
+
 // TestGenerateFaultScheduleRejectsEmptyNodeIDs verifies the empty-cluster
 // case returns a deterministic error instead of panicking on the first
 // node-indexed random draw (order[r.Intn(len(order))] with len(order)==0).
@@ -681,9 +921,9 @@ func nodeCrashedInTrace(trace []string, id raft.NodeID) bool {
 // crash and restart behavior, not strand a crashed node forever" coverage
 // requirement: across a battery of generated seeds, any node observed
 // crashing during the run (by either the host-level FaultCrash pair or a
-// storage-level Save-ordinal directive) must be back up (a live *raft.Node)
-// by the run's end, because every generated crash is now paired with a
-// later FaultRestart for the same node.
+// storage-level Save-ordinal directive) must be back up (a live *raft.Node
+// over recovered storage) by the run's end. Host crashes have non-overlapping
+// event-time pairs; storage crashes carry causal RestartAfterCrash policy.
 func TestGenerateFaultScheduleNeverStrandsACrashedNode(t *testing.T) {
 	nodeIDs := []raft.NodeID{1, 2, 3}
 	const until = VirtualTime(20000)
@@ -706,13 +946,72 @@ func TestGenerateFaultScheduleNeverStrandsACrashedNode(t *testing.T) {
 				continue
 			}
 			sawAnyCrash = true
-			if s.nodes[id].node == nil {
-				t.Fatalf("seed %d: node %d crashed during the run and was never rebuilt by t=%d (stranded)", seed, id, until)
+			store := phase3Store(t, s, id)
+			if s.nodes[id].node == nil || store.Crashed() {
+				t.Fatalf("seed %d: node %d crashed during the run and was not fully recovered by t=%d: node_live=%t storage_crashed=%t", seed, id, until, s.nodes[id].node != nil, store.Crashed())
 			}
 		}
 	}
 	if !sawAnyCrash {
 		t.Fatal("no generated seed crashed any node across 25 seeds; this test proves nothing without at least one observed crash")
+	}
+}
+
+// TestGenerateFaultScheduleSeed8LateStorageCrashRecovers pins the verifier's
+// exact short-horizon counterexample: under generator v2 node 1 restarted at
+// t=214, then its save-5 CrashAfterSend directive fired at t=249 and left the
+// process and storage down at the t=250 run boundary. The generated crash
+// must still fire in this regression and its recovery must be causally tied
+// to that firing, not to a guessed earlier restart time.
+func TestGenerateFaultScheduleSeed8LateStorageCrashRecovers(t *testing.T) {
+	const until = VirtualTime(250)
+	nodeIDs := []raft.NodeID{1, 2, 3}
+	schedule, err := GenerateFaultSchedule(8, nodeIDs, until)
+	if err != nil {
+		t.Fatalf("GenerateFaultSchedule() error = %v", err)
+	}
+	s, err := NewFaultSim(Config{Seed: 8, NodeIDs: nodeIDs}, schedule)
+	if err != nil {
+		t.Fatalf("NewFaultSim() error = %v", err)
+	}
+	if err := s.Run(until); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	store := phase3Store(t, s, 1)
+	info, crashed := store.LastCrash()
+	if !crashed || info.Save != 5 || info.Point != CrashAfterSend {
+		t.Fatalf("node 1 last crash = %+v, %t, want save 5 at %s (regression must exercise the original counterexample); schedule=%+v\ntrace=%v", info, crashed, CrashAfterSend, schedule, s.Trace())
+	}
+	times := make(map[string]VirtualTime)
+	markers := []struct {
+		name string
+		text string
+	}{
+		{name: "crash", text: "node=1 after_send_crash save=5"},
+		{name: "scheduled", text: "node=1 restart_after_crash save=5 scheduled"},
+		{name: "restart", text: "restart node=1"},
+	}
+	for _, line := range s.Trace() {
+		for _, marker := range markers {
+			if !strings.Contains(line, marker.text) {
+				continue
+			}
+			var at VirtualTime
+			if _, err := fmt.Sscanf(line, "t=%d", &at); err != nil {
+				t.Fatalf("parse trace time from %q: %v", line, err)
+			}
+			times[marker.name] = at
+		}
+	}
+	if len(times) != 3 {
+		t.Fatalf("trace lacks exact seed-8 crash/recovery sequence: times=%v; schedule=%+v\ntrace=%v", times, schedule, s.Trace())
+	}
+	if times["crash"] != times["scheduled"] || times["crash"] != times["restart"] {
+		t.Fatalf("seed-8 recovery was not causal at the crash boundary: times=%v; trace=%v", times, s.Trace())
+	}
+	if s.nodes[1].node == nil || store.Crashed() {
+		t.Fatalf("node 1 storage crash fired at save 5 but was stranded at t=%d: node_live=%t storage_crashed=%t; schedule=%+v\ntrace=%v", until, s.nodes[1].node != nil, store.Crashed(), schedule, s.Trace())
 	}
 }
 

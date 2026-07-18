@@ -109,6 +109,13 @@ type Sim struct {
 	dropRate float64
 	dupRate  float64
 
+	// restartAfterCrash contains only Save-ordinal crash directives whose
+	// serialized policy requests causal recovery. NewFaultSim populates it;
+	// newCrashSim leaves it nil so Phase 3's explicit recovery behavior is
+	// unchanged. It is lookup-only except for deleting a directive once it
+	// fires, so map iteration can never affect simulation order.
+	restartAfterCrash map[crashDirectiveKey]CrashPoint
+
 	invariants []InvariantFunc
 	leaders    *leaderTracker
 
@@ -145,6 +152,15 @@ func NewFaultSim(cfg Config, schedule FaultSchedule) (*Sim, error) {
 	s, err := newSim(cfg, schedule, true)
 	if err != nil {
 		return nil, err
+	}
+	for _, directive := range schedule.Crashes {
+		if !directive.RestartAfterCrash {
+			continue
+		}
+		if s.restartAfterCrash == nil {
+			s.restartAfterCrash = make(map[crashDirectiveKey]CrashPoint)
+		}
+		s.restartAfterCrash[crashDirectiveKey{node: directive.Node, save: directive.Save}] = directive.Point
 	}
 	s.installFaultEvents(schedule.Events)
 	return s, nil

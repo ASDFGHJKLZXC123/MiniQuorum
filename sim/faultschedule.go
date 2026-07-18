@@ -74,14 +74,22 @@ const RetainAllUnsynced = -1
 // mid-byte; values beyond the buffer are clamped to it. At the other points
 // the buffer is already empty, so the field is ignored.
 //
+// RestartAfterCrash is host policy used by NewFaultSim. When true, the sim
+// enqueues a restart at the same virtual time only after this directive is
+// observed firing. The default false keeps Phase 3's explicit/manual
+// recovery semantics and lets scripted schedules choose a later
+// FaultRestart event when they need a deliberate down interval.
+//
 // A directive is pure data, so a schedule replays byte-identically: same
-// directives + same Save sequence = same survivors. Phase 3C's crash-point
-// matrix and the Phase 4/5 fault harnesses reuse this struct verbatim.
+// directives + same Save sequence = same survivors and recovery policy.
+// Phase 3C's crash-point matrix and the Phase 4/5 fault harnesses reuse this
+// struct verbatim.
 type CrashDirective struct {
-	Node           raft.NodeID
-	Save           uint64
-	Point          CrashPoint
-	RetainUnsynced int
+	Node              raft.NodeID
+	Save              uint64
+	Point             CrashPoint
+	RetainUnsynced    int
+	RestartAfterCrash bool `json:",omitempty"`
 }
 
 // FaultScheduleGeneratorVersion is bumped whenever GenerateFaultSchedule's
@@ -95,9 +103,14 @@ type CrashDirective struct {
 // partition-groups/heal-groups events (which could draw a lone Resume/Heal
 // with no preceding Pause/Partition for the same target -- a guaranteed
 // no-op) with matched (open, close) pairs on the same target, and paired
-// every generated Save-ordinal crash directive with a later FaultRestart for
-// the same node so a node it crashes is never left stranded.
-const FaultScheduleGeneratorVersion = 2
+// every generated Save-ordinal crash directive with a later FaultRestart.
+//
+// v3 makes all generated stateful pair intervals globally non-overlapping,
+// preventing group and directed partitions from redundantly owning the same
+// edge. It also adds serialized CrashDirective.RestartAfterCrash and uses it
+// for causal same-time recovery after a generated Save-ordinal crash fires,
+// replacing v2's unrelated late-run restart heuristic.
+const FaultScheduleGeneratorVersion = 3
 
 // FaultKind identifies one schedulable fault in FaultSchedule.Events. The
 // zero value is intentionally not a valid kind (see FaultSchedule.Validate),

@@ -139,8 +139,13 @@ func (s *Sim) markProcessCrashed(sn *simNode) {
 func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 	if err := sn.storage.Save(rd.HardState, rd.Entries); err != nil {
 		if errors.Is(err, ErrCrashed) {
+			var info CrashInfo
+			if store, ok := sn.storage.(*CrashStorage); ok {
+				info, _ = store.LastCrash()
+			}
 			s.markProcessCrashed(sn)
 			s.record("node=%d save_crash %v", sn.id, err)
+			s.scheduleRestartAfterStorageCrash(sn.id, info)
 			return
 		}
 		sn.halted = true
@@ -155,6 +160,7 @@ func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 		info, _ := store.LastCrash()
 		s.markProcessCrashed(sn)
 		s.record("node=%d after_send_crash save=%d", sn.id, info.Save)
+		s.scheduleRestartAfterStorageCrash(sn.id, info)
 		return
 	}
 	for i := range rd.CommittedEntries {
@@ -182,6 +188,25 @@ func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 	}
 	sn.node.Advance()
 	s.record("node=%d ready hardstate=%v msgs=%d committed=%d", sn.id, rd.HardState != nil, len(rd.Messages), len(rd.CommittedEntries))
+}
+
+// scheduleRestartAfterStorageCrash causally bridges a serialized crash
+// directive to host recovery. It is called only after CrashStorage reports
+// the crash that actually fired. A matching RestartAfterCrash directive is
+// consumed and enqueues eventRestart at s.now, so even a crash on the run's
+// final virtual-time boundary is recovered before Run returns. Queueing the
+// restart (rather than rebuilding inline) leaves the current tick/message/
+// proposal handler seeing a down process and therefore prevents it from
+// scheduling a second tick stream.
+func (s *Sim) scheduleRestartAfterStorageCrash(id raft.NodeID, info CrashInfo) {
+	key := crashDirectiveKey{node: id, save: info.Save}
+	point, ok := s.restartAfterCrash[key]
+	if !ok || point != info.Point {
+		return
+	}
+	delete(s.restartAfterCrash, key)
+	s.pushAt(s.now, &event{kind: eventRestart, node: id})
+	s.record("node=%d restart_after_crash save=%d scheduled", id, info.Save)
 }
 
 func recoveredInitialState(store storageReader) (raft.InitialState, error) {
