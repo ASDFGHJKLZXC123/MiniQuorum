@@ -1,0 +1,229 @@
+{
+  "Version": 5,
+  "Crashes": [
+    {
+      "Node": 1,
+      "Save": 17,
+      "Point": 3,
+      "RetainUnsynced": -1,
+      "RestartAfterCrash": true
+    },
+    {
+      "Node": 2,
+      "Save": 43,
+      "Point": 1,
+      "RetainUnsynced": 16,
+      "RestartAfterCrash": true
+    }
+  ],
+  "Events": [
+    {
+      "Time": 1599,
+      "Kind": 10,
+      "Node": 2,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 1782,
+      "Kind": 2,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Rate": 0.09186929523991282
+    },
+    {
+      "Time": 3289,
+      "Kind": 11,
+      "Node": 2,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 3397,
+      "Kind": 10,
+      "Node": 2,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 3400,
+      "Kind": 9,
+      "Node": 1,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 1.9515450854857075
+    },
+    {
+      "Time": 3411,
+      "Kind": 11,
+      "Node": 2,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 3840,
+      "Kind": 10,
+      "Node": 3,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 4209,
+      "Kind": 9,
+      "Node": 2,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 1.441318820414355
+    },
+    {
+      "Time": 4267,
+      "Kind": 11,
+      "Node": 3,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 5192,
+      "Kind": 10,
+      "Node": 5,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 5197,
+      "Kind": 1,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Rate": 0.0008871889344045272
+    },
+    {
+      "Time": 5249,
+      "Kind": 11,
+      "Node": 5,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 5414,
+      "Kind": 5,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Groups": [
+        [
+          3,
+          2,
+          1,
+          5
+        ],
+        [
+          4
+        ]
+      ]
+    },
+    {
+      "Time": 5468,
+      "Kind": 6,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Groups": [
+        [
+          3,
+          2,
+          1,
+          5
+        ],
+        [
+          4
+        ]
+      ]
+    },
+    {
+      "Time": 5488,
+      "Kind": 10,
+      "Node": 1,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 5667,
+      "Kind": 2,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Rate": 0.06503552763265603
+    },
+    {
+      "Time": 5857,
+      "Kind": 9,
+      "Node": 5,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 0.765044662381777
+    },
+    {
+      "Time": 5914,
+      "Kind": 11,
+      "Node": 1,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 6000,
+      "Kind": 1,
+      "Node": 0,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 6000,
+      "Kind": 2,
+      "Node": 0,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 6000,
+      "Kind": 9,
+      "Node": 1,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 1
+    },
+    {
+      "Time": 6000,
+      "Kind": 9,
+      "Node": 2,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 1
+    },
+    {
+      "Time": 6000,
+      "Kind": 9,
+      "Node": 3,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 1
+    },
+    {
+      "Time": 6000,
+      "Kind": 9,
+      "Node": 4,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 1
+    },
+    {
+      "Time": 6000,
+      "Kind": 9,
+      "Node": 5,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 1
+    }
+  ]
+}

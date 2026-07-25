@@ -1,0 +1,207 @@
+{
+  "Version": 5,
+  "Crashes": [
+    {
+      "Node": 1,
+      "Save": 19,
+      "Point": 3,
+      "RetainUnsynced": -1,
+      "RestartAfterCrash": true
+    },
+    {
+      "Node": 2,
+      "Save": 43,
+      "Point": 1,
+      "RetainUnsynced": -1,
+      "RestartAfterCrash": true
+    }
+  ],
+  "Events": [
+    {
+      "Time": 413,
+      "Kind": 2,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Rate": 0.17833278617021528
+    },
+    {
+      "Time": 476,
+      "Kind": 1,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Rate": 0.17286667402468361
+    },
+    {
+      "Time": 1461,
+      "Kind": 9,
+      "Node": 4,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 1.5028920157225074
+    },
+    {
+      "Time": 1689,
+      "Kind": 7,
+      "Node": 1,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 2011,
+      "Kind": 8,
+      "Node": 1,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 3345,
+      "Kind": 9,
+      "Node": 1,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 0.82742298392055
+    },
+    {
+      "Time": 3523,
+      "Kind": 7,
+      "Node": 3,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 3605,
+      "Kind": 2,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Rate": 0.263242772616719
+    },
+    {
+      "Time": 3932,
+      "Kind": 8,
+      "Node": 3,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 3965,
+      "Kind": 3,
+      "Node": 0,
+      "From": 1,
+      "To": 3
+    },
+    {
+      "Time": 4004,
+      "Kind": 4,
+      "Node": 0,
+      "From": 1,
+      "To": 3
+    },
+    {
+      "Time": 4018,
+      "Kind": 10,
+      "Node": 5,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 4261,
+      "Kind": 11,
+      "Node": 5,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 4543,
+      "Kind": 3,
+      "Node": 0,
+      "From": 4,
+      "To": 5
+    },
+    {
+      "Time": 4783,
+      "Kind": 4,
+      "Node": 0,
+      "From": 4,
+      "To": 5
+    },
+    {
+      "Time": 5861,
+      "Kind": 10,
+      "Node": 5,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 5885,
+      "Kind": 1,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Rate": 0.24780623320449444
+    },
+    {
+      "Time": 5920,
+      "Kind": 11,
+      "Node": 5,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 6000,
+      "Kind": 1,
+      "Node": 0,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 6000,
+      "Kind": 2,
+      "Node": 0,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 6000,
+      "Kind": 9,
+      "Node": 1,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 1
+    },
+    {
+      "Time": 6000,
+      "Kind": 9,
+      "Node": 2,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 1
+    },
+    {
+      "Time": 6000,
+      "Kind": 9,
+      "Node": 3,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 1
+    },
+    {
+      "Time": 6000,
+      "Kind": 9,
+      "Node": 4,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 1
+    },
+    {
+      "Time": 6000,
+      "Kind": 9,
+      "Node": 5,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 1
+    }
+  ]
+}

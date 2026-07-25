@@ -610,7 +610,7 @@ func (n *Node) advanceCommit() bool {
 	majority := len(n.peers)/2 + 1
 	for index := n.log.lastIndex(); index > n.commitIndex; index-- {
 		term, ok := n.log.term(index)
-		if !ok || term != n.hardState.Term {
+		if !ok || !commitTermEligible(term, n.hardState.Term) {
 			continue
 		}
 		replicas := 0

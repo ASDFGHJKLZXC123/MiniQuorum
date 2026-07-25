@@ -1,0 +1,36 @@
+{
+  "Version": 0,
+  "Crashes": null,
+  "Events": [
+    {
+      "Time": 800,
+      "Kind": 3,
+      "Node": 0,
+      "From": 1,
+      "To": 2
+    },
+    {
+      "Time": 1600,
+      "Kind": 4,
+      "Node": 0,
+      "From": 1,
+      "To": 2
+    },
+    {
+      "Time": 2400,
+      "Kind": 5,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Groups": [[1, 2], [3, 4, 5]]
+    },
+    {
+      "Time": 3600,
+      "Kind": 6,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Groups": [[1, 2], [3, 4, 5]]
+    }
+  ]
+}

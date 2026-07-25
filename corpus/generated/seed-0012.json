@@ -1,0 +1,273 @@
+{
+  "Version": 5,
+  "Crashes": [
+    {
+      "Node": 1,
+      "Save": 14,
+      "Point": 3,
+      "RetainUnsynced": -1,
+      "RestartAfterCrash": true
+    },
+    {
+      "Node": 2,
+      "Save": 48,
+      "Point": 1,
+      "RetainUnsynced": 3,
+      "RestartAfterCrash": true
+    }
+  ],
+  "Events": [
+    {
+      "Time": 324,
+      "Kind": 1,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Rate": 0.28030647723892516
+    },
+    {
+      "Time": 401,
+      "Kind": 2,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Rate": 0.28420001641045833
+    },
+    {
+      "Time": 726,
+      "Kind": 3,
+      "Node": 0,
+      "From": 1,
+      "To": 4
+    },
+    {
+      "Time": 2322,
+      "Kind": 4,
+      "Node": 0,
+      "From": 1,
+      "To": 4
+    },
+    {
+      "Time": 2545,
+      "Kind": 5,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Groups": [
+        [
+          2,
+          4
+        ],
+        [
+          3,
+          5,
+          1
+        ]
+      ]
+    },
+    {
+      "Time": 2694,
+      "Kind": 6,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Groups": [
+        [
+          2,
+          4
+        ],
+        [
+          3,
+          5,
+          1
+        ]
+      ]
+    },
+    {
+      "Time": 3314,
+      "Kind": 10,
+      "Node": 4,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 3734,
+      "Kind": 2,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Rate": 0.1303161730020752
+    },
+    {
+      "Time": 4107,
+      "Kind": 11,
+      "Node": 4,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 4376,
+      "Kind": 3,
+      "Node": 0,
+      "From": 4,
+      "To": 2
+    },
+    {
+      "Time": 4403,
+      "Kind": 2,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Rate": 0.25848328602557846
+    },
+    {
+      "Time": 4662,
+      "Kind": 4,
+      "Node": 0,
+      "From": 4,
+      "To": 2
+    },
+    {
+      "Time": 4684,
+      "Kind": 9,
+      "Node": 5,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 1.2334128438029652
+    },
+    {
+      "Time": 4795,
+      "Kind": 5,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Groups": [
+        [
+          3,
+          1,
+          5
+        ],
+        [
+          2,
+          4
+        ]
+      ]
+    },
+    {
+      "Time": 4800,
+      "Kind": 6,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Groups": [
+        [
+          3,
+          1,
+          5
+        ],
+        [
+          2,
+          4
+        ]
+      ]
+    },
+    {
+      "Time": 5091,
+      "Kind": 5,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Groups": [
+        [
+          3
+        ],
+        [
+          5,
+          1,
+          4,
+          2
+        ]
+      ]
+    },
+    {
+      "Time": 5395,
+      "Kind": 9,
+      "Node": 1,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 0.7784711788225004
+    },
+    {
+      "Time": 5992,
+      "Kind": 6,
+      "Node": 0,
+      "From": 0,
+      "To": 0,
+      "Groups": [
+        [
+          3
+        ],
+        [
+          5,
+          1,
+          4,
+          2
+        ]
+      ]
+    },
+    {
+      "Time": 6000,
+      "Kind": 1,
+      "Node": 0,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 6000,
+      "Kind": 2,
+      "Node": 0,
+      "From": 0,
+      "To": 0
+    },
+    {
+      "Time": 6000,
+      "Kind": 9,
+      "Node": 1,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 1
+    },
+    {
+      "Time": 6000,
+      "Kind": 9,
+      "Node": 2,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 1
+    },
+    {
+      "Time": 6000,
+      "Kind": 9,
+      "Node": 3,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 1
+    },
+    {
+      "Time": 6000,
+      "Kind": 9,
+      "Node": 4,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 1
+    },
+    {
+      "Time": 6000,
+      "Kind": 9,
+      "Node": 5,
+      "From": 0,
+      "To": 0,
+      "Multiplier": 1
+    }
+  ]
+}
