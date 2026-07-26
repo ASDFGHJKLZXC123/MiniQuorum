@@ -166,6 +166,7 @@ func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 			}
 			s.markProcessCrashed(sn)
 			s.record("node=%d save_crash %v", sn.id, err)
+			s.recordCrashFiring(sn.id, info)
 			s.scheduleRestartAfterStorageCrash(sn.id, info)
 			return
 		}
@@ -181,6 +182,7 @@ func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 		info, _ := store.LastCrash()
 		s.markProcessCrashed(sn)
 		s.record("node=%d after_send_crash save=%d", sn.id, info.Save)
+		s.recordCrashFiring(sn.id, info)
 		s.scheduleRestartAfterStorageCrash(sn.id, info)
 		return
 	}
@@ -210,6 +212,18 @@ func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 	}
 	sn.node.Advance()
 	s.record("node=%d ready hardstate=%v msgs=%d committed=%d", sn.id, rd.HardState != nil, len(rd.Messages), len(rd.CommittedEntries))
+}
+
+// recordCrashFiring appends the structured record of a storage crash that
+// just fired. Called only from the two processReady crash branches, so every
+// entry corresponds to exactly one save_crash/after_send_crash trace line.
+func (s *Sim) recordCrashFiring(id raft.NodeID, info CrashInfo) {
+	s.crashFirings = append(s.crashFirings, CrashFiring{
+		Time:  s.now,
+		Node:  id,
+		Save:  info.Save,
+		Point: info.Point,
+	})
 }
 
 // scheduleRestartAfterStorageCrash causally bridges a serialized crash

@@ -1,0 +1,26 @@
+{
+  "artifact_version": 1,
+  "generator_version": 5,
+  "scripted": [
+    {
+      "name": "crash-at-point-x",
+      "seed": 41,
+      "schedule": "scripted/crash-at-point-x.json"
+    },
+    {
+      "name": "partition-during-write",
+      "seed": 42,
+      "schedule": "scripted/partition-during-write.json"
+    },
+    {
+      "name": "pause-leader",
+      "seed": 43,
+      "schedule": "scripted/pause-leader.json"
+    }
+  ],
+  "pinned": {
+    "name": "buggy-5.4.2",
+    "seed": 7,
+    "schedule": "pinned/buggy-5.4.2.json"
+  }
+}

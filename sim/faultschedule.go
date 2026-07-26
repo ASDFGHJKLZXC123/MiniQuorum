@@ -110,7 +110,24 @@ type CrashDirective struct {
 // edge. It also adds serialized CrashDirective.RestartAfterCrash and uses it
 // for causal same-time recovery after a generated Save-ordinal crash fires,
 // replacing v2's unrelated late-run restart heuristic.
-const FaultScheduleGeneratorVersion = 3
+//
+// v4 appends a deterministic recovery tail at the generation horizon: message
+// drop/duplication rates return to zero and every node's skew returns to 1x.
+// Stateful pairs already close structurally. The recovery tail keeps a short
+// fault campaign from turning the rest of a workload into a vacuous retry
+// storm while preserving every injected fault in the serialized artifact.
+//
+// v5 varies the surviving-unsynced-prefix retention of generated before-sync
+// storage crashes across none (0), a positive partial/torn prefix, and all
+// (RetainAllUnsynced) instead of pinning every generated crash at
+// RetainAllUnsynced, so the closed seed campaign finally combines Phase 3's
+// before-sync loss and torn-write survivor states with the network/pause/skew
+// faults (guide decision #16; Phase 3 -> Phase 4 hand-off "drive combinations").
+// Post-sync crash points keep RetainAllUnsynced, where the drained buffer makes
+// retention a no-op. Because the retention draws consume additional RNG values
+// inside the crash loop, every generated schedule's later draws remap — hence
+// the version bump and full corpus regeneration.
+const FaultScheduleGeneratorVersion = 5
 
 // FaultKind identifies one schedulable fault in FaultSchedule.Events. The
 // zero value is intentionally not a valid kind (see FaultSchedule.Validate),

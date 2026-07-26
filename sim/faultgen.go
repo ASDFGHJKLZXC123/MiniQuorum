@@ -119,22 +119,85 @@ func GenerateFaultSchedule(seed int64, nodeIDs []raft.NodeID, until VirtualTime)
 	// NewCrashStorage would otherwise reject. RestartAfterCrash makes the
 	// recovery conditional on this directive actually firing; it does not
 	// guess a virtual time from the Save ordinal.
+	//
+	// A before-sync crash also draws its surviving-unsynced-prefix policy (v5):
+	// the closed seed campaign must combine the none / all / positive-partial
+	// (torn) survivor states Phase 3 exposed with the network/pause/skew faults,
+	// instead of pinning every generated crash at RetainAllUnsynced. At the
+	// post-sync points the unsynced buffer is already drained, so retention is
+	// ignored and left at the harmless RetainAllUnsynced sentinel.
 	const crashCount = 2
 	points := []CrashPoint{CrashBeforeSync, CrashAfterSyncBeforeSend, CrashAfterSend}
 	for i := 0; i < crashCount; i++ {
 		node := order[i%len(order)]
 		save := uint64(5 + i*25 + r.Intn(20))
+		point := points[r.Intn(len(points))]
 		schedule.Crashes = append(schedule.Crashes, CrashDirective{
 			Node:              node,
 			Save:              save,
-			Point:             points[r.Intn(len(points))],
-			RetainUnsynced:    RetainAllUnsynced,
+			Point:             point,
+			RetainUnsynced:    generatedUnsyncedRetention(r, point),
 			RestartAfterCrash: true,
+		})
+	}
+
+	// End every randomized campaign with a deterministic clean-network tail.
+	// Rates are otherwise sticky by design, so without these explicit events a
+	// final random setter could dominate the remainder of a short run and make
+	// workload coverage depend on timeout retries instead of Raft progress.
+	schedule.Events = append(schedule.Events,
+		FaultEvent{Time: until, Kind: FaultDropRate, Rate: 0},
+		FaultEvent{Time: until, Kind: FaultDuplicateRate, Rate: 0},
+	)
+	for _, node := range order {
+		schedule.Events = append(schedule.Events, FaultEvent{
+			Time:       until,
+			Kind:       FaultClockSkew,
+			Node:       node,
+			Multiplier: 1,
 		})
 	}
 
 	sortFaultEvents(schedule.Events)
 	return schedule, nil
+}
+
+// maxGeneratedPartialRetention bounds the positive partial-prefix retention a
+// generated before-sync crash may keep. A small byte count tears the tail of
+// the not-yet-synced batch — a batch carrying an EntriesRecord (a client write)
+// is well over this many bytes — leaving a genuine torn-prefix survivor rather
+// than the whole batch. CrashStorage clamps a value past the actual buffer down
+// to it, so a tiny hard-state-only batch degrades harmlessly to "keep all"
+// rather than misbehaving.
+const maxGeneratedPartialRetention = 24
+
+// generatedUnsyncedRetention draws the surviving-unsynced-prefix policy for a
+// generated crash directive. It is meaningful only at CrashBeforeSync, where
+// the Phase 3 model retains an arbitrary prefix of the not-yet-synced batch:
+//
+//	0                          lose the whole unsynced batch (none survives)
+//	1..maxGeneratedPartial     keep a positive partial prefix (a torn tail)
+//	RetainAllUnsynced          keep every unsynced byte
+//
+// Drawing all three across the closed seed campaign is what lets the 1k/10k
+// gates combine before-sync loss and torn-prefix survivors with the
+// network/pause/skew faults, instead of only ever exercising RetainAllUnsynced;
+// TestGeneratedBeforeSyncCrashesCoverRetentionShapes is the canary. At the
+// post-sync points the unsynced buffer is already drained, so retention has no
+// effect and the directive keeps the RetainAllUnsynced sentinel: the value is
+// ignored there, and the sentinel documents "nothing was torn."
+func generatedUnsyncedRetention(r *rand.Rand, point CrashPoint) int {
+	if point != CrashBeforeSync {
+		return RetainAllUnsynced
+	}
+	switch r.Intn(3) {
+	case 0:
+		return 0
+	case 1:
+		return 1 + r.Intn(maxGeneratedPartialRetention)
+	default:
+		return RetainAllUnsynced
+	}
 }
 
 // normalizeFaultPairTimes turns independently drawn pair endpoints into a

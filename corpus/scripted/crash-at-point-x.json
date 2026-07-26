@@ -1,0 +1,27 @@
+{
+  "Version": 0,
+  "Crashes": [
+    {
+      "Node": 2,
+      "Save": 6,
+      "Point": 1,
+      "RetainUnsynced": 0,
+      "RestartAfterCrash": true
+    },
+    {
+      "Node": 3,
+      "Save": 10,
+      "Point": 2,
+      "RetainUnsynced": -1,
+      "RestartAfterCrash": true
+    },
+    {
+      "Node": 1,
+      "Save": 14,
+      "Point": 3,
+      "RetainUnsynced": -1,
+      "RestartAfterCrash": true
+    }
+  ],
+  "Events": null
+}
