@@ -12,6 +12,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26.x"
+      - name: Generated corpus reproducibility preflight
+        run: go test ./internal/simharness -run '^TestCommittedGeneratedCorpusMatchesGeneratorOutput$' -count=1
       - name: Build
         run: go build ./...
       - name: Vet

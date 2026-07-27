@@ -3,7 +3,13 @@
 package simharness
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"fmt"
+	"math"
+	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -175,6 +181,11 @@ func TestCommittedGeneratedCorpusMatchesGeneratorOutput(t *testing.T) {
 		t.Fatal("no generated corpus entries")
 	}
 	for _, entry := range corpus.Generated {
+		committedPath := filepath.Join(corpusDir, filepath.FromSlash(entry.Schedule))
+		committedBytes, err := os.ReadFile(committedPath)
+		if err != nil {
+			t.Fatal(err)
+		}
 		committed, err := ReadCorpusSchedule(corpusDir, entry)
 		if err != nil {
 			t.Fatal(err)
@@ -183,17 +194,95 @@ func TestCommittedGeneratedCorpusMatchesGeneratorOutput(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GenerateFaultSchedule(%d): %v", entry.Seed, err)
 		}
-		committedBytes, err := sim.EncodeFaultSchedule(committed)
-		if err != nil {
-			t.Fatal(err)
-		}
 		regeneratedBytes, err := sim.EncodeFaultSchedule(regenerated)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if string(committedBytes) != string(regeneratedBytes) {
-			t.Fatalf("corpus entry %s (%s) drifted from generator v%d output for seed %d",
-				entry.Name, filepath.FromSlash(entry.Schedule), sim.FaultScheduleGeneratorVersion, entry.Seed)
+		// schedgen terminates every artifact with one newline. Compare the raw
+		// committed file so whitespace or final-newline drift is also visible.
+		regeneratedBytes = append(regeneratedBytes, '\n')
+		if !bytes.Equal(committedBytes, regeneratedBytes) {
+			firstByte := firstDifferentByte(committedBytes, regeneratedBytes)
+			t.Fatalf("corpus entry %s (%s) drifted from generator v%d output for seed %d:\n"+
+				"committed_sha256=%x regenerated_sha256=%x\n"+
+				"first_diff_byte=%d committed_byte=%s regenerated_byte=%s\n"+
+				"first_diff_field=%s\ncommitted_context=%s\nregenerated_context=%s",
+				entry.Name, filepath.FromSlash(entry.Schedule), sim.FaultScheduleGeneratorVersion, entry.Seed,
+				sha256.Sum256(committedBytes), sha256.Sum256(regeneratedBytes),
+				firstByte, byteAt(committedBytes, firstByte), byteAt(regeneratedBytes, firstByte),
+				firstScheduleDifference(committed, regenerated),
+				byteContext(committedBytes, firstByte), byteContext(regeneratedBytes, firstByte))
 		}
 	}
+}
+
+func firstDifferentByte(committed, regenerated []byte) int {
+	limit := min(len(committed), len(regenerated))
+	for i := 0; i < limit; i++ {
+		if committed[i] != regenerated[i] {
+			return i
+		}
+	}
+	return limit
+}
+
+func byteAt(data []byte, index int) string {
+	if index >= len(data) {
+		return "<EOF>"
+	}
+	return fmt.Sprintf("%q (0x%02x)", data[index], data[index])
+}
+
+func byteContext(data []byte, index int) string {
+	const radius = 24
+	start := max(0, index-radius)
+	end := min(len(data), index+radius)
+	return fmt.Sprintf("%q", data[start:end])
+}
+
+func firstScheduleDifference(committed, regenerated sim.FaultSchedule) string {
+	if difference := firstValueDifference("schedule", reflect.ValueOf(committed), reflect.ValueOf(regenerated)); difference != "" {
+		return difference
+	}
+	return "<decoded schedules equal; serialized bytes differ>"
+}
+
+func firstValueDifference(path string, committed, regenerated reflect.Value) string {
+	if reflect.DeepEqual(committed.Interface(), regenerated.Interface()) {
+		return ""
+	}
+	if committed.Type() != regenerated.Type() {
+		return fmt.Sprintf("%s type: committed=%s regenerated=%s", path, committed.Type(), regenerated.Type())
+	}
+
+	switch committed.Kind() {
+	case reflect.Struct:
+		for i := 0; i < committed.NumField(); i++ {
+			fieldPath := path + "." + committed.Type().Field(i).Name
+			if difference := firstValueDifference(fieldPath, committed.Field(i), regenerated.Field(i)); difference != "" {
+				return difference
+			}
+		}
+	case reflect.Slice:
+		if committed.IsNil() != regenerated.IsNil() {
+			return fmt.Sprintf("%s nil: committed=%t regenerated=%t", path, committed.IsNil(), regenerated.IsNil())
+		}
+		if committed.Len() != regenerated.Len() {
+			return fmt.Sprintf("%s length: committed=%d regenerated=%d", path, committed.Len(), regenerated.Len())
+		}
+		for i := 0; i < committed.Len(); i++ {
+			elementPath := fmt.Sprintf("%s[%d]", path, i)
+			if difference := firstValueDifference(elementPath, committed.Index(i), regenerated.Index(i)); difference != "" {
+				return difference
+			}
+		}
+	case reflect.Float64:
+		committedFloat := committed.Float()
+		regeneratedFloat := regenerated.Float()
+		return fmt.Sprintf("%s: committed=%g (bits=%#016x) regenerated=%g (bits=%#016x)",
+			path, committedFloat, math.Float64bits(committedFloat), regeneratedFloat, math.Float64bits(regeneratedFloat))
+	default:
+		return fmt.Sprintf("%s: committed=%v regenerated=%v", path, committed.Interface(), regenerated.Interface())
+	}
+	return fmt.Sprintf("%s differs", path)
 }

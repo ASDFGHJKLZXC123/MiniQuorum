@@ -908,6 +908,29 @@ func TestGenerateFaultScheduleDeterministic(t *testing.T) {
 	}
 }
 
+// TestGenerateFaultScheduleSeed5ClockSkewRoundingCanary pins the exact
+// one-ULP portability failure caught by linux/amd64 CI. The committed v5
+// mapping is the correctly rounded fused value ...43; the former plain
+// expression produced the separate-operation value ...44 on amd64.
+func TestGenerateFaultScheduleSeed5ClockSkewRoundingCanary(t *testing.T) {
+	schedule, err := GenerateFaultSchedule(5, []raft.NodeID{1, 2, 3, 4, 5}, 6000)
+	if err != nil {
+		t.Fatalf("GenerateFaultSchedule() error = %v", err)
+	}
+
+	const wantBits = uint64(0x3fe926f0730a3a43)
+	for _, event := range schedule.Events {
+		if event.Time == 470 && event.Kind == FaultClockSkew && event.Node == 1 {
+			if gotBits := math.Float64bits(event.Multiplier); gotBits != wantBits {
+				t.Fatalf("seed-5 clock-skew multiplier = %.17g (bits=%#016x), want bits=%#016x",
+					event.Multiplier, gotBits, wantBits)
+			}
+			return
+		}
+	}
+	t.Fatalf("seed-5 clock-skew canary event not found in schedule: %+v", schedule.Events)
+}
+
 // TestGenerateFaultScheduleSeed1PartitionOpensAreMeaningful pins the
 // verifier's seed-1 counterexample. A group partition used to block 3->1
 // before two directed 3->1 partitions opened, making both directed opens

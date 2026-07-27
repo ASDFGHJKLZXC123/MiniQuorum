@@ -126,7 +126,9 @@ type CrashDirective struct {
 // Post-sync crash points keep RetainAllUnsynced, where the drained buffer makes
 // retention a no-op. Because the retention draws consume additional RNG values
 // inside the crash loop, every generated schedule's later draws remap — hence
-// the version bump and full corpus regeneration.
+// the version bump and full corpus regeneration. Its random clock-skew scaling
+// uses math.FMA to define the fused result that produced the committed v5
+// corpus on arm64, without remapping those bytes on other architectures.
 const FaultScheduleGeneratorVersion = 5
 
 // FaultKind identifies one schedulable fault in FaultSchedule.Events. The

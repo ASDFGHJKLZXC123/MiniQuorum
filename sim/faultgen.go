@@ -2,6 +2,7 @@ package sim
 
 import (
 	"errors"
+	"math"
 	"math/rand"
 	"sort"
 
@@ -107,7 +108,10 @@ func GenerateFaultSchedule(seed int64, nodeIDs []raft.NodeID, until VirtualTime)
 			ev.Rate = r.Float64() * 0.3
 		case FaultClockSkew:
 			ev.Node = order[r.Intn(len(order))]
-			ev.Multiplier = minClockMultiplier + r.Float64()*(maxClockMultiplier-minClockMultiplier)
+			// FMA defines one correctly rounded operation on every platform.
+			// A plain multiply-add is allowed to fuse on arm64 while remaining
+			// separate on amd64, remapping the serialized schedule by one ULP.
+			ev.Multiplier = math.FMA(r.Float64(), maxClockMultiplier-minClockMultiplier, minClockMultiplier)
 		}
 		schedule.Events = append(schedule.Events, ev)
 	}

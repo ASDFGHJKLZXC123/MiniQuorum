@@ -50,7 +50,8 @@ sim-crash-500:
 # well over `go test`'s default 10m package timeout on a smaller machine.
 corpus:
 	go test ./checker
-	go test ./internal/simharness -run '^TestCommittedCorpus' -count=1 -timeout 40m
+	go test ./internal/simharness -run '^TestCommittedGeneratedCorpusMatchesGeneratorOutput$$' -count=1
+	go test ./internal/simharness -run '^TestCommittedCorpusSchedulesReplayCleanly$$' -count=1 -timeout 40m
 
 # sim-1k / sim-10k are the Phase 4 full-fault Porcupine gates: independent
 # seeds, complete 4A fault model, K=5 clients x 40 ops over 8 keys, bounded
