@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
-	"sync/atomic"
 	"testing"
 )
 
@@ -125,54 +124,67 @@ func TestEngineEntriesOrderedSnapshot(t *testing.T) {
 // all coordinated through the one engine-level sync.RWMutex.
 //
 // The writer and readers are released together through a ready/start
-// barrier: every goroutine signals it is spawned and blocked, then main
-// releases them all at once. That alone does not guarantee a real overlap:
-// 1000 fast, mutex-guarded writes can run to completion inside a single
-// scheduling quantum before any reader is ever scheduled (reproducible with
-// GOMAXPROCS=1). So readers do not run a fixed iteration budget that could
-// exhaust on its own — an earlier version of this test did, and that let
-// every reader finish and exit before the writer goroutine ran even once,
-// which then deadlocked once the writer waited for an overlap witness that
-// no reader remained alive to provide. Instead, readers loop until told to
-// stop, and main only sends that stop signal after writerDone confirms the
-// writer finished — so a reader is always still alive whenever the writer
-// needs one to witness it. The writer itself does not report done — and
-// does not flip writerActive false — until it receives overlapAck, closed
-// by whichever reader is first to observe writerActive true; since that
-// receive blocks, the writer goroutine parks and forces the runtime to
-// schedule a reader instead (the only other runnable goroutine at that
-// point), making the overlap structural rather than raced for, on any
-// GOMAXPROCS. Every reader also asserts every Entries() snapshot it
-// observes mid-write is strictly ordered, proving the read lock is held for
-// the whole scan and never observes a partially-linked skip list. Run under
-// -race.
+// barrier, but that alone does not prove overlap: on any GOMAXPROCS, 1000
+// fast, mutex-guarded writes can run to completion inside a single
+// scheduling quantum before a reader is ever scheduled, and a reader would
+// then only ever observe the already-finished memtable. An earlier version
+// of this test tried to prove overlap with a boolean (writerActive) that
+// the writer set true before its write loop and held true — via a channel
+// receive issued only *after* every write had already been applied — until
+// a reader observed it. That proved only that the writer goroutine was
+// still alive when a reader ran; if the scheduler ran the writer's loop to
+// completion first, a reader could satisfy that witness only after every
+// write had already finished, which proves goroutine lifecycle overlap, not
+// a reader completing a read while the write stream was still incomplete.
+//
+// This version makes the overlap structural instead of incidental: the
+// writer pauses at a checkpoint strictly inside the write stream — after
+// applying exactly `checkpoint` of `keyCount` writes, with writes both
+// before and after that point — and then blocks on a channel receive that
+// only a reader's signal can satisfy. A blocked channel receive forces the
+// runtime to schedule a ready goroutine instead (the readers are the only
+// other runnable goroutines at that point), so on any GOMAXPROCS a reader
+// is guaranteed to run, and to run its witness Get and Entries call, before
+// the writer can apply another write. That witness reads a key which the
+// write loop only ever writes on its final iteration, so the key's absence
+// mid-checkpoint is a structural guarantee, not an opportunistic
+// observation, and it records the exact Entries() count observed at that
+// moment — a positive witness tied to writes provably still outstanding,
+// not a boolean whose lifetime can extend past the final write.
+//
+// Readers keep hammering Get/Entries for the writer's entire lifetime
+// (looping until told to stop, with that stop only sent after the writer
+// finishes), so overlap continues through the remainder of the write stream
+// too, not just at the checkpoint. Every reader also asserts every
+// Entries() snapshot it observes mid-write is strictly ordered, proving the
+// read lock is held for the whole scan and never observes a
+// partially-linked skip list. Run under -race.
 func TestEngineConcurrentReadersDuringSustainedWrites(t *testing.T) {
 	e := NewEngine(newSeededRand(29))
 
 	const keyCount = 1000
 	const deleteEvery = 5
 	const readers = 6
+	const checkpoint = keyCount / 2 // writes fall both before (0..checkpoint-1) and after (checkpoint..keyCount-1)
 
 	keys := make([][]byte, keyCount)
 	for i := range keys {
 		keys[i] = []byte(fmt.Sprintf("key-%05d", i))
 	}
+	// Only the loop's final iteration writes this key, so at the checkpoint
+	// — strictly inside the write stream — it is guaranteed not yet present.
+	tailKey := keys[keyCount-1]
 
 	var ready sync.WaitGroup
 	ready.Add(1 + readers)
 	start := make(chan struct{})
 	stop := make(chan struct{})
 
-	var writerActive atomic.Bool
-	var overlapWitnessed atomic.Bool
-	overlapAck := make(chan struct{})
-	var ackOnce sync.Once
-	signalOverlap := func() {
-		ackOnce.Do(func() {
-			overlapWitnessed.Store(true)
-			close(overlapAck)
-		})
-	}
+	checkpointReached := make(chan struct{})
+	checkpointWitnessed := make(chan struct{})
+	var witnessOnce sync.Once
+	var midStreamEntryCount int
+	var midStreamTailFound bool
 
 	var writerDone sync.WaitGroup
 	writerDone.Add(1)
@@ -180,8 +192,6 @@ func TestEngineConcurrentReadersDuringSustainedWrites(t *testing.T) {
 		defer writerDone.Done()
 		ready.Done()
 		<-start
-
-		writerActive.Store(true)
 
 		seq := uint64(0)
 		for i, key := range keys {
@@ -191,14 +201,16 @@ func TestEngineConcurrentReadersDuringSustainedWrites(t *testing.T) {
 				seq++
 				e.Delete(append([]byte(nil), key...), seq)
 			}
-		}
 
-		// All writes are issued, but the writer is not "done" — and
-		// writerActive stays true — until a reader has actually witnessed
-		// it active. See the func doc for why this can't just be a
-		// best-effort check.
-		<-overlapAck
-		writerActive.Store(false)
+			if i+1 == checkpoint {
+				// Exactly `checkpoint` writes are applied; the remaining
+				// keyCount-checkpoint cannot be applied until a reader
+				// signals checkpointWitnessed — the writer physically
+				// cannot proceed until that happens.
+				close(checkpointReached)
+				<-checkpointWitnessed
+			}
+		}
 	}()
 
 	var readersDone sync.WaitGroup
@@ -217,8 +229,23 @@ func TestEngineConcurrentReadersDuringSustainedWrites(t *testing.T) {
 				default:
 				}
 
-				if writerActive.Load() {
-					signalOverlap()
+				select {
+				case <-checkpointReached:
+					witnessOnce.Do(func() {
+						_, _, _, found := e.Get(tailKey)
+						midStreamTailFound = found
+
+						entries := e.Entries()
+						midStreamEntryCount = len(entries)
+						for j := 1; j < len(entries); j++ {
+							if bytes.Compare(entries[j-1].Key, entries[j].Key) >= 0 {
+								t.Errorf("Entries() not strictly ascending at checkpoint witness, index %d: %q then %q", j, entries[j-1].Key, entries[j].Key)
+							}
+						}
+
+						close(checkpointWitnessed)
+					})
+				default:
 				}
 
 				_, _, _, _ = e.Get(keys[rnd.Intn(keyCount)])
@@ -229,10 +256,6 @@ func TestEngineConcurrentReadersDuringSustainedWrites(t *testing.T) {
 						t.Errorf("Entries() not strictly ascending mid-write at %d: %q then %q", j, entries[j-1].Key, entries[j].Key)
 						return
 					}
-				}
-
-				if writerActive.Load() {
-					signalOverlap()
 				}
 			}
 		}(int64(100 + r))
@@ -245,8 +268,11 @@ func TestEngineConcurrentReadersDuringSustainedWrites(t *testing.T) {
 	close(stop)
 	readersDone.Wait()
 
-	if !overlapWitnessed.Load() {
-		t.Fatalf("no reader ever observed the writer active: writer and readers did not overlap, so this run did not exercise concurrent read/write access")
+	if midStreamTailFound {
+		t.Fatalf("checkpoint witness found the not-yet-written tail key: overlap was not proven against unfinished writes")
+	}
+	if midStreamEntryCount != checkpoint {
+		t.Fatalf("checkpoint witness observed %d entries, want exactly %d: proves the witness ran mid-stream rather than after the writer finished", midStreamEntryCount, checkpoint)
 	}
 
 	entries := e.Entries()
