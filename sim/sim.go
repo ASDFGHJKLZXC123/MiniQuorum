@@ -122,8 +122,28 @@ type Sim struct {
 
 	trace []string
 
+	crashFirings []CrashFiring
+
 	workload *simWorkload
 	runErr   error
+}
+
+// CrashFiring records one storage-level crash that actually fired: a
+// scheduled Save-ordinal directive (or the armed after-send backstop) taking
+// effect at a virtual time. It is the structured counterpart of the
+// save_crash/after_send_crash trace lines, so hosts can attribute crash-point
+// coverage and crash-during-in-flight evidence without parsing trace text.
+type CrashFiring struct {
+	Time  VirtualTime
+	Node  raft.NodeID
+	Save  uint64
+	Point CrashPoint
+}
+
+// CrashFirings returns a copy of every storage crash observed firing so far,
+// in firing order.
+func (s *Sim) CrashFirings() []CrashFiring {
+	return append([]CrashFiring(nil), s.crashFirings...)
 }
 
 // NewSim builds a Sim with cfg.NodeIDs as a fully connected cluster, each
