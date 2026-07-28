@@ -290,7 +290,7 @@ func decodeIndex(data []byte) ([]indexEntry, error) {
 }
 
 func appendBlock(dst *bytes.Buffer, payload []byte) error {
-	if len(payload) > math.MaxUint32 {
+	if uint64(len(payload)) > math.MaxUint32 {
 		return fmt.Errorf("lsm: block too large")
 	}
 	dst.Write(payload)
@@ -353,7 +353,11 @@ func OpenSSTable(r io.ReaderAt, size int64) (*SSTableReader, error) {
 	if metadataLen < 48 || int64(metadataLen) > size-footerTrailer {
 		return nil, corruptf("invalid footer length")
 	}
-	metadata := make([]byte, metadataLen)
+	metadataLength, ok := uint64ToInt(uint64(metadataLen))
+	if !ok {
+		return nil, corruptf("footer too large")
+	}
+	metadata := make([]byte, metadataLength)
 	if err := readAtFull(r, metadata, size-footerTrailer-int64(metadataLen)); err != nil {
 		return nil, corruptf("read footer: %v", err)
 	}
@@ -450,7 +454,11 @@ func readBlock(r io.ReaderAt, offset, length uint64) ([]byte, error) {
 	if length < 4 || offset > math.MaxInt64 || length > math.MaxInt64 || offset+length < offset || offset+length > math.MaxInt64 {
 		return nil, corruptf("invalid block bounds")
 	}
-	block := make([]byte, int(length))
+	blockLength, ok := uint64ToInt(length)
+	if !ok {
+		return nil, corruptf("block too large")
+	}
+	block := make([]byte, blockLength)
 	if err := readAtFull(r, block, int64(offset)); err != nil {
 		return nil, corruptf("read block: %v", err)
 	}
@@ -460,6 +468,13 @@ func readBlock(r io.ReaderAt, offset, length uint64) ([]byte, error) {
 		return nil, corruptf("block crc32c mismatch")
 	}
 	return payload, nil
+}
+
+func uint64ToInt(value uint64) (int, bool) {
+	if value > uint64(^uint(0)>>1) {
+		return 0, false
+	}
+	return int(value), true
 }
 
 func readAtFull(r io.ReaderAt, data []byte, offset int64) error {

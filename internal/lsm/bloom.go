@@ -3,6 +3,7 @@ package lsm
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 )
 
 const (
@@ -20,16 +21,48 @@ type BloomFilter struct {
 }
 
 // NewBloomFilter allocates a filter with 10 bits per expected key. A filter
-// for zero keys still has one byte so it remains well-formed on disk.
+// for zero keys still has one byte so it remains well-formed on disk. It
+// returns nil when the requested size overflows its on-disk or in-memory
+// representation.
 func NewBloomFilter(expectedKeys int) *BloomFilter {
+	bits, bytes, ok := bloomSize(expectedKeys)
+	if !ok {
+		return nil
+	}
+	return &BloomFilter{bits: make([]byte, bytes), m: bits}
+}
+
+// bloomSize converts before multiplying so a large expected-key count cannot
+// wrap to a small filter. The byte length is also checked before conversion to
+// int for allocation.
+func bloomSize(expectedKeys int) (uint64, int, bool) {
 	if expectedKeys < 0 {
 		expectedKeys = 0
 	}
-	bits := uint64(expectedKeys * bloomBitsPerKey)
+	keys := uint64(expectedKeys)
+	if keys > math.MaxUint64/bloomBitsPerKey {
+		return 0, 0, false
+	}
+	bits := keys * bloomBitsPerKey
 	if bits < 8 {
 		bits = 8
 	}
-	return &BloomFilter{bits: make([]byte, (bits+7)/8), m: bits}
+	bytes, ok := bloomByteLen(bits)
+	if !ok {
+		return 0, 0, false
+	}
+	return bits, bytes, true
+}
+
+func bloomByteLen(bits uint64) (int, bool) {
+	bytes := bits / 8
+	if bits%8 != 0 {
+		bytes++
+	}
+	if bytes > uint64(^uint(0)>>1) {
+		return 0, false
+	}
+	return int(bytes), true
 }
 
 // Add records key in the filter.
@@ -78,7 +111,8 @@ func UnmarshalBloomFilter(data []byte) (*BloomFilter, error) {
 		return nil, fmt.Errorf("lsm: invalid bloom encoding")
 	}
 	m := binary.LittleEndian.Uint64(data[2:10])
-	if m == 0 || uint64(len(data)-10) != (m+7)/8 {
+	byteLen, ok := bloomByteLen(m)
+	if m == 0 || !ok || len(data)-10 != byteLen {
 		return nil, fmt.Errorf("lsm: invalid bloom bit count")
 	}
 	bits := append([]byte(nil), data[10:]...)
