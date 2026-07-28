@@ -10,6 +10,7 @@ const (
 	bloomBitsPerKey = 10
 	bloomHashCount  = 7
 	bloomVersion    = 1
+	bloomHeaderSize = 10
 )
 
 // BloomFilter is a fixed-size Bloom filter using seven probes derived from two
@@ -94,28 +95,32 @@ func (f *BloomFilter) MayContain(key []byte) bool {
 
 // MarshalBinary returns a stable, self-describing encoding of the filter.
 func (f *BloomFilter) MarshalBinary() ([]byte, error) {
-	if f == nil || f.m == 0 || uint64(len(f.bits)) != (f.m+7)/8 {
+	if f == nil || f.m == 0 {
 		return nil, fmt.Errorf("lsm: invalid bloom filter")
 	}
-	out := make([]byte, 10+len(f.bits))
+	byteLen, ok := bloomByteLen(f.m)
+	if !ok || len(f.bits) != byteLen || byteLen > int(^uint(0)>>1)-bloomHeaderSize {
+		return nil, fmt.Errorf("lsm: invalid bloom filter")
+	}
+	out := make([]byte, bloomHeaderSize+byteLen)
 	out[0] = bloomVersion
 	out[1] = bloomHashCount
-	binary.LittleEndian.PutUint64(out[2:10], f.m)
-	copy(out[10:], f.bits)
+	binary.LittleEndian.PutUint64(out[2:bloomHeaderSize], f.m)
+	copy(out[bloomHeaderSize:], f.bits)
 	return out, nil
 }
 
 // UnmarshalBloomFilter decodes a filter written by MarshalBinary.
 func UnmarshalBloomFilter(data []byte) (*BloomFilter, error) {
-	if len(data) < 11 || data[0] != bloomVersion || data[1] != bloomHashCount {
+	if len(data) < bloomHeaderSize+1 || data[0] != bloomVersion || data[1] != bloomHashCount {
 		return nil, fmt.Errorf("lsm: invalid bloom encoding")
 	}
-	m := binary.LittleEndian.Uint64(data[2:10])
+	m := binary.LittleEndian.Uint64(data[2:bloomHeaderSize])
 	byteLen, ok := bloomByteLen(m)
-	if m == 0 || !ok || len(data)-10 != byteLen {
+	if m == 0 || !ok || len(data)-bloomHeaderSize != byteLen {
 		return nil, fmt.Errorf("lsm: invalid bloom bit count")
 	}
-	bits := append([]byte(nil), data[10:]...)
+	bits := append([]byte(nil), data[bloomHeaderSize:]...)
 	return &BloomFilter{bits: bits, m: m}, nil
 }
 

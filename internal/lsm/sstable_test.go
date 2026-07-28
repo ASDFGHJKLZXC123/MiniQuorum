@@ -10,6 +10,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"reflect"
+	"strconv"
 	"testing"
 )
 
@@ -66,8 +67,14 @@ func TestBloomSizeBoundaryChecksDoNotAllocate(t *testing.T) {
 		})
 	}
 
-	if bytes, ok := bloomByteLen(math.MaxUint64); !ok || bytes <= 0 {
-		t.Fatalf("bloomByteLen(MaxUint64) = (%d, ok=%v), want a positive addressable length", bytes, ok)
+	const maxBloomBytes = uint64(math.MaxUint64/8 + 1)
+	bytes, ok := bloomByteLen(math.MaxUint64)
+	if strconv.IntSize == 64 {
+		if !ok || uint64(bytes) != maxBloomBytes {
+			t.Fatalf("bloomByteLen(MaxUint64) = (%d, ok=%v), want (%d, ok=true) on 64-bit", bytes, ok, maxBloomBytes)
+		}
+	} else if ok {
+		t.Fatalf("bloomByteLen(MaxUint64) = (%d, ok=true), want an unaddressable length on %d-bit", bytes, strconv.IntSize)
 	}
 	if f := NewBloomFilter(maxInt); f != nil {
 		t.Fatal("NewBloomFilter accepted a size that cannot be represented safely")
@@ -79,6 +86,25 @@ func TestBloomSizeBoundaryChecksDoNotAllocate(t *testing.T) {
 	binary.LittleEndian.PutUint64(malformed[2:10], math.MaxUint64-6)
 	if _, err := UnmarshalBloomFilter(malformed); err == nil {
 		t.Fatal("UnmarshalBloomFilter accepted an overflowing bit count")
+	}
+}
+
+func TestBloomFilterMarshalRejectsMalformedInMemoryFilters(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		f    *BloomFilter
+	}{
+		{name: "nil"},
+		{name: "zero-bit-count", f: &BloomFilter{bits: []byte{0}, m: 0}},
+		{name: "short-bits", f: &BloomFilter{m: 8}},
+		{name: "long-bits", f: &BloomFilter{bits: []byte{0, 0}, m: 8}},
+		{name: "extreme-bit-count", f: &BloomFilter{m: math.MaxUint64}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if encoded, err := test.f.MarshalBinary(); err == nil {
+				t.Fatalf("MarshalBinary() = %x, nil; want invalid-filter error", encoded)
+			}
+		})
 	}
 }
 
