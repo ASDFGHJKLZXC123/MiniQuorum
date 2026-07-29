@@ -195,6 +195,40 @@ func TestSSTableRejectsUnsortedEntries(t *testing.T) {
 	}
 }
 
+func TestSSTableWriterRequiresStrictSequenceDecreaseWithinSameKeyRun(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		first  TableEntry
+		second TableEntry
+	}{
+		{
+			name:   "conflicting values",
+			first:  TableEntry{Key: []byte("key"), Seq: 7, Value: []byte("first")},
+			second: TableEntry{Key: []byte("key"), Seq: 7, Value: []byte("second")},
+		},
+		{
+			name:   "conflicting tombstone state",
+			first:  TableEntry{Key: []byte("key"), Seq: 7, Value: []byte("value")},
+			second: TableEntry{Key: []byte("key"), Seq: 7, Tombstone: true},
+		},
+		{
+			name:   "identical duplicate",
+			first:  TableEntry{Key: []byte("key"), Seq: 7, Value: []byte("value")},
+			second: TableEntry{Key: []byte("key"), Seq: 7, Value: []byte("value")},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			w := NewSSTableWriter(&bytes.Buffer{})
+			if err := w.Add(test.first); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Add(test.second); err == nil {
+				t.Fatal("Add accepted a same-key record whose sequence did not strictly decrease")
+			}
+		})
+	}
+}
+
 func TestSSTableOversizedRecordGetsItsOwnReadableBlock(t *testing.T) {
 	large := bytes.Repeat([]byte{'v'}, dataBlockTarget+1)
 	var out bytes.Buffer

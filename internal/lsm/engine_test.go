@@ -13,7 +13,9 @@ func TestEnginePutGetDeleteAndDefensiveCopies(t *testing.T) {
 
 	key := []byte("k")
 	value := []byte("v1")
-	e.Put(key, value, 1)
+	if err := e.Put(key, value, 1); err != nil {
+		t.Fatal(err)
+	}
 	// Put defensively copies key and value into engine-owned storage, so
 	// mutating the caller's slices afterward must not affect stored state.
 	key[0] = 'z'
@@ -30,7 +32,9 @@ func TestEnginePutGetDeleteAndDefensiveCopies(t *testing.T) {
 		t.Fatalf("Get(k) after mutating prior result = %q, want v1 (aliasing detected)", got2)
 	}
 
-	e.Delete([]byte("k"), 2)
+	if err := e.Delete([]byte("k"), 2); err != nil {
+		t.Fatal(err)
+	}
 	if _, tombstone, seq, found := e.Get([]byte("k")); !found || !tombstone || seq != 2 {
 		t.Fatalf("Get(k) after Delete = tombstone=%v seq=%d found=%v, want true,2,true", tombstone, seq, found)
 	}
@@ -48,28 +52,40 @@ func TestEnginePutGetDeleteAndDefensiveCopies(t *testing.T) {
 func TestEngineSeqMonotonicity(t *testing.T) {
 	e := NewEngine(newSeededRand(17))
 
-	e.Put([]byte("k"), []byte("v10"), 10)
-	e.Put([]byte("k"), []byte("v-lower"), 5) // lower seq: rejected
+	if err := e.Put([]byte("k"), []byte("v10"), 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Put([]byte("k"), []byte("v-lower"), 5); err != nil { // lower seq: rejected
+		t.Fatal(err)
+	}
 	if value, tombstone, seq, found := e.Get([]byte("k")); !found || tombstone || seq != 10 || !bytes.Equal(value, []byte("v10")) {
 		t.Fatalf("Get(k) after rejected lower-seq Put = (%q,%v,%d,%v), want (v10,false,10,true)", value, tombstone, seq, found)
 	}
 
-	e.Put([]byte("k"), []byte("v-equal"), 10) // equal seq: idempotent no-op
+	if err := e.Put([]byte("k"), []byte("v-equal"), 10); err != nil { // equal seq: idempotent no-op
+		t.Fatal(err)
+	}
 	if value, tombstone, seq, found := e.Get([]byte("k")); !found || tombstone || seq != 10 || !bytes.Equal(value, []byte("v10")) {
 		t.Fatalf("Get(k) after idempotent equal-seq Put = (%q,%v,%d,%v), want (v10,false,10,true)", value, tombstone, seq, found)
 	}
 
-	e.Delete([]byte("k"), 8) // lower seq: rejected
+	if err := e.Delete([]byte("k"), 8); err != nil { // lower seq: rejected
+		t.Fatal(err)
+	}
 	if value, tombstone, seq, found := e.Get([]byte("k")); !found || tombstone || seq != 10 || !bytes.Equal(value, []byte("v10")) {
 		t.Fatalf("Get(k) after rejected lower-seq Delete = (%q,%v,%d,%v), want (v10,false,10,true)", value, tombstone, seq, found)
 	}
 
-	e.Put([]byte("k"), []byte("v20"), 20) // higher seq: applied
+	if err := e.Put([]byte("k"), []byte("v20"), 20); err != nil { // higher seq: applied
+		t.Fatal(err)
+	}
 	if value, tombstone, seq, found := e.Get([]byte("k")); !found || tombstone || seq != 20 || !bytes.Equal(value, []byte("v20")) {
 		t.Fatalf("Get(k) after higher-seq Put = (%q,%v,%d,%v), want (v20,false,20,true)", value, tombstone, seq, found)
 	}
 
-	e.Delete([]byte("k"), 30) // higher seq: applied
+	if err := e.Delete([]byte("k"), 30); err != nil { // higher seq: applied
+		t.Fatal(err)
+	}
 	if _, tombstone, seq, found := e.Get([]byte("k")); !found || !tombstone || seq != 30 {
 		t.Fatalf("Get(k) after higher-seq Delete = tombstone=%v seq=%d found=%v, want true,30,true", tombstone, seq, found)
 	}
@@ -91,10 +107,14 @@ func TestEngineEntriesOrderedSnapshot(t *testing.T) {
 	e := NewEngine(newSeededRand(13))
 	keys := []string{"delta", "alpha", "charlie", "bravo"}
 	for i, k := range keys {
-		e.Put([]byte(k), []byte("v-"+k), uint64(i+1))
+		if err := e.Put([]byte(k), []byte("v-"+k), uint64(i+1)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	deleteSeq := uint64(len(keys) + 1)
-	e.Delete([]byte("charlie"), deleteSeq)
+	if err := e.Delete([]byte("charlie"), deleteSeq); err != nil {
+		t.Fatal(err)
+	}
 
 	entries := e.Entries()
 	if len(entries) != len(keys) {
@@ -196,10 +216,16 @@ func TestEngineConcurrentReadersDuringSustainedWrites(t *testing.T) {
 		seq := uint64(0)
 		for i, key := range keys {
 			seq++
-			e.Put(append([]byte(nil), key...), []byte(fmt.Sprintf("value-%d", i)), seq)
+			if err := e.Put(append([]byte(nil), key...), []byte(fmt.Sprintf("value-%d", i)), seq); err != nil {
+				t.Errorf("Put(%q) error = %v", key, err)
+				return
+			}
 			if i%deleteEvery == 0 {
 				seq++
-				e.Delete(append([]byte(nil), key...), seq)
+				if err := e.Delete(append([]byte(nil), key...), seq); err != nil {
+					t.Errorf("Delete(%q) error = %v", key, err)
+					return
+				}
 			}
 
 			if i+1 == checkpoint {
