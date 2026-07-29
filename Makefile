@@ -1,7 +1,7 @@
 .PHONY: proto proto-check test boundary sim sim-500 sim-crash-500 corpus lint real-smoke real-crash sim-1k sim-10k negative-control
 
 proto:
-	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative proto/raft.proto proto/kv.proto
+	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative proto/raft.proto proto/kv.proto proto/lsm.proto
 
 proto-check:
 	@tmp=$$(mktemp -d); \

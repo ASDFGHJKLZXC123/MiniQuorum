@@ -79,7 +79,7 @@ func randomHeight(rnd Rand, maxH, inverseP int) int {
 // A key with no existing entry accepts any seq — there is nothing to
 // compare against yet. A tombstone put still occupies the key's slot in the
 // ordered sequence so iteration and lookups observe the delete.
-func (s *skipList) put(key, value []byte, tombstone bool, seq uint64) {
+func (s *skipList) put(key, value []byte, tombstone bool, seq uint64) bool {
 	var update [maxHeight]*skipNode
 	x := s.head
 	for i := s.level - 1; i >= 0; i-- {
@@ -92,12 +92,12 @@ func (s *skipList) put(key, value []byte, tombstone bool, seq uint64) {
 	next := x.forward[0]
 	if next != nil && bytes.Equal(next.key, key) {
 		if seq <= next.seq {
-			return
+			return false
 		}
 		next.value = value
 		next.tombstone = tombstone
 		next.seq = seq
-		return
+		return true
 	}
 
 	height := randomHeight(s.rnd, maxHeight, towerInverseP)
@@ -119,6 +119,7 @@ func (s *skipList) put(key, value []byte, tombstone bool, seq uint64) {
 		node.forward[i] = update[i].forward[i]
 		update[i].forward[i] = node
 	}
+	return true
 }
 
 // get performs a byte-ordered lookup. found is false if key has never been

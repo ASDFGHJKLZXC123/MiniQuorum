@@ -47,8 +47,8 @@ type SSTableWriter struct {
 func NewSSTableWriter(w io.Writer) *SSTableWriter { return &SSTableWriter{w: w} }
 
 // Add appends an entry. Keys must be in ascending byte order; versions of the
-// same key must be in descending sequence order so readers can stop at the
-// first matching version in a block.
+// same key must be in strictly descending sequence order so a same-key run has
+// at most one record per Raft sequence and readers can stop at the first match.
 func (w *SSTableWriter) Add(entry TableEntry) error {
 	if w == nil || w.w == nil {
 		return fmt.Errorf("lsm: nil sstable writer")
@@ -57,9 +57,8 @@ func (w *SSTableWriter) Add(entry TableEntry) error {
 		return fmt.Errorf("lsm: Add after Finish")
 	}
 	if len(w.entries) != 0 {
-		cmp := bytes.Compare(entry.Key, w.lastKey)
-		if cmp < 0 || (cmp == 0 && entry.Seq > w.entries[len(w.entries)-1].Seq) {
-			return fmt.Errorf("lsm: entries are not sorted by key then descending sequence")
+		if !validSSTableRecordOrder(w.lastKey, w.entries[len(w.entries)-1].Seq, entry.Key, entry.Seq) {
+			return fmt.Errorf("lsm: entries are not sorted by key then strictly descending sequence")
 		}
 	}
 	copyEntry := TableEntry{Key: append([]byte(nil), entry.Key...), Seq: entry.Seq, Tombstone: entry.Tombstone}
@@ -224,14 +223,22 @@ func decodeRecords(data []byte) ([]TableEntry, error) {
 		}
 		data = data[int(valueLen):]
 		if len(entries) != 0 {
-			cmp := bytes.Compare(entry.Key, entries[len(entries)-1].Key)
-			if cmp < 0 || (cmp == 0 && entry.Seq > entries[len(entries)-1].Seq) {
-				return nil, corruptf("records out of order")
+			previous := entries[len(entries)-1]
+			if !validSSTableRecordOrder(previous.Key, previous.Seq, entry.Key, entry.Seq) {
+				return nil, corruptf("records are not ordered by key then strictly descending sequence")
 			}
 		}
 		entries = append(entries, entry)
 	}
 	return entries, nil
+}
+
+// validSSTableRecordOrder is the shared writer/reopen invariant. Equal
+// sequences are rejected even for byte-identical records: accepting them would
+// make a same-key run contain more than one record for one Raft log position.
+func validSSTableRecordOrder(previousKey []byte, previousSeq uint64, key []byte, seq uint64) bool {
+	cmp := bytes.Compare(key, previousKey)
+	return cmp > 0 || (cmp == 0 && seq < previousSeq)
 }
 
 type indexEntry struct {
@@ -445,6 +452,54 @@ func (r *SSTableReader) Get(key []byte) (TableEntry, bool, error) {
 		}
 	}
 	return TableEntry{}, false, nil
+}
+
+// AllEntries validates and returns every data record in key/strictly-
+// descending-seq order. It is used during manifest replay so a referenced
+// table's data-block CRCs and metadata are checked before the engine publishes
+// the version set.
+func (r *SSTableReader) AllEntries() ([]TableEntry, error) {
+	if r == nil {
+		return nil, fmt.Errorf("lsm: nil sstable reader")
+	}
+	entries := make([]TableEntry, 0)
+	for _, block := range r.index {
+		data, err := readBlock(r.r, block.offset, block.length)
+		if err != nil {
+			return nil, err
+		}
+		decoded, err := decodeRecords(data)
+		if err != nil {
+			return nil, err
+		}
+		if len(decoded) == 0 || !bytes.Equal(decoded[0].Key, block.firstKey) {
+			return nil, corruptf("index first key does not match data block")
+		}
+		if len(entries) != 0 {
+			cmp := bytes.Compare(decoded[0].Key, entries[len(entries)-1].Key)
+			if cmp <= 0 {
+				return nil, corruptf("records out of order or same key spans data blocks")
+			}
+		}
+		for _, entry := range decoded {
+			if !r.bloom.MayContain(entry.Key) {
+				return nil, corruptf("bloom false negative for stored key")
+			}
+			entries = append(entries, TableEntry{
+				Key:       cloneBytes(entry.Key),
+				Seq:       entry.Seq,
+				Value:     cloneBytes(entry.Value),
+				Tombstone: entry.Tombstone,
+			})
+		}
+	}
+	if uint64(len(entries)) != r.entryCount {
+		return nil, corruptf("entry count is %d, footer says %d", len(entries), r.entryCount)
+	}
+	if len(entries) != 0 && (!bytes.Equal(entries[0].Key, r.minKey) || !bytes.Equal(entries[len(entries)-1].Key, r.maxKey)) {
+		return nil, corruptf("footer key bounds do not match records")
+	}
+	return entries, nil
 }
 
 // EntryCount reports the exact number of records, including tombstones.
