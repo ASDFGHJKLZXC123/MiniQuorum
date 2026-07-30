@@ -36,6 +36,22 @@ const (
 // removable torn tail.
 var ErrManifestCorrupt = errors.New("lsm: corrupt manifest")
 
+// uncertainManifestAppendError marks a MANIFEST write or sync failure after
+// the append handle was opened. The process cannot know whether none, some, or
+// all of the frame reached durable storage, so appending another frame in the
+// same process would risk placing it after a torn prefix.
+type uncertainManifestAppendError struct {
+	err error
+}
+
+func (err *uncertainManifestAppendError) Error() string { return err.err.Error() }
+func (err *uncertainManifestAppendError) Unwrap() error { return err.err }
+
+func isUncertainManifestAppend(err error) bool {
+	var uncertain *uncertainManifestAppendError
+	return errors.As(err, &uncertain)
+}
+
 type fileMetadata struct {
 	tier   uint32
 	file   string
@@ -424,32 +440,45 @@ func syncManifest(fs FS, path string) error {
 
 // appendManifestEdit reports committed=true only after the complete frame's
 // file sync succeeds. A close failure after that point returns both true and
-// the close error so the caller can publish the genuinely durable edit while
-// still fail-stopping.
-func appendManifestEdit(fs FS, dir string, edit *raftpb.VersionEdit) (committed bool, err error) {
+// the close error so the caller can publish the genuinely durable edit and
+// retain the unresolved handle for a retry-safe Close.
+func appendManifestEdit(fs FS, dir string, edit *raftpb.VersionEdit) (committed bool, unresolved File, err error) {
 	frame, err := encodeManifestFrame(edit)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	path := filepath.Join(dir, manifestFilename)
 	file, err := fs.OpenAppend(path)
 	if err != nil {
-		return false, fmt.Errorf("lsm: open manifest for append: %w", err)
+		return false, nil, fmt.Errorf("lsm: open manifest for append: %w", err)
 	}
 	written, writeErr := file.Write(frame)
 	if writeErr != nil || written != len(frame) {
 		if writeErr == nil {
 			writeErr = io.ErrShortWrite
 		}
-		return false, fmt.Errorf("lsm: append manifest: %w", errors.Join(writeErr, file.Close()))
+		closeErr := file.Close()
+		if closeErr != nil && !errors.Is(closeErr, ErrFSClosed) {
+			unresolved = file
+		}
+		cause := fmt.Errorf("lsm: append manifest: %w", errors.Join(writeErr, closeErr))
+		return false, unresolved, &uncertainManifestAppendError{err: cause}
 	}
 	if syncErr := file.Sync(); syncErr != nil {
-		return false, fmt.Errorf("lsm: sync manifest: %w", errors.Join(syncErr, file.Close()))
+		closeErr := file.Close()
+		if closeErr != nil && !errors.Is(closeErr, ErrFSClosed) {
+			unresolved = file
+		}
+		cause := fmt.Errorf("lsm: sync manifest: %w", errors.Join(syncErr, closeErr))
+		return false, unresolved, &uncertainManifestAppendError{err: cause}
 	}
 	if closeErr := file.Close(); closeErr != nil {
-		return true, fmt.Errorf("lsm: close synced manifest: %w", closeErr)
+		if !errors.Is(closeErr, ErrFSClosed) {
+			unresolved = file
+		}
+		return true, unresolved, fmt.Errorf("lsm: close synced manifest: %w", closeErr)
 	}
-	return true, nil
+	return true, nil, nil
 }
 
 func sortedManifestFiles(files map[string]fileMetadata) []fileMetadata {
