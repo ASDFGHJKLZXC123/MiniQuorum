@@ -18,6 +18,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"miniquorum/internal/lsm"
 	"miniquorum/internal/raft"
 	"miniquorum/internal/statemachine"
 	"miniquorum/internal/storage"
@@ -34,14 +35,18 @@ const (
 // the deterministic tie-break order for same-time events; it must never be
 // derived from map iteration by the caller.
 type Config struct {
-	Seed            int64
-	NodeIDs         []raft.NodeID
-	ElectionTickMin int
-	ElectionTickMax int
-	HeartbeatTicks  int
-	TickIntervalMS  VirtualTime // default 50
-	MinDelayMS      VirtualTime // default 1
-	MaxDelayMS      VirtualTime // default 10
+	Seed int64
+	// Engine selects the replicated state machine used by StartWorkload. The
+	// zero value is map, preserving every pre-Phase-5 simulation caller.
+	Engine            string
+	LSMFlushThreshold int64
+	NodeIDs           []raft.NodeID
+	ElectionTickMin   int
+	ElectionTickMax   int
+	HeartbeatTicks    int
+	TickIntervalMS    VirtualTime // default 50
+	MinDelayMS        VirtualTime // default 1
+	MaxDelayMS        VirtualTime // default 10
 }
 
 // simNode is the sim's per-node bookkeeping. storage outlives crashes; it
@@ -76,17 +81,20 @@ type simNode struct {
 	results         []statemachine.Result
 	lastApplied     uint64
 	sm              statemachine.StateMachine
-	newStateMachine func() statemachine.StateMachine
+	lsmFS           *lsm.SimFS
+	newStateMachine func() (statemachine.StateMachine, error)
 }
 
 type partitionKey struct{ from, to raft.NodeID }
 
 // Sim is a single-threaded deterministic multi-node Raft simulator.
 type Sim struct {
-	now   VirtualTime
-	seq   uint64
-	queue eventQueue
-	seed  int64
+	now               VirtualTime
+	seq               uint64
+	queue             eventQueue
+	seed              int64
+	engine            string
+	lsmFlushThreshold int64
 
 	order []raft.NodeID
 	nodes map[raft.NodeID]*simNode
@@ -115,7 +123,10 @@ type Sim struct {
 	// newCrashSim leaves it nil so Phase 3's explicit recovery behavior is
 	// unchanged. It is lookup-only except for deleting a directive once it
 	// fires, so map iteration can never affect simulation order.
-	restartAfterCrash map[crashDirectiveKey]CrashPoint
+	restartAfterCrash  map[crashDirectiveKey]CrashPoint
+	lsmCrashDirectives []LSMCrashDirective
+	lsmRestartOnCrash  map[lsmCrashDirectiveKey]bool
+	lsmFS              map[raft.NodeID]*lsm.SimFS
 
 	invariants []InvariantFunc
 	leaders    *leaderTracker
@@ -173,6 +184,13 @@ func NewFaultSim(cfg Config, schedule FaultSchedule) (*Sim, error) {
 	if err := schedule.ValidateForCluster(cfg.NodeIDs); err != nil {
 		return nil, err
 	}
+	engine := cfg.Engine
+	if engine == "" {
+		engine = "map"
+	}
+	if len(schedule.LSMCrashes) != 0 && engine != "lsm" {
+		return nil, fmt.Errorf("sim: LSM crash directives require engine lsm")
+	}
 	s, err := newSim(cfg, schedule, true)
 	if err != nil {
 		return nil, err
@@ -187,12 +205,35 @@ func NewFaultSim(cfg Config, schedule FaultSchedule) (*Sim, error) {
 		s.restartAfterCrash[crashDirectiveKey{node: directive.Node, save: directive.Save}] = directive.Point
 	}
 	s.installFaultEvents(schedule.Events)
+	s.lsmCrashDirectives = append([]LSMCrashDirective(nil), schedule.LSMCrashes...)
+	for _, d := range schedule.LSMCrashes {
+		if s.lsmRestartOnCrash == nil {
+			s.lsmRestartOnCrash = make(map[lsmCrashDirectiveKey]bool, len(schedule.LSMCrashes))
+		}
+		// Retain false policies too. Every fired directive is consumed by its
+		// exact (node, operation, occurrence, point) key; only a true value
+		// causes the causal same-time restart.
+		s.lsmRestartOnCrash[lsmDirectiveKey(d)] = d.RestartAfterCrash
+	}
 	return s, nil
 }
 
 func newSim(cfg Config, schedule FaultSchedule, crashStorage bool) (*Sim, error) {
 	if len(cfg.NodeIDs) == 0 {
 		return nil, errors.New("sim: Config.NodeIDs must not be empty")
+	}
+	engine := cfg.Engine
+	if engine == "" {
+		engine = "map"
+	}
+	if engine != "map" && engine != "lsm" {
+		return nil, fmt.Errorf("sim: unsupported engine %q (want map or lsm)", engine)
+	}
+	if cfg.LSMFlushThreshold < 0 {
+		return nil, fmt.Errorf("sim: negative LSM flush threshold %d", cfg.LSMFlushThreshold)
+	}
+	if engine == "map" && cfg.LSMFlushThreshold != 0 {
+		return nil, fmt.Errorf("sim: LSM flush threshold requires engine lsm")
 	}
 	seen := make(map[raft.NodeID]struct{}, len(cfg.NodeIDs))
 	for _, id := range cfg.NodeIDs {
@@ -219,16 +260,18 @@ func newSim(cfg Config, schedule FaultSchedule, crashStorage bool) (*Sim, error)
 	delayRand, perNode, faultRand := newRandStreams(cfg.Seed, order)
 
 	s := &Sim{
-		seed:         cfg.Seed,
-		order:        order,
-		nodes:        make(map[raft.NodeID]*simNode, len(order)),
-		partition:    make(map[partitionKey]struct{}),
-		delayRand:    delayRand,
-		faultRand:    faultRand,
-		tickInterval: tickInterval,
-		minDelay:     minDelay,
-		maxDelay:     maxDelay,
-		leaders:      newLeaderTracker(),
+		seed:              cfg.Seed,
+		engine:            engine,
+		lsmFlushThreshold: cfg.LSMFlushThreshold,
+		order:             order,
+		nodes:             make(map[raft.NodeID]*simNode, len(order)),
+		partition:         make(map[partitionKey]struct{}),
+		delayRand:         delayRand,
+		faultRand:         faultRand,
+		tickInterval:      tickInterval,
+		minDelay:          minDelay,
+		maxDelay:          maxDelay,
+		leaders:           newLeaderTracker(),
 		// Log matching is a universal Phase 2 safety property, not an
 		// opt-in scenario assertion. Run checks it after every event.
 		invariants: []InvariantFunc{LogMatching},
@@ -277,10 +320,13 @@ func newSim(cfg Config, schedule FaultSchedule, crashStorage bool) (*Sim, error)
 func (s *Sim) setStateMachineFactory(factory func() statemachine.StateMachine) {
 	for _, id := range s.order {
 		sn := s.nodes[id]
-		sn.newStateMachine = factory
 		if factory == nil {
+			sn.newStateMachine = nil
 			sn.sm = nil
 			continue
+		}
+		sn.newStateMachine = func() (statemachine.StateMachine, error) {
+			return factory(), nil
 		}
 		sn.sm = factory()
 	}

@@ -140,6 +140,10 @@ func Open(dir string, options Options) (*Engine, error) {
 func (engine *Engine) Put(key, value []byte, seq uint64) error {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
+	return engine.putLocked(key, value, seq)
+}
+
+func (engine *Engine) putLocked(key, value []byte, seq uint64) error {
 	if err := engine.checkOpenLocked(); err != nil {
 		return err
 	}
@@ -155,6 +159,10 @@ func (engine *Engine) Put(key, value []byte, seq uint64) error {
 func (engine *Engine) Delete(key []byte, seq uint64) error {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
+	return engine.deleteLocked(key, seq)
+}
+
+func (engine *Engine) deleteLocked(key []byte, seq uint64) error {
 	if err := engine.checkOpenLocked(); err != nil {
 		return err
 	}
@@ -217,6 +225,10 @@ func (engine *Engine) automaticFlushTargetLocked() uint64 {
 func (engine *Engine) AdvanceAppliedIndex(index uint64) error {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
+	return engine.advanceAppliedIndexLocked(index)
+}
+
+func (engine *Engine) advanceAppliedIndexLocked(index uint64) error {
 	if err := engine.checkOpenLocked(); err != nil {
 		return err
 	}
@@ -565,6 +577,10 @@ func (engine *Engine) removeOrphans() error {
 func (engine *Engine) Lookup(key []byte) (value []byte, tombstone bool, seq uint64, found bool, err error) {
 	engine.mu.RLock()
 	defer engine.mu.RUnlock()
+	return engine.lookupLocked(key)
+}
+
+func (engine *Engine) lookupLocked(key []byte) (value []byte, tombstone bool, seq uint64, found bool, err error) {
 	if engine.closed {
 		return nil, false, 0, false, errors.New("lsm: engine is closed")
 	}
@@ -608,7 +624,13 @@ func (engine *Engine) Lookup(key []byte) (value []byte, tombstone bool, seq uint
 // Read is the normal logical point-read surface. A highest-seq tombstone is
 // represented as not found.
 func (engine *Engine) Read(key []byte) ([]byte, bool, error) {
-	value, tombstone, _, found, err := engine.Lookup(key)
+	engine.mu.RLock()
+	defer engine.mu.RUnlock()
+	return engine.readLocked(key)
+}
+
+func (engine *Engine) readLocked(key []byte) ([]byte, bool, error) {
+	value, tombstone, _, found, err := engine.lookupLocked(key)
 	if err != nil || !found || tombstone {
 		return nil, false, err
 	}
@@ -670,6 +692,15 @@ func (engine *Engine) Close() error {
 	cleanupErr := engine.reconcileObsoleteLocked()
 	unresolvedErr := engine.closeUnresolvedLocked()
 	return errors.Join(cleanupErr, unresolvedErr, engine.closeTables())
+}
+
+// Abandon marks the engine unusable without reconciling obsolete files,
+// syncing directories, or closing handles. It models abrupt process loss;
+// only normal shutdown calls Close.
+func (engine *Engine) Abandon() {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	engine.closed = true
 }
 
 func (engine *Engine) closeTables() error {

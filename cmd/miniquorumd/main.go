@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,8 +20,10 @@ import (
 	"time"
 
 	"miniquorum/internal/clock"
+	"miniquorum/internal/lsm"
 	"miniquorum/internal/raft"
 	"miniquorum/internal/server"
+	"miniquorum/internal/statemachine"
 	"miniquorum/internal/statemachine/mapsm"
 	"miniquorum/internal/storage/disklog"
 	transportgrpc "miniquorum/internal/transport/grpc"
@@ -31,9 +34,11 @@ func main() {
 	var id uint64
 	var peersFlag string
 	var dataDir string
+	var engineFlag string
 	flag.Uint64Var(&id, "id", 0, "this node ID")
 	flag.StringVar(&peersFlag, "peers", "", "comma-separated id=address peers")
 	flag.StringVar(&dataDir, "data-dir", "", "directory for this node's durable Raft log")
+	flag.StringVar(&engineFlag, "engine", "map", "state-machine engine: map or lsm")
 	flag.Parse()
 	if id == 0 {
 		log.Print("--id is required")
@@ -51,6 +56,11 @@ func main() {
 	}
 	if dataDir == "" {
 		log.Print("--data-dir is required")
+		return
+	}
+	engineName, err := parseEngine(engineFlag)
+	if err != nil {
+		log.Printf("invalid --engine: %v", err)
 		return
 	}
 	store, err := openDataDir(dataDir)
@@ -74,6 +84,43 @@ func main() {
 		log.Printf("recover node: %v", err)
 		return
 	}
+	var sm statemachine.StateMachine
+	var closeStateMachine func() error
+	switch engineName {
+	case "map":
+		sm = mapsm.New()
+	case "lsm":
+		lsmRand, randErr := newProdRand()
+		if randErr != nil {
+			log.Printf("seed LSM skip-list rand: %v", randErr)
+			return
+		}
+		lsmDir := filepath.Join(dataDir, "lsm")
+		if mkdirErr := os.MkdirAll(lsmDir, 0o700); mkdirErr != nil {
+			log.Printf("create LSM directory: %v", mkdirErr)
+			return
+		}
+		lsmStateMachine, openErr := lsm.OpenStateMachine(lsmDir, lsm.Options{Rand: lsmRand})
+		if openErr != nil {
+			log.Printf("open LSM state machine: %v", openErr)
+			return
+		}
+		if replayErr := lsmStateMachine.BeginReplay(store.FirstIndex(), store.LastIndex()); replayErr != nil {
+			_ = lsmStateMachine.Close()
+			log.Printf("prepare LSM replay: %v", replayErr)
+			return
+		}
+		sm = lsmStateMachine
+		closeStateMachine = lsmStateMachine.Close
+	}
+	if closeStateMachine != nil {
+		defer func() {
+			if err := closeStateMachine(); err != nil {
+				log.Printf("close state machine: %v", err)
+			}
+		}()
+	}
+
 	host := &server.Host{Node: node, Storage: store, SelfID: raft.NodeID(id)}
 	transport := transportgrpc.New(peers, func(m *raftpb.Message) {
 		if err := host.Step(m); err != nil {
@@ -81,7 +128,7 @@ func main() {
 		}
 	})
 	host.Transport = transport
-	applier := server.NewKVApplier(mapsm.New())
+	applier := server.NewKVApplier(sm)
 	host.Applier = applier
 	raftpb.RegisterKVServer(transport.Server(), server.NewKVService(host, applier, peers))
 
@@ -101,7 +148,7 @@ func main() {
 	defer ticker.Stop()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log.Printf("miniquorumd node=%d listening=%s data-dir=%s started", id, addr, dataDir)
+	log.Printf("miniquorumd node=%d listening=%s data-dir=%s engine=%s started", id, addr, dataDir, engineName)
 	for {
 		select {
 		case <-ctx.Done():
@@ -116,6 +163,15 @@ func main() {
 			}
 			log.Printf("miniquorumd node=%d tick", id)
 		}
+	}
+}
+
+func parseEngine(value string) (string, error) {
+	switch value {
+	case "map", "lsm":
+		return value, nil
+	default:
+		return "", fmt.Errorf("want map or lsm, got %q", value)
 	}
 }
 

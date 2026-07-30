@@ -24,6 +24,19 @@ const corpusDir = "../../corpus"
 // schedule — must replay green on the ordinary build, from the files exactly
 // as committed.
 func TestCommittedCorpusSchedulesReplayCleanly(t *testing.T) {
+	replayCommittedCorpus(t, "")
+}
+
+// TestCommittedCorpusSchedulesReplayCleanlyLSM replays the exact same
+// committed Phase 4 schedules and checker/history path with the LSM selected.
+// The schedules are deliberately read from the unchanged corpus files; only
+// the StateMachine implementation differs.
+func TestCommittedCorpusSchedulesReplayCleanlyLSM(t *testing.T) {
+	replayCommittedCorpus(t, "lsm")
+}
+
+func replayCommittedCorpus(t *testing.T, engine string) {
+	t.Helper()
 	corpus, err := LoadCorpus(corpusDir)
 	if err != nil {
 		t.Fatalf("LoadCorpus: %v", err)
@@ -69,7 +82,7 @@ func TestCommittedCorpusSchedulesReplayCleanly(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				result, err := RunSeed(RunConfig{Seed: entry.Seed, Schedule: &schedule})
+				result, err := RunSeed(RunConfig{Seed: entry.Seed, Engine: engine, Schedule: &schedule})
 				if err != nil {
 					t.Fatalf("corpus entry %s (seed %d): %v", entry.Name, entry.Seed, err)
 				}

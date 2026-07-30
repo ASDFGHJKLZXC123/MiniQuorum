@@ -24,28 +24,39 @@ const (
 )
 
 type historyArtifact struct {
-	ArtifactVersion int             `json:"artifact_version"`
-	Seed            int64           `json:"seed"`
-	History         checker.History `json:"history"`
+	ArtifactVersion   int             `json:"artifact_version"`
+	Seed              int64           `json:"seed"`
+	Engine            string          `json:"engine"`
+	LSMFlushThreshold int64           `json:"lsm_flush_threshold"`
+	History           checker.History `json:"history"`
 }
 
 // ArtifactBytes produces every replay artifact in memory. Identical results
 // produce identical bytes, including Porcupine's self-contained HTML.
 func ArtifactBytes(result Result) (map[string][]byte, error) {
+	engine := result.Engine
+	if engine == "" {
+		engine = "map"
+	}
+	summaryValue := result.Summary
+	summaryValue.Engine = engine
+	summaryValue.LSMFlushThreshold = result.LSMFlushThreshold
 	schedule, err := sim.EncodeFaultSchedule(result.Schedule)
 	if err != nil {
 		return nil, err
 	}
 	schedule = append(schedule, '\n')
 	history, err := marshalIndented(historyArtifact{
-		ArtifactVersion: ArtifactVersion,
-		Seed:            result.Seed,
-		History:         result.History,
+		ArtifactVersion:   ArtifactVersion,
+		Seed:              result.Seed,
+		Engine:            engine,
+		LSMFlushThreshold: result.LSMFlushThreshold,
+		History:           result.History,
 	})
 	if err != nil {
 		return nil, err
 	}
-	summary, err := marshalIndented(result.Summary)
+	summary, err := marshalIndented(summaryValue)
 	if err != nil {
 		return nil, err
 	}
@@ -57,13 +68,13 @@ func ArtifactBytes(result Result) (map[string][]byte, error) {
 		}
 	}
 	violation := []byte(fmt.Sprintf(
-		"seed=%d\nresult=%s\nlogical_operations=%d\ncompleted_operations=%d\nopen_operations=%d\nschedule=%s\nhistory=%s\nvisualization=%s\n",
-		result.Seed, checkResultName(result.Summary), result.Summary.LogicalOperations,
-		result.Summary.CompletedOperations, result.Summary.OpenOperations, ScheduleFile, HistoryFile, VisualizationFile,
+		"seed=%d\nengine=%s\nlsm_flush_threshold=%d\nreproduce=go run ./cmd/simreplay -engine %s -lsm-flush-threshold %d -seed %d -schedule %s\nresult=%s\nlogical_operations=%d\ncompleted_operations=%d\nopen_operations=%d\nschedule=%s\nhistory=%s\nvisualization=%s\n",
+		result.Seed, engine, result.LSMFlushThreshold, engine, result.LSMFlushThreshold, result.Seed, ScheduleFile, checkResultName(summaryValue), summaryValue.LogicalOperations,
+		summaryValue.CompletedOperations, summaryValue.OpenOperations, ScheduleFile, HistoryFile, VisualizationFile,
 	))
 	checkResult, info := porcupine.CheckEventsVerbose(checker.KVModel, result.History.PorcupineEvents(), 0*time.Second)
-	if result.Summary.CheckerRan && (checkResult == porcupine.Ok) != result.Summary.Linearizable {
-		return nil, fmt.Errorf("verbose Porcupine result %s disagrees with summary linearizable=%t", checkResult, result.Summary.Linearizable)
+	if summaryValue.CheckerRan && (checkResult == porcupine.Ok) != summaryValue.Linearizable {
+		return nil, fmt.Errorf("verbose Porcupine result %s disagrees with summary linearizable=%t", checkResult, summaryValue.Linearizable)
 	}
 	var visualization bytes.Buffer
 	if err := porcupine.Visualize(checker.KVModel, info, &visualization); err != nil {
