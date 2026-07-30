@@ -44,6 +44,7 @@ type tableHandle struct {
 	metadata fileMetadata
 	file     File
 	reader   *SSTableReader
+	size     int64
 }
 
 // Engine owns the one engine-level RWMutex. Writes, freezes, manifest
@@ -52,20 +53,25 @@ type tableHandle struct {
 type Engine struct {
 	mu sync.RWMutex
 
-	rnd            Rand
-	list           *skipList
-	activeSize     int64
-	activeCount    int
-	activeMaxSeq   uint64
-	immutables     []*immutableMemtable
-	flushThreshold int64
-	appliedIndex   uint64
-	manifest       manifestState
-	tables         []*tableHandle
-	nextFileNumber uint64
-	fs             FS
-	dir            string
-	closed         bool
+	rnd              Rand
+	list             *skipList
+	activeSize       int64
+	activeCount      int
+	activeMaxSeq     uint64
+	immutables       []*immutableMemtable
+	flushThreshold   int64
+	appliedIndex     uint64
+	manifest         manifestState
+	tables           []*tableHandle
+	nextFileNumber   uint64
+	fs               FS
+	dir              string
+	poisoned         error
+	unresolved       []File
+	obsolete         []obsoleteFile
+	obsoleteDirDirty bool
+	compactionHook   func(compactionStage)
+	closed           bool
 }
 
 // NewEngine preserves Packet 5A's in-memory constructor. Persistence and
@@ -116,16 +122,13 @@ func Open(dir string, options Options) (*Engine, error) {
 		dir:            dir,
 	}
 	if err := engine.openReferencedTables(); err != nil {
-		_ = engine.closeTables()
-		return nil, err
+		return nil, errors.Join(err, engine.closeTables(), engine.closeUnresolvedLocked())
 	}
 	if err := engine.syncRecoveredVersion(); err != nil {
-		_ = engine.closeTables()
-		return nil, err
+		return nil, errors.Join(err, engine.closeTables(), engine.closeUnresolvedLocked())
 	}
 	if err := engine.removeOrphans(); err != nil {
-		_ = engine.closeTables()
-		return nil, err
+		return nil, errors.Join(err, engine.closeTables(), engine.closeUnresolvedLocked())
 	}
 	engine.nextFileNumber = nextFileNumber(state.files)
 	return engine, nil
@@ -346,22 +349,28 @@ func (engine *Engine) flushOldestLocked() error {
 		return addErr == nil
 	})
 	if addErr != nil {
-		return fmt.Errorf("lsm: build SSTable %s: %w", filename, errors.Join(addErr, file.Close()))
+		return fmt.Errorf("lsm: build SSTable %s: %w", filename, errors.Join(addErr, engine.closeFileRetainingLocked(file)))
 	}
 	if err := writer.Finish(); err != nil {
-		return fmt.Errorf("lsm: finish SSTable %s: %w", filename, errors.Join(err, file.Close()))
+		return fmt.Errorf("lsm: finish SSTable %s: %w", filename, errors.Join(err, engine.closeFileRetainingLocked(file)))
 	}
 	if err := file.Sync(); err != nil {
-		return fmt.Errorf("lsm: sync SSTable %s: %w", filename, errors.Join(err, file.Close()))
+		return fmt.Errorf("lsm: sync SSTable %s: %w", filename, errors.Join(err, engine.closeFileRetainingLocked(file)))
 	}
-	if err := file.Close(); err != nil {
+	if err := engine.closeFileRetainingLocked(file); err != nil {
 		return fmt.Errorf("lsm: close SSTable %s: %w", filename, err)
 	}
 	if err := engine.fs.SyncDir(engine.dir); err != nil {
 		return fmt.Errorf("lsm: sync SSTable directory for %s: %w", filename, err)
 	}
 
-	metadata := fileMetadata{file: filename, minKey: firstKey, maxKey: lastKey, count: count}
+	metadata := fileMetadata{
+		tier:   tableSizeClass(writer.size),
+		file:   filename,
+		minKey: firstKey,
+		maxKey: lastKey,
+		count:  count,
+	}
 	table, err := engine.openTable(metadata, immutable.watermark)
 	if err != nil {
 		return err
@@ -373,6 +382,9 @@ func (engine *Engine) flushOldestLocked() error {
 	committed, err := engine.commitEditLocked(edit, table)
 	if committed {
 		engine.immutables = engine.immutables[1:]
+		if err == nil {
+			err = engine.compactAllLocked()
+		}
 	}
 	return err
 }
@@ -387,15 +399,23 @@ func (engine *Engine) commitEditLocked(edit *raftpb.VersionEdit, table *tableHan
 		next.files[name] = metadata
 	}
 	if err := next.apply(edit); err != nil {
+		var closeErr error
 		if table != nil {
-			_ = table.file.Close()
+			closeErr = engine.closeFileRetainingLocked(table.file)
 		}
-		return false, fmt.Errorf("lsm: invalid manifest edit: %w", err)
+		return false, errors.Join(fmt.Errorf("lsm: invalid manifest edit: %w", err), closeErr)
 	}
-	committed, appendErr := appendManifestEdit(engine.fs, engine.dir, edit)
+	committed, unresolved, appendErr := appendManifestEdit(engine.fs, engine.dir, edit)
+	if unresolved != nil {
+		engine.unresolved = append(engine.unresolved, unresolved)
+	}
 	if !committed {
+		if isUncertainManifestAppend(appendErr) {
+			engine.poisonLocked(appendErr)
+		}
 		if table != nil {
-			appendErr = errors.Join(appendErr, table.file.Close())
+			closeErr := engine.closeFileRetainingLocked(table.file)
+			appendErr = errors.Join(appendErr, closeErr)
 		}
 		return false, appendErr
 	}
@@ -459,39 +479,50 @@ func (engine *Engine) syncRecoveredVersion() error {
 }
 
 func (engine *Engine) openTable(metadata fileMetadata, maxSequence uint64) (*tableHandle, error) {
+	table, err := engine.openTableOwned(metadata, maxSequence)
+	if err == nil {
+		return table, nil
+	}
+	if table == nil || table.file == nil {
+		return nil, err
+	}
+	closeErr := engine.closeFileRetainingLocked(table.file)
+	return nil, errors.Join(err, closeErr)
+}
+
+// openTableOwned returns ownership of an opened handle even when validation
+// fails. Packet 5D's compaction path uses this form so a failed validation and
+// failed Close cannot silently lose the handle.
+func (engine *Engine) openTableOwned(metadata fileMetadata, maxSequence uint64) (*tableHandle, error) {
 	path := filepath.Join(engine.dir, metadata.file)
 	info, err := engine.fs.Stat(path)
 	if err != nil {
-		return nil, fmt.Errorf("%w: stat referenced SSTable %s: %v", ErrManifestCorrupt, metadata.file, err)
+		return nil, fmt.Errorf("%w: stat referenced SSTable %s: %w", ErrManifestCorrupt, metadata.file, err)
 	}
 	if info.IsDir || info.Size < 0 {
 		return nil, fmt.Errorf("%w: invalid stat for referenced SSTable %s", ErrManifestCorrupt, metadata.file)
 	}
 	file, err := engine.fs.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("%w: open referenced SSTable %s: %v", ErrManifestCorrupt, metadata.file, err)
+		return nil, fmt.Errorf("%w: open referenced SSTable %s: %w", ErrManifestCorrupt, metadata.file, err)
 	}
 	reader, err := OpenSSTable(file, info.Size)
 	if err != nil {
-		_ = file.Close()
-		return nil, fmt.Errorf("%w: open referenced SSTable %s: %v", ErrManifestCorrupt, metadata.file, err)
+		return &tableHandle{metadata: metadata, file: file, size: info.Size}, fmt.Errorf("%w: open referenced SSTable %s: %w", ErrManifestCorrupt, metadata.file, err)
 	}
 	if reader.EntryCount() != metadata.count || !bytes.Equal(reader.minKey, metadata.minKey) || !bytes.Equal(reader.maxKey, metadata.maxKey) {
-		_ = file.Close()
-		return nil, fmt.Errorf("%w: metadata mismatch for referenced SSTable %s", ErrManifestCorrupt, metadata.file)
+		return &tableHandle{metadata: metadata, file: file, reader: reader, size: info.Size}, fmt.Errorf("%w: metadata mismatch for referenced SSTable %s", ErrManifestCorrupt, metadata.file)
 	}
 	entries, err := reader.AllEntries()
 	if err != nil {
-		_ = file.Close()
-		return nil, fmt.Errorf("%w: validate referenced SSTable %s: %v", ErrManifestCorrupt, metadata.file, err)
+		return &tableHandle{metadata: metadata, file: file, reader: reader, size: info.Size}, fmt.Errorf("%w: validate referenced SSTable %s: %w", ErrManifestCorrupt, metadata.file, err)
 	}
 	for _, entry := range entries {
 		if entry.Seq > maxSequence {
-			_ = file.Close()
-			return nil, fmt.Errorf("%w: SSTable %s seq %d exceeds flushed_index %d", ErrManifestCorrupt, metadata.file, entry.Seq, maxSequence)
+			return &tableHandle{metadata: metadata, file: file, reader: reader, size: info.Size}, fmt.Errorf("%w: SSTable %s seq %d exceeds flushed_index %d", ErrManifestCorrupt, metadata.file, entry.Seq, maxSequence)
 		}
 	}
-	return &tableHandle{metadata: metadata, file: file, reader: reader}, nil
+	return &tableHandle{metadata: metadata, file: file, reader: reader, size: info.Size}, nil
 }
 
 func (engine *Engine) removeOrphans() error {
@@ -627,18 +658,18 @@ func (engine *Engine) ReferencedSSTables() []string {
 	return names
 }
 
-// Close releases referenced SSTable handles. It performs no sync: every
-// published edit is already durable.
+// Close retries any pending obsolete-file removal and directory sync, then
+// releases retained MANIFEST/output handles and referenced SSTable handles.
+// Published VersionEdits themselves are already durable.
 func (engine *Engine) Close() error {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	if !engine.closed {
 		engine.closed = true
 	}
-	if len(engine.tables) == 0 {
-		return nil
-	}
-	return engine.closeTables()
+	cleanupErr := engine.reconcileObsoleteLocked()
+	unresolvedErr := engine.closeUnresolvedLocked()
+	return errors.Join(cleanupErr, unresolvedErr, engine.closeTables())
 }
 
 func (engine *Engine) closeTables() error {
@@ -660,7 +691,42 @@ func (engine *Engine) checkOpenLocked() error {
 	if engine.closed {
 		return errors.New("lsm: engine is closed")
 	}
+	if engine.poisoned != nil {
+		return fmt.Errorf("lsm: engine is fail-stopped after uncertain MANIFEST append: %w", engine.poisoned)
+	}
 	return nil
+}
+
+func (engine *Engine) poisonLocked(err error) {
+	if engine.poisoned == nil {
+		engine.poisoned = err
+	}
+}
+
+func (engine *Engine) closeUnresolvedLocked() error {
+	var err error
+	unresolved := make([]File, 0, len(engine.unresolved))
+	for _, file := range engine.unresolved {
+		closeErr := file.Close()
+		if closeErr == nil || errors.Is(closeErr, ErrFSClosed) {
+			continue
+		}
+		err = errors.Join(err, closeErr)
+		unresolved = append(unresolved, file)
+	}
+	engine.unresolved = unresolved
+	return err
+}
+
+func (engine *Engine) closeFileRetainingLocked(file File) error {
+	if file == nil {
+		return nil
+	}
+	err := file.Close()
+	if err != nil && !errors.Is(err, ErrFSClosed) {
+		engine.unresolved = append(engine.unresolved, file)
+	}
+	return err
 }
 
 func cloneBytes(value []byte) []byte {

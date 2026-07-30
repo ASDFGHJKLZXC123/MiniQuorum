@@ -40,6 +40,7 @@ type SSTableWriter struct {
 	w       io.Writer
 	entries []TableEntry
 	lastKey []byte
+	size    int64
 	closed  bool
 }
 
@@ -133,6 +134,7 @@ func (w *SSTableWriter) Finish() error {
 	if n != table.Len() {
 		return io.ErrShortWrite
 	}
+	w.size = int64(n)
 	return nil
 }
 
