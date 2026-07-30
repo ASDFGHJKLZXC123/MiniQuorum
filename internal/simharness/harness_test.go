@@ -222,6 +222,9 @@ func TestRunBatchIsDeterministicAndAggregatesEvidence(t *testing.T) {
 	if first.Failed != 0 || first.Passed != 6 || first.FirstViolationSeed != nil {
 		t.Fatalf("batch = %#v, want 6 clean passes", first)
 	}
+	if first.Engine != "map" || first.LSMFlushThreshold != 0 {
+		t.Fatalf("batch provenance = engine %q threshold %d, want map/0", first.Engine, first.LSMFlushThreshold)
+	}
 	if first.MinLogicalOperations < MinimumLogicalOperations || first.MinCompletedOperations < MinimumCompleted {
 		t.Fatalf("batch minima %d/%d below floors %d/%d",
 			first.MinLogicalOperations, first.MinCompletedOperations, MinimumLogicalOperations, MinimumCompleted)
@@ -233,6 +236,107 @@ func TestRunBatchIsDeterministicAndAggregatesEvidence(t *testing.T) {
 	}
 	if len(first.FaultEventCounts) == 0 {
 		t.Fatal("batch observed no fault events")
+	}
+}
+
+func TestLSMArtifactsCarryEngineProvenance(t *testing.T) {
+	result, err := RunSeed(RunConfig{Seed: 1, Engine: "lsm", LSMFlushThreshold: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Engine != "lsm" || result.Summary.Engine != "lsm" || result.LSMFlushThreshold != 1 || result.Summary.LSMFlushThreshold != 1 {
+		t.Fatalf("result provenance = engine %q/%q threshold %d/%d", result.Engine, result.Summary.Engine, result.LSMFlushThreshold, result.Summary.LSMFlushThreshold)
+	}
+	artifacts, err := ArtifactBytes(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{SummaryFile, HistoryFile, ViolationFile} {
+		if !bytes.Contains(artifacts[name], []byte("lsm")) {
+			t.Fatalf("%s omits LSM provenance: %s", name, artifacts[name])
+		}
+	}
+	if !bytes.Contains(artifacts[ViolationFile], []byte("simreplay -engine lsm")) {
+		t.Fatalf("violation artifact lacks LSM reproduction cue: %s", artifacts[ViolationFile])
+	}
+	for _, name := range []string{SummaryFile, HistoryFile, ViolationFile} {
+		if !bytes.Contains(artifacts[name], []byte("lsm_flush_threshold")) || !bytes.Contains(artifacts[name], []byte("1")) {
+			t.Fatalf("%s omits LSM flush-threshold provenance: %s", name, artifacts[name])
+		}
+	}
+	if !bytes.Contains(artifacts[ViolationFile], []byte("-lsm-flush-threshold 1")) {
+		t.Fatalf("violation artifact lacks exact LSM threshold reproduction cue: %s", artifacts[ViolationFile])
+	}
+}
+
+func TestMapArtifactsCarryCanonicalReplayCue(t *testing.T) {
+	result, err := RunSeed(RunConfig{Seed: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Engine != "map" || result.Summary.Engine != "map" {
+		t.Fatalf("map provenance = %q/%q", result.Engine, result.Summary.Engine)
+	}
+	artifacts, err := ArtifactBytes(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(artifacts[ViolationFile], []byte("simreplay -engine map")) {
+		t.Fatalf("map reproduction cue missing: %s", artifacts[ViolationFile])
+	}
+	if !bytes.Contains(artifacts[ViolationFile], []byte("-lsm-flush-threshold 0")) {
+		t.Fatalf("map threshold reproduction cue missing: %s", artifacts[ViolationFile])
+	}
+}
+
+func TestRunSeedStartupFailureRetainsArtifactProvenance(t *testing.T) {
+	schedule := sim.FaultSchedule{Version: 0}
+	result, err := RunSeed(RunConfig{
+		Seed:              9_901,
+		Engine:            "lsm",
+		LSMFlushThreshold: 1,
+		Schedule:          &schedule,
+		Operations:        -1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "start workload") {
+		t.Fatalf("startup failure = %v, want StartWorkload error", err)
+	}
+	if result.Seed != 9_901 || result.Engine != "lsm" || result.LSMFlushThreshold != 1 || !reflect.DeepEqual(result.Schedule, schedule) {
+		t.Fatalf("startup failure result lost provenance: %#v", result)
+	}
+	if result.Summary.Seed != result.Seed || result.Summary.Engine != result.Engine || result.Summary.LSMFlushThreshold != result.LSMFlushThreshold || result.Summary.ScheduleVersion != schedule.Version {
+		t.Fatalf("startup failure summary lost provenance: %#v", result.Summary)
+	}
+	if result.Summary.OperationCounts == nil || result.Summary.FaultEventCounts == nil || result.Summary.CrashPointCounts == nil {
+		t.Fatalf("startup failure summary maps are not initialized: %#v", result.Summary)
+	}
+	artifacts, artifactErr := ArtifactBytes(result)
+	if artifactErr != nil {
+		t.Fatal(artifactErr)
+	}
+	if !bytes.Contains(artifacts[HistoryFile], []byte(`"seed": 9901`)) || !bytes.Contains(artifacts[SummaryFile], []byte(`"engine": "lsm"`)) || !bytes.Contains(artifacts[ViolationFile], []byte("simreplay -engine lsm -lsm-flush-threshold 1 -seed 9901")) {
+		t.Fatalf("startup failure artifacts lost exact replay provenance: history=%s summary=%s violation=%s", artifacts[HistoryFile], artifacts[SummaryFile], artifacts[ViolationFile])
+	}
+}
+
+func TestRunSeedRejectsInvalidLSMThresholdWithoutDroppingProvenance(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		engine    string
+		threshold int64
+	}{
+		{name: "negative lsm", engine: "lsm", threshold: -1},
+		{name: "map nonzero", engine: "map", threshold: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := RunSeed(RunConfig{Seed: 9_902, Engine: test.engine, LSMFlushThreshold: test.threshold, Schedule: &sim.FaultSchedule{}})
+			if err == nil {
+				t.Fatal("invalid LSM threshold succeeded")
+			}
+			if result.Seed != 9_902 || result.Engine != test.engine || result.LSMFlushThreshold != test.threshold || result.Summary.Engine != test.engine || result.Summary.LSMFlushThreshold != test.threshold {
+				t.Fatalf("invalid threshold result lost provenance: %#v", result)
+			}
+		})
 	}
 }
 

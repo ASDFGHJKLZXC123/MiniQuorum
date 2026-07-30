@@ -23,16 +23,18 @@ type BatchConfig struct {
 // Aggregate is the deterministic result of a batch; wall-clock timing belongs
 // only in the command's human-readable output.
 type Aggregate struct {
-	ArtifactVersion     int   `json:"artifact_version"`
-	StartSeed           int64 `json:"start_seed"`
-	Count               int   `json:"count"`
-	Workers             int   `json:"workers"`
-	Passed              int   `json:"passed"`
-	Failed              int   `json:"failed"`
-	LogicalOperations   int   `json:"logical_operations"`
-	CompletedOperations int   `json:"completed_operations"`
-	OpenOperations      int   `json:"open_operations"`
-	Attempts            int   `json:"attempts"`
+	ArtifactVersion     int    `json:"artifact_version"`
+	Engine              string `json:"engine"`
+	LSMFlushThreshold   int64  `json:"lsm_flush_threshold"`
+	StartSeed           int64  `json:"start_seed"`
+	Count               int    `json:"count"`
+	Workers             int    `json:"workers"`
+	Passed              int    `json:"passed"`
+	Failed              int    `json:"failed"`
+	LogicalOperations   int    `json:"logical_operations"`
+	CompletedOperations int    `json:"completed_operations"`
+	OpenOperations      int    `json:"open_operations"`
+	Attempts            int    `json:"attempts"`
 	// MinLogicalOperations and MinCompletedOperations are the weakest single
 	// seed in the batch; MaxOpenOperations and SeedsWithOpenOperations size
 	// the genuinely-indeterminate tail. All are 0 for an empty batch. They
@@ -96,14 +98,20 @@ func RunBatch(config BatchConfig) Aggregate {
 	close(jobs)
 	workers.Wait()
 
+	engine := config.Run.Engine
+	if engine == "" {
+		engine = "map"
+	}
 	aggregate := Aggregate{
-		ArtifactVersion:  ArtifactVersion,
-		StartSeed:        config.StartSeed,
-		Count:            config.Count,
-		Workers:          config.Workers,
-		OperationCounts:  make(map[string]int),
-		FaultEventCounts: make(map[string]int),
-		CrashPointCounts: make(map[string]int),
+		ArtifactVersion:   ArtifactVersion,
+		Engine:            engine,
+		LSMFlushThreshold: config.Run.LSMFlushThreshold,
+		StartSeed:         config.StartSeed,
+		Count:             config.Count,
+		Workers:           config.Workers,
+		OperationCounts:   make(map[string]int),
+		FaultEventCounts:  make(map[string]int),
+		CrashPointCounts:  make(map[string]int),
 	}
 	for index, result := range results {
 		if result.summary.CheckerRan && !result.summary.Linearizable && aggregate.FirstViolationSeed == nil {

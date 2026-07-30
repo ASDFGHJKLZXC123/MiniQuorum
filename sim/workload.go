@@ -6,6 +6,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"miniquorum/checker"
+	"miniquorum/internal/lsm"
 	"miniquorum/internal/raft"
 	"miniquorum/internal/statemachine"
 	"miniquorum/internal/statemachine/mapsm"
@@ -34,10 +35,10 @@ type simWorkload struct {
 	byAttempt map[workloadpkg.AttemptID]workloadApplyKey
 }
 
-// StartWorkload installs fresh per-node map state machines and schedules a
-// deterministic workload inside this simulator. It must be called before the
-// scheduler advances; replacing state machines after Raft application begins
-// would discard replicated state.
+// StartWorkload installs fresh per-node state machines selected by Config's
+// simulator engine and schedules a deterministic workload. It must be called
+// before the scheduler advances; replacing state machines after Raft
+// application begins would discard replicated state.
 func (s *Sim) StartWorkload(config workloadpkg.Config) error {
 	if s.workload != nil {
 		return fmt.Errorf("sim: workload already started")
@@ -54,7 +55,16 @@ func (s *Sim) StartWorkload(config workloadpkg.Config) error {
 	if err != nil {
 		return err
 	}
-	s.setStateMachineFactory(func() statemachine.StateMachine { return mapsm.New() })
+	switch s.engine {
+	case "map":
+		s.setStateMachineFactory(func() statemachine.StateMachine { return mapsm.New() })
+	case "lsm":
+		if err := s.installLSMStateMachines(); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("sim: unsupported engine %q", s.engine)
+	}
 	s.workload = &simWorkload{
 		runner:    runner,
 		pending:   make(map[workloadApplyKey][]pendingWorkloadAttempt),
@@ -62,6 +72,60 @@ func (s *Sim) StartWorkload(config workloadpkg.Config) error {
 	}
 	if err := runner.Start(workloadHost{sim: s}); err != nil {
 		return err
+	}
+	return nil
+}
+
+// installLSMStateMachines gives each simulated node an independent durable
+// SimFS and deterministic skip-list stream. The closures reopen that same
+// node-local directory after a simulated process restart, so the retained
+// Raft log rebuilds both logical state and in-memory deduplication without
+// crossing the simulator's I/O or wall-clock boundary.
+func (s *Sim) installLSMStateMachines() error {
+	for _, id := range s.order {
+		sn := s.nodes[id]
+		fs := lsm.NewSimFS()
+		sn.lsmFS = fs
+		if s.lsmFS == nil {
+			s.lsmFS = make(map[raft.NodeID]*lsm.SimFS)
+		}
+		s.lsmFS[id] = fs
+		var directives []lsm.SimCrashDirective
+		for _, directive := range s.lsmCrashDirectives {
+			if directive.Node != id {
+				continue
+			}
+			directives = append(directives, lsm.SimCrashDirective{Op: directive.Op, Occurrence: directive.Occurrence, Point: directive.Point, RetainUnsynced: directive.RetainUnsynced})
+		}
+		dir := fmt.Sprintf("/node-%d", id)
+		seed := lsmRandSeed(s.seed, id)
+		factory := func() (statemachine.StateMachine, error) {
+			if fs.Crashed() {
+				if err := fs.Recover(); err != nil {
+					return nil, fmt.Errorf("recover LSM filesystem for node %d: %w", id, err)
+				}
+			}
+			return lsm.OpenStateMachine(dir, lsm.Options{FS: fs, Rand: newSeededLSMRand(seed), FlushThreshold: s.lsmFlushThreshold})
+		}
+		stateMachine, err := factory()
+		if err != nil {
+			return fmt.Errorf("sim: open LSM state machine for node %d: %w", id, err)
+		}
+		// Opening an existing engine performs ordinary filesystem reads and
+		// cleanup. Arm the validated crash schedule only after that initial
+		// open succeeds, so a directive's first occurrence always belongs to
+		// the replicated workload or a later reopen, never startup plumbing.
+		// SetCrashSchedule also resets per-operation counters when directives
+		// is empty; calibration and scheduled runs therefore share the same
+		// post-open occurrence origin.
+		if err := fs.SetCrashSchedule(directives); err != nil {
+			if closer, ok := stateMachine.(interface{ Close() error }); ok {
+				_ = closer.Close()
+			}
+			return fmt.Errorf("sim: configure LSM crash directives for node %d: %w", id, err)
+		}
+		sn.newStateMachine = factory
+		sn.sm = stateMachine
 	}
 	return nil
 }

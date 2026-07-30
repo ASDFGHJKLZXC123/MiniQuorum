@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 
+	"miniquorum/internal/lsm"
 	"miniquorum/internal/raft"
 )
 
@@ -253,6 +254,30 @@ type FaultSchedule struct {
 	Version int
 	Crashes []CrashDirective
 	Events  []FaultEvent
+	// LSMCrashes targets the selected LSM state machine's node-local SimFS.
+	// It is omitted for every existing map corpus artifact.
+	LSMCrashes []LSMCrashDirective `json:",omitempty"`
+}
+
+// LSMCrashDirective is a serialized, per-node SimFS crash decision. The
+// causal restart policy is explicit so recovery remains artifact-driven.
+type LSMCrashDirective struct {
+	Node              raft.NodeID
+	Op                lsm.FSOp
+	Occurrence        uint64
+	Point             lsm.SimFaultPoint
+	RetainUnsynced    int
+	RestartAfterCrash bool `json:",omitempty"`
+}
+type lsmCrashDirectiveKey struct {
+	node       raft.NodeID
+	op         lsm.FSOp
+	occurrence uint64
+	point      lsm.SimFaultPoint
+}
+
+func lsmDirectiveKey(d LSMCrashDirective) lsmCrashDirectiveKey {
+	return lsmCrashDirectiveKey{d.Node, d.Op, d.Occurrence, d.Point}
 }
 
 // Validate reports a structural problem in the schedule: a negative event
@@ -301,6 +326,41 @@ func (s FaultSchedule) Validate() error {
 	}
 	if err := validateCrashDirectives(s.Crashes); err != nil {
 		return err
+	}
+	if err := validateLSMCrashDirectives(s.LSMCrashes); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateLSMCrashDirectives(ds []LSMCrashDirective) error {
+	type key struct {
+		node       raft.NodeID
+		op         lsm.FSOp
+		occurrence uint64
+	}
+	seen := make(map[key]struct{}, len(ds))
+	for i, d := range ds {
+		if d.Op == "" {
+			return fmt.Errorf("sim: LSM crash directive %d: empty FS operation", i)
+		}
+		if d.Occurrence == 0 {
+			return fmt.Errorf("sim: LSM crash directive %d: occurrence is 1-based", i)
+		}
+		if d.RetainUnsynced < lsm.RetainAllUnsynced {
+			return fmt.Errorf("sim: LSM crash directive %d: retain %d below %d", i, d.RetainUnsynced, lsm.RetainAllUnsynced)
+		}
+		if d.Point != lsm.SimBeforeOperation && d.Point != lsm.SimAfterOperation {
+			return fmt.Errorf("sim: LSM crash directive %d: invalid point %d", i, d.Point)
+		}
+		if err := lsm.NewSimFS().SetCrashSchedule([]lsm.SimCrashDirective{{Op: d.Op, Occurrence: d.Occurrence, Point: d.Point, RetainUnsynced: d.RetainUnsynced}}); err != nil {
+			return fmt.Errorf("sim: LSM crash directive %d: %w", i, err)
+		}
+		k := key{d.Node, d.Op, d.Occurrence}
+		if _, ok := seen[k]; ok {
+			return fmt.Errorf("sim: LSM crash directive %d: duplicate node %d op %s occurrence %d", i, d.Node, d.Op, d.Occurrence)
+		}
+		seen[k] = struct{}{}
 	}
 	return nil
 }
@@ -428,6 +488,11 @@ func (s FaultSchedule) ValidateForCluster(nodeIDs []raft.NodeID) error {
 	for i, d := range s.Crashes {
 		if err := member(d.Node); err != nil {
 			return fmt.Errorf("sim: crash directive %d: %w", i, err)
+		}
+	}
+	for i, d := range s.LSMCrashes {
+		if err := member(d.Node); err != nil {
+			return fmt.Errorf("sim: LSM crash directive %d: %w", i, err)
 		}
 	}
 	return nil
