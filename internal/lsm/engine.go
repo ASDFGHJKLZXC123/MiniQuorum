@@ -31,6 +31,12 @@ type Options struct {
 	FS             FS
 	Rand           Rand
 	FlushThreshold int64
+	// SkipBloom bypasses Bloom filters in SSTable reads. Production usage keeps
+	// Bloom enabled by default.
+	SkipBloom bool
+	// DisableAutoCompaction suppresses automatic compaction after every flush.
+	// This is benchmark-only.
+	DisableAutoCompaction bool
 }
 
 type immutableMemtable struct {
@@ -53,25 +59,45 @@ type tableHandle struct {
 type Engine struct {
 	mu sync.RWMutex
 
-	rnd              Rand
-	list             *skipList
-	activeSize       int64
-	activeCount      int
-	activeMaxSeq     uint64
-	immutables       []*immutableMemtable
-	flushThreshold   int64
-	appliedIndex     uint64
-	manifest         manifestState
-	tables           []*tableHandle
-	nextFileNumber   uint64
-	fs               FS
-	dir              string
-	poisoned         error
-	unresolved       []File
-	obsolete         []obsoleteFile
-	obsoleteDirDirty bool
-	compactionHook   func(compactionStage)
-	closed           bool
+	rnd                   Rand
+	list                  *skipList
+	activeSize            int64
+	activeCount           int
+	activeMaxSeq          uint64
+	immutables            []*immutableMemtable
+	flushThreshold        int64
+	appliedIndex          uint64
+	manifest              manifestState
+	tables                []*tableHandle
+	nextFileNumber        uint64
+	fs                    FS
+	dir                   string
+	poisoned              error
+	unresolved            []File
+	obsolete              []obsoleteFile
+	obsoleteDirDirty      bool
+	compactionHook        func(compactionStage)
+	disableAutoCompaction bool
+	readWithBloom         bool
+	completedFlushes      uint64
+	completedCompactions  uint64
+	closed                bool
+}
+
+// EngineBenchmarkCounters reports additive, lock-protected benchmark counters.
+type EngineBenchmarkCounters struct {
+	CompletedFlushes     uint64
+	CompletedCompactions uint64
+}
+
+// SnapshotBenchmarkCounters returns the current benchmark counters.
+func (engine *Engine) SnapshotBenchmarkCounters() EngineBenchmarkCounters {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	return EngineBenchmarkCounters{
+		CompletedFlushes:     engine.completedFlushes,
+		CompletedCompactions: engine.completedCompactions,
+	}
 }
 
 // NewEngine preserves Packet 5A's in-memory constructor. Persistence and
@@ -85,6 +111,7 @@ func NewEngine(rnd Rand) *Engine {
 		list:           newSkipList(rnd),
 		manifest:       newManifestState(),
 		nextFileNumber: 1,
+		readWithBloom:  true,
 	}
 }
 
@@ -113,13 +140,15 @@ func Open(dir string, options Options) (*Engine, error) {
 		return nil, err
 	}
 	engine := &Engine{
-		rnd:            options.Rand,
-		list:           newSkipList(options.Rand),
-		flushThreshold: threshold,
-		manifest:       state,
-		nextFileNumber: 1,
-		fs:             fs,
-		dir:            dir,
+		rnd:                   options.Rand,
+		list:                  newSkipList(options.Rand),
+		flushThreshold:        threshold,
+		disableAutoCompaction: options.DisableAutoCompaction,
+		readWithBloom:         !options.SkipBloom,
+		manifest:              state,
+		nextFileNumber:        1,
+		fs:                    fs,
+		dir:                   dir,
 	}
 	if err := engine.openReferencedTables(); err != nil {
 		return nil, errors.Join(err, engine.closeTables(), engine.closeUnresolvedLocked())
@@ -393,9 +422,12 @@ func (engine *Engine) flushOldestLocked() error {
 	}
 	committed, err := engine.commitEditLocked(edit, table)
 	if committed {
+		engine.completedFlushes++
 		engine.immutables = engine.immutables[1:]
 		if err == nil {
-			err = engine.compactAllLocked()
+			if !engine.disableAutoCompaction {
+				err = engine.compactAllLocked()
+			}
 		}
 	}
 	return err
@@ -610,7 +642,7 @@ func (engine *Engine) lookupLocked(key []byte) (value []byte, tombstone bool, se
 		}
 	}
 	for _, table := range engine.tables {
-		entry, candidateFound, readErr := table.reader.Get(key)
+		entry, candidateFound, readErr := table.reader.get(key, engine.readWithBloom)
 		if readErr != nil {
 			return nil, false, 0, false, fmt.Errorf("lsm: read SSTable %s: %w", table.metadata.file, readErr)
 		}

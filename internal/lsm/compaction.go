@@ -512,6 +512,7 @@ func (engine *Engine) commitCompactionLocked(edit *raftpb.VersionEdit, output *t
 	if engine.compactionHook != nil {
 		engine.compactionHook(compactionAfterPublish)
 	}
+	engine.completedCompactions++
 	cleanupErr := engine.reconcileObsoleteLocked()
 	return errors.Join(appendErr, cleanupErr)
 }
