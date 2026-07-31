@@ -61,6 +61,12 @@ func randomHeight(rnd Rand, maxH, inverseP int) int {
 	return height
 }
 
+// RandomHeight runs the production Tower-based height generator with the
+// fixed max height and inverse probability used by this engine (p=1/4, max 16).
+func RandomHeight(rnd Rand) int {
+	return randomHeight(rnd, maxHeight, towerInverseP)
+}
+
 // put inserts key at seq if absent. If key is present, put applies the
 // write only when seq is strictly greater than the seq already stored for
 // key; otherwise it is a no-op. This is the monotonic-per-key rule the

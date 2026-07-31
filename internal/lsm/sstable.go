@@ -423,10 +423,14 @@ func OpenSSTable(r io.ReaderAt, size int64) (*SSTableReader, error) {
 // Get returns the highest-sequence record for key. A returned tombstone is a
 // found record; its caller decides how to represent deletion.
 func (r *SSTableReader) Get(key []byte) (TableEntry, bool, error) {
+	return r.get(key, true)
+}
+
+func (r *SSTableReader) get(key []byte, checkBloom bool) (TableEntry, bool, error) {
 	if r == nil {
 		return TableEntry{}, false, fmt.Errorf("lsm: nil sstable reader")
 	}
-	if r.entryCount == 0 || !r.bloom.MayContain(key) || bytes.Compare(key, r.minKey) < 0 || bytes.Compare(key, r.maxKey) > 0 {
+	if r.entryCount == 0 || (checkBloom && !r.bloom.MayContain(key)) || bytes.Compare(key, r.minKey) < 0 || bytes.Compare(key, r.maxKey) > 0 {
 		return TableEntry{}, false, nil
 	}
 	i := sort.Search(len(r.index), func(i int) bool { return bytes.Compare(r.index[i].firstKey, key) > 0 }) - 1
@@ -454,6 +458,27 @@ func (r *SSTableReader) Get(key []byte) (TableEntry, bool, error) {
 		}
 	}
 	return TableEntry{}, false, nil
+}
+
+// BloomMayContain exposes the reader's Bloom filter decision.
+func (r *SSTableReader) BloomMayContain(key []byte) bool {
+	if r == nil {
+		return false
+	}
+	return r.bloom.MayContain(key)
+}
+
+// BloomBitCount returns the Bloom filter bit width in the table's metadata.
+func (r *SSTableReader) BloomBitCount() uint64 {
+	if r == nil || r.bloom == nil {
+		return 0
+	}
+	return r.bloom.m
+}
+
+// BloomHashCount returns the configured Bloom probe count used by this build.
+func (r *SSTableReader) BloomHashCount() uint64 {
+	return uint64(bloomHashCount)
 }
 
 // AllEntries validates and returns every data record in key/strictly-
