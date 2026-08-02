@@ -35,3 +35,20 @@ func newRandStreams(seed int64, order []raft.NodeID) (delay *rand.Rand, perNode 
 	fault = rand.New(rand.NewSource(src.Int63()))
 	return delay, perNode, fault
 }
+
+// lsmRandSeed derives an independent deterministic stream for a node's LSM
+// skip list. It deliberately does not consume any existing Raft, network, or
+// fault stream, preserving map-engine simulation traces byte-for-byte.
+func lsmRandSeed(seed int64, id raft.NodeID) int64 {
+	mixed := uint64(seed) ^ (uint64(id) * 0x9e3779b97f4a7c15)
+	mixed ^= mixed >> 30
+	mixed *= 0xbf58476d1ce4e5b9
+	mixed ^= mixed >> 27
+	mixed *= 0x94d049bb133111eb
+	mixed ^= mixed >> 31
+	return int64(mixed)
+}
+
+func newSeededLSMRand(seed int64) *nodeRand {
+	return &nodeRand{r: rand.New(rand.NewSource(seed))}
+}

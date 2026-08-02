@@ -16,6 +16,29 @@ func TestPeerIDsAreSorted(t *testing.T) {
 	}
 }
 
+func TestParseEngine(t *testing.T) {
+	for _, test := range []struct {
+		value   string
+		want    string
+		wantErr bool
+	}{
+		{value: "map", want: "map"},
+		{value: "lsm", want: "lsm"},
+		{value: "", wantErr: true},
+		{value: "bad", wantErr: true},
+	} {
+		t.Run(test.value, func(t *testing.T) {
+			got, err := parseEngine(test.value)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("parseEngine(%q) error = %v, wantErr=%t", test.value, err, test.wantErr)
+			}
+			if got != test.want {
+				t.Fatalf("parseEngine(%q) = %q, want %q", test.value, got, test.want)
+			}
+		})
+	}
+}
+
 // fixedEntropy returns an entropy-read func that fills every requested byte
 // slice with a repeated pattern byte, so two calls with different patterns
 // are guaranteed (not merely overwhelmingly likely) to seed different PCG

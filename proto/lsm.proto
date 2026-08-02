@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package miniquorum;
+
+option go_package = "miniquorum/proto;raftpb";
+
+// AddedFile is the manifest metadata for one referenced SSTable.
+message AddedFile {
+  uint32 tier = 1;
+  string file = 2;
+  bytes min_key = 3;
+  bytes max_key = 4;
+  uint64 count = 5;
+}
+
+// VersionEdit is one atomic manifest operation. A flush or compaction records
+// every added file, every removed file, and its durability watermark in this
+// single protobuf payload before physical framing.
+message VersionEdit {
+  repeated AddedFile added_files = 1;
+  repeated string removed_files = 2;
+  uint64 flushed_index = 3;
+}

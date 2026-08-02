@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"miniquorum/internal/lsm"
 	"miniquorum/internal/raft"
 	"miniquorum/internal/statemachine"
 	raftpb "miniquorum/proto"
@@ -108,7 +109,24 @@ func (s *Sim) handleRestart(id raft.NodeID) {
 	}
 	s.replaceProcess(sn, raft.NewNode(sn.cfg, init, sn.rnd))
 	if sn.newStateMachine != nil {
-		sn.sm = sn.newStateMachine()
+		stateMachine, stateMachineErr := sn.newStateMachine()
+		if stateMachineErr != nil {
+			if errors.Is(stateMachineErr, lsm.ErrSimulatedCrash) {
+				s.handleLSMProcessCrash(sn, "node=%d lsm_reopen_crash %v", sn.id, stateMachineErr)
+				return
+			}
+			s.markProcessHalted(sn)
+			s.record("restart node=%d state_machine_error=%v fail-stop", id, stateMachineErr)
+			return
+		}
+		if replay, ok := stateMachine.(interface{ BeginReplay(uint64, uint64) error }); ok {
+			if replayErr := replay.BeginReplay(sn.storage.FirstIndex(), sn.storage.LastIndex()); replayErr != nil {
+				s.markProcessHalted(sn)
+				s.record("restart node=%d replay_lifecycle_error=%v fail-stop", id, replayErr)
+				return
+			}
+		}
+		sn.sm = stateMachine
 		sn.applied = nil
 		sn.results = nil
 		sn.lastApplied = 0
@@ -118,6 +136,12 @@ func (s *Sim) handleRestart(id raft.NodeID) {
 }
 
 func (s *Sim) markProcessCrashed(sn *simNode) {
+	if crashing, ok := sn.sm.(interface{ Crash() error }); ok {
+		if err := crashing.Crash(); err != nil {
+			s.record("crash node=%d state_machine_error=%v", sn.id, err)
+		}
+	}
+	sn.sm = nil
 	sn.node = nil
 	sn.halted = false
 	s.invalidateTickStream(sn)
@@ -192,6 +216,10 @@ func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 			var err error
 			result, err = sn.sm.Apply(&rd.CommittedEntries[i])
 			if err != nil {
+				if errors.Is(err, lsm.ErrSimulatedCrash) {
+					s.handleLSMProcessCrash(sn, "node=%d lsm_apply_crash index=%d %v", sn.id, rd.CommittedEntries[i].Index, err)
+					return
+				}
 				s.markProcessHalted(sn)
 				s.record("node=%d apply_error index=%d %v fail-stop", sn.id, rd.CommittedEntries[i].Index, err)
 				return
@@ -212,6 +240,57 @@ func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 	}
 	sn.node.Advance()
 	s.record("node=%d ready hardstate=%v msgs=%d committed=%d", sn.id, rd.HardState != nil, len(rd.Messages), len(rd.CommittedEntries))
+}
+
+// handleLSMProcessCrash is the common host boundary for a SimFS crash while
+// applying a committed entry or while reopening the LSM engine. Both cases
+// identify the fired policy from the final SimFS event and consume it exactly
+// once before scheduling the requested causal recovery.
+func (s *Sim) handleLSMProcessCrash(sn *simNode, format string, args ...any) {
+	s.markProcessCrashed(sn)
+	s.record(format, args...)
+	s.scheduleRestartAfterLSMCrash(sn.id)
+}
+
+func (s *Sim) scheduleRestartAfterLSMCrash(id raft.NodeID) {
+	key, ok := s.firedLSMCrashKey(id)
+	if !ok {
+		return
+	}
+	restart, ok := s.lsmRestartOnCrash[key]
+	if !ok {
+		return
+	}
+	delete(s.lsmRestartOnCrash, key)
+	if !restart {
+		return
+	}
+	s.pushAt(s.now, &event{kind: eventRestart, node: id})
+	s.record("node=%d lsm_restart_after_crash scheduled", id)
+}
+
+func (s *Sim) firedLSMCrashKey(id raft.NodeID) (lsmCrashDirectiveKey, bool) {
+	fs := s.lsmFS[id]
+	if fs == nil {
+		return lsmCrashDirectiveKey{}, false
+	}
+	events := fs.Events()
+	if len(events) == 0 {
+		return lsmCrashDirectiveKey{}, false
+	}
+	e := events[len(events)-1]
+	point := lsm.SimBeforeOperation
+	if e.Completed {
+		point = lsm.SimAfterOperation
+	}
+	// FSEvent supplies the operation, its per-op occurrence, and whether the
+	// effect completed, so this exact policy key is derived from crash evidence
+	// rather than inferred from schedule order or a node-global counter.
+	key := lsmCrashDirectiveKey{node: id, op: e.Op, occurrence: e.Occurrence, point: point}
+	if _, ok := s.lsmRestartOnCrash[key]; ok {
+		return key, true
+	}
+	return lsmCrashDirectiveKey{}, false
 }
 
 // recordCrashFiring appends the structured record of a storage crash that

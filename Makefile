@@ -1,7 +1,7 @@
-.PHONY: proto proto-check test boundary sim sim-500 sim-crash-500 corpus lint real-smoke real-crash sim-1k sim-10k negative-control
+.PHONY: proto proto-check test boundary sim sim-500 sim-crash-500 corpus lint real-smoke real-crash sim-1k sim-10k negative-control bench-smoke bench-collect bench-validate bench-graphs bench-report
 
 proto:
-	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative proto/raft.proto proto/kv.proto
+	protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative proto/raft.proto proto/kv.proto proto/lsm.proto
 
 proto-check:
 	@tmp=$$(mktemp -d); \
@@ -80,3 +80,38 @@ real-smoke:
 # verify every acknowledged write survives.
 real-crash:
 	go test -race -tags=integration ./cmd/miniquorumd -run '^TestRealLeaderSIGKILLDuringMQCTLLoopLosesNoAckedWrite$$' -count=1 -v
+
+BENCH_RAW ?= bench/results/report-v1.json
+BENCH_GRAPH_DIR ?= docs/benchmarks
+
+bench-smoke:
+	@tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	go run ./cmd/lsmbench collect -profile smoke-v1 -out "$$tmp/raw.json"; \
+	go run ./cmd/lsmbench validate -in "$$tmp/raw.json"; \
+	go run ./cmd/lsmbench graph -in "$$tmp/raw.json" -out-dir "$$tmp/graphs"; \
+	for artifact in "$$tmp/raw.json" "$$tmp/graphs/write-throughput.svg" "$$tmp/graphs/point-read-latency.svg" "$$tmp/graphs/bloom-false-positive.svg" "$$tmp/graphs/amplification.svg" "$$tmp/graphs/compaction-pause.svg" "$$tmp/graphs/skiplist-height.svg"; do \
+		if [ ! -s "$$artifact" ]; then \
+			echo "bench-smoke: missing or empty $$artifact"; \
+			exit 1; \
+		fi; \
+	done; \
+	echo "bench-smoke raw: $$tmp/raw.json"; \
+	echo "raw.json: $$(sha256sum "$$tmp/raw.json" | awk '{print $$1}')"; \
+	for svg in write-throughput.svg point-read-latency.svg bloom-false-positive.svg amplification.svg compaction-pause.svg skiplist-height.svg; do \
+		echo "$${svg}: $$(sha256sum "$$tmp/graphs/$$svg" | awk '{print $$1}')"; \
+	done
+
+bench-collect:
+	go run ./cmd/lsmbench collect -profile report-v1 -out "$(BENCH_RAW)"
+
+bench-validate:
+	go run ./cmd/lsmbench validate -in "$(BENCH_RAW)"
+
+bench-graphs:
+	go run ./cmd/lsmbench graph -in "$(BENCH_RAW)" -out-dir "$(BENCH_GRAPH_DIR)"
+
+bench-report:
+	$(MAKE) bench-collect
+	$(MAKE) bench-validate
+	$(MAKE) bench-graphs

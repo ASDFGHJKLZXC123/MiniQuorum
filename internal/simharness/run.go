@@ -55,7 +55,14 @@ func DefaultNodeIDs() []raft.NodeID {
 // RunConfig identifies one replay. A nil Schedule uses the current versioned
 // generator. An explicit schedule is replayed as-is and is never regenerated.
 type RunConfig struct {
-	Seed              int64
+	Seed int64
+	// Engine is map (the default) or lsm. It selects the simulator's
+	// StateMachine implementation without changing schedules, histories, or
+	// checker semantics.
+	Engine string
+	// LSMFlushThreshold configures the LSM's active-memtable flush seam when
+	// Engine is lsm. Zero selects lsm.DefaultFlushThreshold.
+	LSMFlushThreshold int64
 	Schedule          *sim.FaultSchedule
 	Duration          sim.VirtualTime
 	FaultHorizon      sim.VirtualTime
@@ -68,9 +75,11 @@ type RunConfig struct {
 // Summary is deterministic evidence collected from one run. It deliberately
 // excludes wall-clock elapsed time so replays serialize byte-for-byte.
 type Summary struct {
-	ArtifactVersion int   `json:"artifact_version"`
-	Seed            int64 `json:"seed"`
-	ScheduleVersion int   `json:"schedule_version"`
+	ArtifactVersion   int    `json:"artifact_version"`
+	Seed              int64  `json:"seed"`
+	Engine            string `json:"engine"`
+	LSMFlushThreshold int64  `json:"lsm_flush_threshold"`
+	ScheduleVersion   int    `json:"schedule_version"`
 	// CheckerRan distinguishes "Porcupine accepted the history" from "the run
 	// aborted (for example on a simulator invariant) before the checker could
 	// run": Linearizable is meaningful only when CheckerRan is true.
@@ -96,11 +105,13 @@ type Summary struct {
 // Result retains the exact deterministic inputs and outputs needed for replay
 // diagnostics. Batch callers aggregate Summary and discard the larger fields.
 type Result struct {
-	Seed     int64
-	Schedule sim.FaultSchedule
-	History  checker.History
-	Trace    []string
-	Summary  Summary
+	Seed              int64
+	Engine            string
+	LSMFlushThreshold int64
+	Schedule          sim.FaultSchedule
+	History           checker.History
+	Trace             []string
+	Summary           Summary
 }
 
 // RunSeed executes one complete full-fault/full-workload replay. It advances
@@ -109,16 +120,28 @@ type Result struct {
 // still driven synchronously from one scheduler thread.
 func RunSeed(config RunConfig) (Result, error) {
 	config = normalizeRunConfig(config)
+	if config.Engine == "" {
+		config.Engine = "map"
+	}
 	schedule, err := scheduleFor(config)
 	if err != nil {
-		return Result{}, err
+		return baseResult(config, sim.FaultSchedule{}), err
+	}
+	base := baseResult(config, schedule)
+	if config.LSMFlushThreshold < 0 {
+		return base, fmt.Errorf("seed %d: negative LSM flush threshold %d", config.Seed, config.LSMFlushThreshold)
+	}
+	if config.Engine == "map" && config.LSMFlushThreshold != 0 {
+		return base, fmt.Errorf("seed %d: LSM flush threshold requires engine lsm", config.Seed)
 	}
 	s, err := sim.NewFaultSim(sim.Config{
-		Seed:    config.Seed,
-		NodeIDs: append([]raft.NodeID(nil), defaultNodeIDs...),
+		Seed:              config.Seed,
+		Engine:            config.Engine,
+		LSMFlushThreshold: config.LSMFlushThreshold,
+		NodeIDs:           append([]raft.NodeID(nil), defaultNodeIDs...),
 	}, schedule)
 	if err != nil {
-		return Result{}, fmt.Errorf("seed %d: build fault sim: %w", config.Seed, err)
+		return base, fmt.Errorf("seed %d: build fault sim: %w", config.Seed, err)
 	}
 	s.RegisterInvariant(sim.SingleLeaderPerTerm)
 	if err := s.StartWorkload(workloadpkg.Config{
@@ -129,12 +152,12 @@ func RunSeed(config RunConfig) (Result, error) {
 		RetryDelay:          workloadpkg.DefaultRetryDelay,
 		ThinkTime:           config.ThinkTime,
 	}); err != nil {
-		return Result{}, fmt.Errorf("seed %d: start workload: %w", config.Seed, err)
+		return base, fmt.Errorf("seed %d: start workload: %w", config.Seed, err)
 	}
 
 	for through := config.RetryScanInterval; through <= config.Duration; through += config.RetryScanInterval {
 		if err := s.Run(through); err != nil {
-			result := collectResult(config.Seed, schedule, s)
+			result := collectResult(config.Seed, config.Engine, config.LSMFlushThreshold, schedule, s)
 			return result, fmt.Errorf("seed %d: simulator invariant: %w", config.Seed, err)
 		}
 		if through == config.Duration {
@@ -145,7 +168,7 @@ func RunSeed(config RunConfig) (Result, error) {
 				continue
 			}
 			if err := s.ScheduleWorkloadRetry(client.ClientID, s.Now()+1); err != nil {
-				result := collectResult(config.Seed, schedule, s)
+				result := collectResult(config.Seed, config.Engine, config.LSMFlushThreshold, schedule, s)
 				return result, fmt.Errorf("seed %d: schedule retry for client %d: %w", config.Seed, client.ClientID, err)
 			}
 		}
@@ -153,12 +176,12 @@ func RunSeed(config RunConfig) (Result, error) {
 	// Duration need not be divisible by the retry scan interval.
 	if s.Now() < config.Duration {
 		if err := s.Run(config.Duration); err != nil {
-			result := collectResult(config.Seed, schedule, s)
+			result := collectResult(config.Seed, config.Engine, config.LSMFlushThreshold, schedule, s)
 			return result, fmt.Errorf("seed %d: simulator invariant: %w", config.Seed, err)
 		}
 	}
 
-	result := collectResult(config.Seed, schedule, s)
+	result := collectResult(config.Seed, config.Engine, config.LSMFlushThreshold, schedule, s)
 	result.Summary.CheckerRan = true
 	result.Summary.Linearizable = checker.Check(result.History)
 	result.Summary.AntiVacuityFailure = antiVacuityFailure(result.Summary)
@@ -204,21 +227,34 @@ func scheduleFor(config RunConfig) (sim.FaultSchedule, error) {
 	return sim.GenerateFaultSchedule(config.Seed, defaultNodeIDs, config.FaultHorizon)
 }
 
-func collectResult(seed int64, schedule sim.FaultSchedule, s *sim.Sim) Result {
+func baseResult(config RunConfig, schedule sim.FaultSchedule) Result {
+	return Result{
+		Seed:              config.Seed,
+		Engine:            config.Engine,
+		LSMFlushThreshold: config.LSMFlushThreshold,
+		Schedule:          schedule,
+		Summary: Summary{
+			ArtifactVersion:   ArtifactVersion,
+			Seed:              config.Seed,
+			Engine:            config.Engine,
+			LSMFlushThreshold: config.LSMFlushThreshold,
+			ScheduleVersion:   schedule.Version,
+			OperationCounts:   make(map[string]int),
+			FaultEventCounts:  make(map[string]int),
+			CrashPointCounts:  make(map[string]int),
+		},
+	}
+}
+
+func collectResult(seed int64, engine string, lsmFlushThreshold int64, schedule sim.FaultSchedule, s *sim.Sim) Result {
 	history := s.WorkloadHistory()
 	trace := s.Trace()
-	summary := Summary{
-		ArtifactVersion:      ArtifactVersion,
-		Seed:                 seed,
-		ScheduleVersion:      schedule.Version,
-		LogicalOperations:    len(history),
-		Attempts:             len(s.WorkloadAttempts()),
-		OperationCounts:      make(map[string]int),
-		FaultEventCounts:     make(map[string]int),
-		CrashPointCounts:     make(map[string]int),
-		FinalVirtualTime:     int64(s.Now()),
-		WorkloadReportedDone: s.WorkloadDone(),
-	}
+	result := baseResult(RunConfig{Seed: seed, Engine: engine, LSMFlushThreshold: lsmFlushThreshold}, schedule)
+	summary := result.Summary
+	summary.LogicalOperations = len(history)
+	summary.Attempts = len(s.WorkloadAttempts())
+	summary.FinalVirtualTime = int64(s.Now())
+	summary.WorkloadReportedDone = s.WorkloadDone()
 	for _, operation := range history {
 		summary.OperationCounts[operation.Input.Op.String()]++
 		if operation.ReturnTime == nil {
@@ -261,7 +297,10 @@ func collectResult(seed int64, schedule sim.FaultSchedule, s *sim.Sim) Result {
 			summary.NetworkDuplicates++
 		}
 	}
-	return Result{Seed: seed, Schedule: schedule, History: history, Trace: trace, Summary: summary}
+	result.History = history
+	result.Trace = trace
+	result.Summary = summary
+	return result
 }
 
 // neutralFaultEvent reports whether a schedule event restores the neutral

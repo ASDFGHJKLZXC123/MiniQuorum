@@ -40,6 +40,8 @@ jobs:
         run: make sim-1k
       - name: Committed corpus replay gate
         run: make corpus
+      - name: Committed corpus replay gate (LSM)
+        run: go test ./internal/simharness -run '^TestCommittedCorpusSchedulesReplayCleanlyLSM$' -count=1 -timeout 40m
       - name: Upload failure artifacts (seed, schedule, history, visualization)
         if: failure()
         uses: actions/upload-artifact@v4
