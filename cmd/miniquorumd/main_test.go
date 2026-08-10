@@ -39,6 +39,39 @@ func TestParseEngine(t *testing.T) {
 	}
 }
 
+func TestParseReadMode(t *testing.T) {
+	for _, test := range []struct {
+		value   string
+		want    string
+		wantErr bool
+	}{
+		{value: "log", want: "log"},
+		{value: "readindex", want: "readindex"},
+		{value: "", wantErr: true},
+		{value: "lease", wantErr: true},
+	} {
+		t.Run(test.value, func(t *testing.T) {
+			got, err := parseReadMode(test.value)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("parseReadMode(%q) error = %v, wantErr=%t", test.value, err, test.wantErr)
+			}
+			if string(got) != test.want {
+				t.Fatalf("parseReadMode(%q) = %q, want %q", test.value, got, test.want)
+			}
+		})
+	}
+}
+
+func TestDaemonPhase6DefaultReadModeIsReadIndex(t *testing.T) {
+	mode, err := parseReadMode(defaultReadMode)
+	if err != nil {
+		t.Fatalf("parseReadMode(defaultReadMode) error = %v", err)
+	}
+	if string(mode) != "readindex" {
+		t.Fatalf("daemon default reads = %q, want readindex", mode)
+	}
+}
+
 // fixedEntropy returns an entropy-read func that fills every requested byte
 // slice with a repeated pattern byte, so two calls with different patterns
 // are guaranteed (not merely overwhelmingly likely) to seed different PCG

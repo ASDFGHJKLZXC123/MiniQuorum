@@ -16,6 +16,11 @@ import (
 )
 
 const (
+	// ArtifactVersion stays at v1 for additive replay provenance such as
+	// engine, flush threshold, and read mode: v1 JSON readers ignore unknown
+	// fields, while the schedule/history/checker payloads retain their original
+	// meaning. Bump this only for an incompatible artifact layout; committed
+	// corpus manifests are independently versioned by CorpusArtifactVersion.
 	ArtifactVersion = 1
 
 	DefaultDuration          = sim.VirtualTime(12_000)
@@ -60,6 +65,9 @@ type RunConfig struct {
 	// StateMachine implementation without changing schedules, histories, or
 	// checker semantics.
 	Engine string
+	// Reads selects log or readindex GETs. Empty selects the canonical Phase-6
+	// harness default, readindex; log remains the explicit A/B baseline.
+	Reads sim.ReadMode
 	// LSMFlushThreshold configures the LSM's active-memtable flush seam when
 	// Engine is lsm. Zero selects lsm.DefaultFlushThreshold.
 	LSMFlushThreshold int64
@@ -78,6 +86,7 @@ type Summary struct {
 	ArtifactVersion   int    `json:"artifact_version"`
 	Seed              int64  `json:"seed"`
 	Engine            string `json:"engine"`
+	Reads             string `json:"reads"`
 	LSMFlushThreshold int64  `json:"lsm_flush_threshold"`
 	ScheduleVersion   int    `json:"schedule_version"`
 	// CheckerRan distinguishes "Porcupine accepted the history" from "the run
@@ -107,6 +116,7 @@ type Summary struct {
 type Result struct {
 	Seed              int64
 	Engine            string
+	Reads             sim.ReadMode
 	LSMFlushThreshold int64
 	Schedule          sim.FaultSchedule
 	History           checker.History
@@ -123,6 +133,9 @@ func RunSeed(config RunConfig) (Result, error) {
 	if config.Engine == "" {
 		config.Engine = "map"
 	}
+	if config.Reads == "" {
+		config.Reads = sim.ReadModeReadIndex
+	}
 	schedule, err := scheduleFor(config)
 	if err != nil {
 		return baseResult(config, sim.FaultSchedule{}), err
@@ -137,6 +150,7 @@ func RunSeed(config RunConfig) (Result, error) {
 	s, err := sim.NewFaultSim(sim.Config{
 		Seed:              config.Seed,
 		Engine:            config.Engine,
+		Reads:             config.Reads,
 		LSMFlushThreshold: config.LSMFlushThreshold,
 		NodeIDs:           append([]raft.NodeID(nil), defaultNodeIDs...),
 	}, schedule)
@@ -157,7 +171,7 @@ func RunSeed(config RunConfig) (Result, error) {
 
 	for through := config.RetryScanInterval; through <= config.Duration; through += config.RetryScanInterval {
 		if err := s.Run(through); err != nil {
-			result := collectResult(config.Seed, config.Engine, config.LSMFlushThreshold, schedule, s)
+			result := collectResult(config.Seed, config.Engine, config.Reads, config.LSMFlushThreshold, schedule, s)
 			return result, fmt.Errorf("seed %d: simulator invariant: %w", config.Seed, err)
 		}
 		if through == config.Duration {
@@ -168,7 +182,7 @@ func RunSeed(config RunConfig) (Result, error) {
 				continue
 			}
 			if err := s.ScheduleWorkloadRetry(client.ClientID, s.Now()+1); err != nil {
-				result := collectResult(config.Seed, config.Engine, config.LSMFlushThreshold, schedule, s)
+				result := collectResult(config.Seed, config.Engine, config.Reads, config.LSMFlushThreshold, schedule, s)
 				return result, fmt.Errorf("seed %d: schedule retry for client %d: %w", config.Seed, client.ClientID, err)
 			}
 		}
@@ -176,12 +190,12 @@ func RunSeed(config RunConfig) (Result, error) {
 	// Duration need not be divisible by the retry scan interval.
 	if s.Now() < config.Duration {
 		if err := s.Run(config.Duration); err != nil {
-			result := collectResult(config.Seed, config.Engine, config.LSMFlushThreshold, schedule, s)
+			result := collectResult(config.Seed, config.Engine, config.Reads, config.LSMFlushThreshold, schedule, s)
 			return result, fmt.Errorf("seed %d: simulator invariant: %w", config.Seed, err)
 		}
 	}
 
-	result := collectResult(config.Seed, config.Engine, config.LSMFlushThreshold, schedule, s)
+	result := collectResult(config.Seed, config.Engine, config.Reads, config.LSMFlushThreshold, schedule, s)
 	result.Summary.CheckerRan = true
 	result.Summary.Linearizable = checker.Check(result.History)
 	result.Summary.AntiVacuityFailure = antiVacuityFailure(result.Summary)
@@ -195,6 +209,9 @@ func RunSeed(config RunConfig) (Result, error) {
 }
 
 func normalizeRunConfig(config RunConfig) RunConfig {
+	if config.Reads == "" {
+		config.Reads = sim.ReadModeReadIndex
+	}
 	if config.Duration == 0 {
 		config.Duration = DefaultDuration
 	}
@@ -231,12 +248,14 @@ func baseResult(config RunConfig, schedule sim.FaultSchedule) Result {
 	return Result{
 		Seed:              config.Seed,
 		Engine:            config.Engine,
+		Reads:             config.Reads,
 		LSMFlushThreshold: config.LSMFlushThreshold,
 		Schedule:          schedule,
 		Summary: Summary{
 			ArtifactVersion:   ArtifactVersion,
 			Seed:              config.Seed,
 			Engine:            config.Engine,
+			Reads:             string(config.Reads),
 			LSMFlushThreshold: config.LSMFlushThreshold,
 			ScheduleVersion:   schedule.Version,
 			OperationCounts:   make(map[string]int),
@@ -246,10 +265,10 @@ func baseResult(config RunConfig, schedule sim.FaultSchedule) Result {
 	}
 }
 
-func collectResult(seed int64, engine string, lsmFlushThreshold int64, schedule sim.FaultSchedule, s *sim.Sim) Result {
+func collectResult(seed int64, engine string, reads sim.ReadMode, lsmFlushThreshold int64, schedule sim.FaultSchedule, s *sim.Sim) Result {
 	history := s.WorkloadHistory()
 	trace := s.Trace()
-	result := baseResult(RunConfig{Seed: seed, Engine: engine, LSMFlushThreshold: lsmFlushThreshold}, schedule)
+	result := baseResult(RunConfig{Seed: seed, Engine: engine, Reads: reads, LSMFlushThreshold: lsmFlushThreshold}, schedule)
 	summary := result.Summary
 	summary.LogicalOperations = len(history)
 	summary.Attempts = len(s.WorkloadAttempts())

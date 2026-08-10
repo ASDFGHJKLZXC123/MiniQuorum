@@ -5,6 +5,8 @@ package simharness
 import (
 	"bytes"
 	"testing"
+
+	"miniquorum/sim"
 )
 
 // TestPinnedNegativeControlSchedulePassesOrdinaryBuild is the positive half
@@ -28,7 +30,7 @@ func TestPinnedNegativeControlSchedulePassesOrdinaryBuild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := RunSeed(RunConfig{Seed: pinned.Seed, Schedule: &schedule})
+	result, err := RunSeed(RunConfig{Seed: pinned.Seed, Reads: sim.ReadModeLog, Schedule: &schedule})
 	if err != nil {
 		t.Fatalf("ordinary build failed the pinned schedule (seed %d): %v", pinned.Seed, err)
 	}
@@ -51,7 +53,7 @@ func TestPinnedNegativeControlSchedulePassesOrdinaryBuild(t *testing.T) {
 
 	// Determinism: the ordinary replay of the pin is byte-identical too, so
 	// the pinned pair is a stable regression artifact for Phase 5 onward.
-	again, err := RunSeed(RunConfig{Seed: pinned.Seed, Schedule: &schedule})
+	again, err := RunSeed(RunConfig{Seed: pinned.Seed, Reads: sim.ReadModeLog, Schedule: &schedule})
 	if err != nil {
 		t.Fatalf("second ordinary replay of the pinned schedule failed: %v", err)
 	}

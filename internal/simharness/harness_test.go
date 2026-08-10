@@ -37,6 +37,52 @@ func TestRunSeedExplicitScheduleReplaysByteIdentically(t *testing.T) {
 	assertArtifactsByteIdentical(t, generated, explicit)
 }
 
+func TestHarnessReadModeSelectorDrivesBothGETPathsWithUnchangedLogicalInputs(t *testing.T) {
+	if got := normalizeRunConfig(RunConfig{}).Reads; got != sim.ReadModeReadIndex {
+		t.Fatalf("Phase-6 harness default reads = %q, want readindex", got)
+	}
+	readIndex := mustRunSeed(t, RunConfig{Seed: 7, Reads: sim.ReadModeReadIndex})
+	logReads := mustRunSeed(t, RunConfig{Seed: 7, Reads: sim.ReadModeLog})
+	for mode, result := range map[sim.ReadMode]Result{
+		sim.ReadModeReadIndex: readIndex,
+		sim.ReadModeLog:       logReads,
+	} {
+		if result.Reads != mode || result.Summary.Reads != string(mode) {
+			t.Fatalf("%s provenance = result:%q summary:%q", mode, result.Reads, result.Summary.Reads)
+		}
+		if !result.Summary.CheckerRan || !result.Summary.Linearizable || !checker.Check(result.History) {
+			t.Fatalf("%s history lost checker semantics: %+v", mode, result.Summary)
+		}
+	}
+	if harnessTraceContains(logReads.Trace, " readindex_request") {
+		t.Fatal("harness log selector entered ReadIndex path")
+	}
+	if !harnessTraceContains(readIndex.Trace, " readindex_request") ||
+		!harnessTraceContains(readIndex.Trace, " readindex_serve") {
+		t.Fatal("harness readindex selector did not reach request and direct-serve trace points")
+	}
+	if got, want := logicalInputsBySession(readIndex.History), logicalInputsBySession(logReads.History); !reflect.DeepEqual(got, want) {
+		t.Fatalf("A/B selector changed the seed's logical command history:\nreadindex=%#v\nlog=%#v", got, want)
+	}
+}
+
+func harnessTraceContains(trace []string, fragment string) bool {
+	for _, line := range trace {
+		if strings.Contains(line, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func logicalInputsBySession(history checker.History) map[[2]uint64]checker.Input {
+	inputs := make(map[[2]uint64]checker.Input, len(history))
+	for _, operation := range history {
+		inputs[[2]uint64{operation.ClientID, operation.Seq}] = operation.Input
+	}
+	return inputs
+}
+
 // TestRunSeedAntiVacuityEvidenceAcrossSampleSeeds is the interleaving-sanity
 // canary, asserted programmatically on a sample of ordinary seeds: histories
 // must overlap across at least two clients, faults must fire during in-flight

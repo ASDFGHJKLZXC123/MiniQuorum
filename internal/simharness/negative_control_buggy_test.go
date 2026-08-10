@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"miniquorum/sim"
 )
 
 // TestPinnedNegativeControlScheduleFailsPorcupineUnderBuggyTag is the phase-4
@@ -44,7 +46,7 @@ func TestPinnedNegativeControlScheduleFailsPorcupineUnderBuggyTag(t *testing.T) 
 	}
 
 	replay := func() map[string][]byte {
-		result, runErr := RunSeed(RunConfig{Seed: pinned.Seed, Schedule: &schedule})
+		result, runErr := RunSeed(RunConfig{Seed: pinned.Seed, Reads: sim.ReadModeLog, Schedule: &schedule})
 		if runErr == nil {
 			t.Fatalf("buggy build passed the pinned schedule (seed %d); the negative control is broken", pinned.Seed)
 		}

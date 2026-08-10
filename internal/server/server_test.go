@@ -64,6 +64,55 @@ func TestProcessReadyApplyFailureIsFailStopAndSkipsAdvance(t *testing.T) {
 	}
 }
 
+func TestProcessReadyDeliversReadStatesAfterApplyBeforeAdvance(t *testing.T) {
+	events := make([]string, 0, 5)
+	node := &testNode{events: &events, ready: raft.Ready{
+		Messages:         []*raftpb.Message{{To: 2}},
+		CommittedEntries: []raftpb.Entry{{Index: 4}},
+		ReadStates:       []raft.ReadState{{Ctx: []byte("r"), Index: 4}},
+	}}
+	applier := &testApplier{events: &events}
+	if err := processReady(node, &testStorage{events: &events}, &testTransport{events: &events}, applier); err != nil {
+		t.Fatalf("processReady() error: %v", err)
+	}
+	if want := []string{"save", "send:2", "apply:4", "read:r", "advance"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("events = %v, want %v", events, want)
+	}
+}
+
+func TestProcessReadySaveFailureDoesNotDeliverReadStates(t *testing.T) {
+	events := make([]string, 0, 1)
+	wantErr := errors.New("save failed")
+	node := &testNode{events: &events, ready: raft.Ready{
+		ReadStates: []raft.ReadState{{Ctx: []byte("must-not-escape"), Index: 4}},
+	}}
+	err := processReady(node, &testStorage{events: &events, err: wantErr}, noopTransport{}, &testApplier{events: &events})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("processReady() error = %v, want wrapped %v", err, wantErr)
+	}
+	if want := []string{"save"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("events = %v, want %v", events, want)
+	}
+}
+
+func TestProcessReadyApplyFailureDoesNotDeliverReadStatesOrAdvance(t *testing.T) {
+	events := make([]string, 0, 5)
+	wantErr := errors.New("apply failed before read delivery")
+	node := &testNode{events: &events, ready: raft.Ready{
+		Messages:         []*raftpb.Message{{To: 2}},
+		CommittedEntries: []raftpb.Entry{{Index: 4}, {Index: 5}},
+		ReadStates:       []raft.ReadState{{Ctx: []byte("must-wait-for-apply"), Index: 5}},
+	}}
+	applier := &testApplier{events: &events, failIndex: 5, err: wantErr}
+	err := processReady(node, &testStorage{events: &events}, &testTransport{events: &events}, applier)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("processReady() error = %v, want wrapped %v", err, wantErr)
+	}
+	if want := []string{"save", "send:2", "apply:4", "apply:5"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("events = %v, want %v (no read delivery or Advance)", events, want)
+	}
+}
+
 type testNode struct {
 	events *[]string
 	ready  raft.Ready
@@ -106,6 +155,10 @@ func (a *testApplier) Apply(entry *raftpb.Entry) error {
 		return a.err
 	}
 	return nil
+}
+
+func (a *testApplier) HandleReadState(state raft.ReadState) {
+	*a.events = append(*a.events, "read:"+string(state.Ctx))
 }
 
 func toString(id raft.NodeID) string { return strconv.FormatUint(uint64(id), 10) }

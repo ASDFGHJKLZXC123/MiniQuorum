@@ -25,6 +25,7 @@ type BatchConfig struct {
 type Aggregate struct {
 	ArtifactVersion     int    `json:"artifact_version"`
 	Engine              string `json:"engine"`
+	Reads               string `json:"reads"`
 	LSMFlushThreshold   int64  `json:"lsm_flush_threshold"`
 	StartSeed           int64  `json:"start_seed"`
 	Count               int    `json:"count"`
@@ -102,9 +103,14 @@ func RunBatch(config BatchConfig) Aggregate {
 	if engine == "" {
 		engine = "map"
 	}
+	reads := config.Run.Reads
+	if reads == "" {
+		reads = sim.ReadModeReadIndex
+	}
 	aggregate := Aggregate{
 		ArtifactVersion:   ArtifactVersion,
 		Engine:            engine,
+		Reads:             string(reads),
 		LSMFlushThreshold: config.Run.LSMFlushThreshold,
 		StartSeed:         config.StartSeed,
 		Count:             config.Count,

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"miniquorum/internal/simharness"
+	"miniquorum/sim"
 )
 
 func main() {
@@ -18,6 +19,7 @@ func main() {
 	count := flag.Int("count", 1000, "number of consecutive seeds")
 	workers := flag.Int("workers", 0, "bounded parallel workers (default: GOMAXPROCS)")
 	engine := flag.String("engine", "map", "state-machine engine: map or lsm")
+	reads := flag.String("reads", "readindex", "read path: log or readindex")
 	lsmFlushThreshold := flag.Int64("lsm-flush-threshold", 0, "LSM flush threshold (0 uses the default; lsm engine only)")
 	failureOut := flag.String("failure-out", "sim-artifacts/batch-failure", "artifact directory for the first failing seed")
 	flag.Parse()
@@ -27,6 +29,11 @@ func main() {
 	}
 	if *engine != "map" && *engine != "lsm" {
 		fmt.Fprintf(os.Stderr, "simrun: invalid -engine %q (want map or lsm)\n", *engine)
+		os.Exit(2)
+	}
+	readMode, err := sim.ParseReadMode(*reads)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "simrun: invalid -reads %q (want log or readindex)\n", *reads)
 		os.Exit(2)
 	}
 	if *lsmFlushThreshold < 0 {
@@ -43,7 +50,7 @@ func main() {
 		StartSeed: *start,
 		Count:     *count,
 		Workers:   *workers,
-		Run:       simharness.RunConfig{Engine: *engine, LSMFlushThreshold: *lsmFlushThreshold},
+		Run:       simharness.RunConfig{Engine: *engine, Reads: readMode, LSMFlushThreshold: *lsmFlushThreshold},
 	})
 	elapsed := time.Since(started)
 	data, err := json.MarshalIndent(aggregate, "", "  ")
@@ -61,7 +68,7 @@ func main() {
 		artifactSeed = aggregate.FirstViolationSeed
 	}
 	if artifactSeed != nil {
-		result, _ := simharness.RunSeed(simharness.RunConfig{Seed: *artifactSeed, Engine: *engine, LSMFlushThreshold: *lsmFlushThreshold})
+		result, _ := simharness.RunSeed(simharness.RunConfig{Seed: *artifactSeed, Engine: *engine, Reads: readMode, LSMFlushThreshold: *lsmFlushThreshold})
 		directory := filepath.Join(*failureOut, fmt.Sprintf("seed-%d", *artifactSeed))
 		if err := simharness.WriteArtifacts(directory, result); err != nil {
 			fmt.Fprintf(os.Stderr, "simrun: write failure artifacts: %v\n", err)

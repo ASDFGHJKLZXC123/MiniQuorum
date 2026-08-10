@@ -1,7 +1,9 @@
 package sim
 
 import (
+	"encoding/binary"
 	"fmt"
+	"sort"
 
 	"google.golang.org/protobuf/proto"
 
@@ -28,11 +30,25 @@ type pendingWorkloadAttempt struct {
 	term       uint64
 }
 
+type pendingWorkloadRead struct {
+	node       raft.NodeID
+	submission workloadpkg.Submission
+	token      []byte
+	confirmed  bool
+	index      uint64
+}
+
 type simWorkload struct {
 	runner *workloadpkg.Runner
 
-	pending   map[workloadApplyKey][]pendingWorkloadAttempt
-	byAttempt map[workloadpkg.AttemptID]workloadApplyKey
+	pending       map[workloadApplyKey][]pendingWorkloadAttempt
+	byAttempt     map[workloadpkg.AttemptID]workloadApplyKey
+	pendingReads  map[string]*pendingWorkloadRead
+	readByAttempt map[workloadpkg.AttemptID]string
+	// deferredReadCancels preserves client timeout order while a target process
+	// is paused. A frozen process cannot execute Node.CancelRead; Resume flushes
+	// these tokens synchronously before the node handles later activity.
+	deferredReadCancels map[raft.NodeID][][]byte
 }
 
 // StartWorkload installs fresh per-node state machines selected by Config's
@@ -66,9 +82,12 @@ func (s *Sim) StartWorkload(config workloadpkg.Config) error {
 		return fmt.Errorf("sim: unsupported engine %q", s.engine)
 	}
 	s.workload = &simWorkload{
-		runner:    runner,
-		pending:   make(map[workloadApplyKey][]pendingWorkloadAttempt),
-		byAttempt: make(map[workloadpkg.AttemptID]workloadApplyKey),
+		runner:              runner,
+		pending:             make(map[workloadApplyKey][]pendingWorkloadAttempt),
+		byAttempt:           make(map[workloadpkg.AttemptID]workloadApplyKey),
+		pendingReads:        make(map[string]*pendingWorkloadRead),
+		readByAttempt:       make(map[workloadpkg.AttemptID]string),
+		deferredReadCancels: make(map[raft.NodeID][][]byte),
 	}
 	if err := runner.Start(workloadHost{sim: s}); err != nil {
 		return err
@@ -196,11 +215,14 @@ func (h workloadHost) Schedule(at int64, workloadEvent workloadpkg.Event) {
 }
 
 func (h workloadHost) Submit(submission workloadpkg.Submission) (workloadpkg.SubmitStatus, error) {
+	target := raft.NodeID(submission.Target)
+	if submission.Command.GetOp() == raftpb.Op_GET && h.sim.reads == ReadModeReadIndex {
+		return h.sim.submitWorkloadRead(target, submission)
+	}
 	data, err := proto.Marshal(submission.Command)
 	if err != nil {
 		return workloadpkg.SubmitNotLeader, fmt.Errorf("sim: marshal workload command: %w", err)
 	}
-	target := raft.NodeID(submission.Target)
 	_, _, isLeader := h.sim.propose(target, data, func(index, term uint64) {
 		h.sim.registerWorkloadAttempt(target, index, term, submission)
 	})
@@ -210,6 +232,38 @@ func (h workloadHost) Submit(submission workloadpkg.Submission) (workloadpkg.Sub
 	}
 	h.sim.record("workload client=%d seq=%d attempt=%d target=%d accepted", submission.AttemptID.ClientID, submission.AttemptID.Seq, submission.AttemptID.Attempt, target)
 	return workloadpkg.SubmitAccepted, nil
+}
+
+func (s *Sim) submitWorkloadRead(target raft.NodeID, submission workloadpkg.Submission) (workloadpkg.SubmitStatus, error) {
+	sn, ok := s.nodes[target]
+	if !ok || sn.node == nil || sn.halted || sn.paused {
+		s.record("workload client=%d seq=%d attempt=%d target=%d readindex_reject(unavailable)", submission.AttemptID.ClientID, submission.AttemptID.Seq, submission.AttemptID.Attempt, target)
+		return workloadpkg.SubmitNotLeader, nil
+	}
+	token := workloadReadToken(target, submission.AttemptID)
+	id := string(token)
+	if _, exists := s.workload.pendingReads[id]; exists {
+		return workloadpkg.SubmitNotLeader, fmt.Errorf("sim: duplicate ReadIndex token for attempt %+v", submission.AttemptID)
+	}
+	s.workload.pendingReads[id] = &pendingWorkloadRead{
+		node:       target,
+		submission: submission,
+		token:      token,
+	}
+	s.workload.readByAttempt[submission.AttemptID] = id
+	s.record("workload client=%d seq=%d attempt=%d target=%d readindex_request", submission.AttemptID.ClientID, submission.AttemptID.Seq, submission.AttemptID.Attempt, target)
+	sn.node.RequestRead(token)
+	s.processReady(sn, sn.node.Ready())
+	return workloadpkg.SubmitAccepted, nil
+}
+
+func workloadReadToken(node raft.NodeID, attempt workloadpkg.AttemptID) []byte {
+	token := make([]byte, 32)
+	binary.BigEndian.PutUint64(token[0:8], uint64(node))
+	binary.BigEndian.PutUint64(token[8:16], attempt.ClientID)
+	binary.BigEndian.PutUint64(token[16:24], attempt.Seq)
+	binary.BigEndian.PutUint64(token[24:32], attempt.Attempt)
+	return token
 }
 
 func (h workloadHost) Cancel(attempt workloadpkg.AttemptID) {
@@ -227,6 +281,24 @@ func (s *Sim) registerWorkloadAttempt(node raft.NodeID, index, term uint64, subm
 }
 
 func (s *Sim) cancelWorkloadAttempt(attempt workloadpkg.AttemptID) {
+	if tokenID, ok := s.workload.readByAttempt[attempt]; ok {
+		pending := s.workload.pendingReads[tokenID]
+		delete(s.workload.readByAttempt, attempt)
+		delete(s.workload.pendingReads, tokenID)
+		if pending != nil {
+			if sn := s.nodes[pending.node]; sn != nil && sn.node != nil && !sn.halted {
+				if sn.paused {
+					s.workload.deferredReadCancels[pending.node] = append(
+						s.workload.deferredReadCancels[pending.node], append([]byte(nil), pending.token...))
+				} else {
+					sn.node.CancelRead(pending.token)
+					s.processReady(sn, sn.node.Ready())
+				}
+			}
+		}
+		s.record("workload client=%d seq=%d attempt=%d cancel(timeout readindex)", attempt.ClientID, attempt.Seq, attempt.Attempt)
+		return
+	}
 	key, ok := s.workload.byAttempt[attempt]
 	if !ok {
 		return
@@ -245,6 +317,94 @@ func (s *Sim) cancelWorkloadAttempt(attempt workloadpkg.AttemptID) {
 		s.workload.pending[key] = kept
 	}
 	s.record("workload client=%d seq=%d attempt=%d cancel(timeout)", attempt.ClientID, attempt.Seq, attempt.Attempt)
+}
+
+func (s *Sim) flushDeferredWorkloadReadCancels(sn *simNode) {
+	if s.workload == nil || sn == nil {
+		return
+	}
+	tokens := s.workload.deferredReadCancels[sn.id]
+	delete(s.workload.deferredReadCancels, sn.id)
+	if len(tokens) == 0 || sn.node == nil || sn.halted || sn.paused {
+		return
+	}
+	for _, token := range tokens {
+		sn.node.CancelRead(token)
+	}
+	s.processReady(sn, sn.node.Ready())
+	s.record("workload node=%d readindex_cancel_flush count=%d", sn.id, len(tokens))
+}
+
+func (s *Sim) discardDeferredWorkloadReadCancels(node raft.NodeID) {
+	if s.workload != nil {
+		delete(s.workload.deferredReadCancels, node)
+	}
+}
+
+func (s *Sim) observeWorkloadReadState(node raft.NodeID, state raft.ReadState) {
+	if s.workload == nil {
+		return
+	}
+	id := string(state.Ctx)
+	pending, ok := s.workload.pendingReads[id]
+	if !ok || pending.node != node {
+		return
+	}
+	if state.Canceled {
+		s.removePendingWorkloadRead(id, pending)
+		s.record("workload client=%d seq=%d attempt=%d target=%d readindex_canceled rejected=%t", pending.submission.AttemptID.ClientID, pending.submission.AttemptID.Seq, pending.submission.AttemptID.Attempt, node, state.Rejected)
+		s.scheduleWorkloadReadResult(pending, workloadpkg.EventLeadershipLost, checker.Output{})
+		return
+	}
+	pending.confirmed = true
+	pending.index = state.Index
+	s.record("workload client=%d seq=%d attempt=%d target=%d readindex_confirm index=%d", pending.submission.AttemptID.ClientID, pending.submission.AttemptID.Seq, pending.submission.AttemptID.Attempt, node, state.Index)
+}
+
+func (s *Sim) fulfillConfirmedWorkloadReads(sn *simNode) {
+	if s.workload == nil || sn == nil || sn.sm == nil {
+		return
+	}
+	for _, id := range sortedPendingReadIDs(s.workload.pendingReads) {
+		pending := s.workload.pendingReads[id]
+		if pending == nil || pending.node != sn.id || !pending.confirmed || pending.index > sn.lastApplied {
+			continue
+		}
+		result, err := sn.sm.Read(pending.submission.Command.GetKey())
+		s.removePendingWorkloadRead(id, pending)
+		if err != nil {
+			s.record("workload client=%d seq=%d attempt=%d target=%d readindex_read_error=%v", pending.submission.AttemptID.ClientID, pending.submission.AttemptID.Seq, pending.submission.AttemptID.Attempt, sn.id, err)
+			s.scheduleWorkloadReadResult(pending, workloadpkg.EventLeadershipLost, checker.Output{})
+			continue
+		}
+		s.record("workload client=%d seq=%d attempt=%d target=%d readindex_serve index=%d", pending.submission.AttemptID.ClientID, pending.submission.AttemptID.Seq, pending.submission.AttemptID.Attempt, sn.id, pending.index)
+		s.scheduleWorkloadReadResult(pending, workloadpkg.EventApplied, successfulWorkloadOutput(result))
+	}
+}
+
+func sortedPendingReadIDs(pending map[string]*pendingWorkloadRead) []string {
+	ids := make([]string, 0, len(pending))
+	for id := range pending {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func (s *Sim) removePendingWorkloadRead(id string, pending *pendingWorkloadRead) {
+	delete(s.workload.pendingReads, id)
+	delete(s.workload.readByAttempt, pending.submission.AttemptID)
+}
+
+func (s *Sim) scheduleWorkloadReadResult(pending *pendingWorkloadRead, kind workloadpkg.EventKind, output checker.Output) {
+	s.pushAt(s.now, &event{
+		kind: eventWorkload,
+		workload: &workloadEvent{event: workloadpkg.Event{
+			Kind:      kind,
+			AttemptID: pending.submission.AttemptID,
+			Output:    output,
+		}},
+	})
 }
 
 func (s *Sim) observeWorkloadApply(node raft.NodeID, entry *raftpb.Entry, result statemachine.Result) {

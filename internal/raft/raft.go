@@ -2,6 +2,7 @@
 package raft
 
 import (
+	"bytes"
 	"sort"
 
 	raftpb "miniquorum/proto"
@@ -49,6 +50,18 @@ type Ready struct {
 	Entries          []raftpb.Entry
 	Messages         []*raftpb.Message
 	CommittedEntries []raftpb.Entry
+	ReadStates       []ReadState
+}
+
+// ReadState is the asynchronous result of one RequestRead token. Ctx is an
+// owned copy. Canceled explicitly distinguishes an unconfirmed result from a
+// confirmed Index. Rejected identifies an immediate non-leader rejection;
+// other cancellations are retryable leadership-loss/exhaustion outcomes.
+type ReadState struct {
+	Ctx      []byte
+	Index    uint64
+	Canceled bool
+	Rejected bool
 }
 
 type role uint8
@@ -67,6 +80,15 @@ type appendInflight struct {
 	hasEntries   bool
 }
 
+type readConfirmation struct {
+	round    uint64
+	term     uint64
+	index    uint64
+	contexts [][]byte
+	acks     map[NodeID]struct{}
+	expected map[NodeID]uint64
+}
+
 type readyAck struct {
 	valid        bool
 	hardState    bool
@@ -76,6 +98,7 @@ type readyAck struct {
 	stableTo     uint64
 	committed    bool
 	appliedTo    uint64
+	readStates   int
 }
 
 // Node is a deterministic, synchronous Raft state machine.
@@ -100,6 +123,11 @@ type Node struct {
 	nextIndex  map[NodeID]uint64
 	matchIndex map[NodeID]uint64
 	inflight   map[NodeID]*appendInflight
+
+	pendingReads  [][]byte
+	activeRead    *readConfirmation
+	nextReadRound uint64
+	readStates    []ReadState
 
 	hardStateDirty bool
 	messages       []*raftpb.Message
@@ -187,9 +215,46 @@ func (n *Node) Propose(data []byte) (index, term uint64, isLeader bool) {
 	return index, n.hardState.Term, true
 }
 
+// RequestRead asynchronously requests a quorum-confirmed read index for ctx.
+// The token is copied on entry and its result is emitted through Ready.
+func (n *Node) RequestRead(ctx []byte) {
+	owned := append([]byte(nil), ctx...)
+	if n.role != leader {
+		n.readStates = append(n.readStates, ReadState{Ctx: owned, Canceled: true, Rejected: true})
+		return
+	}
+	n.pendingReads = append(n.pendingReads, owned)
+}
+
+// CancelRead synchronously forgets every queued or active read carrying ctx.
+// It is the local-caller cancellation path: unlike leadership loss it
+// deliberately emits no ReadState, because the caller has already stopped
+// waiting. A result already placed in readStates is immutable Ready output and
+// remains pending until Advance; removing it could make Advance consume a
+// later, never-delivered result from the same slice prefix. The comparison is
+// by token contents so callers need not retain the core-owned copy made by
+// RequestRead.
+func (n *Node) CancelRead(ctx []byte) bool {
+	canceled := false
+	if n.activeRead != nil {
+		n.activeRead.contexts, canceled = removeReadContexts(n.activeRead.contexts, ctx)
+		if len(n.activeRead.contexts) == 0 {
+			n.activeRead = nil
+		}
+	}
+	var removed bool
+	n.pendingReads, removed = removeReadContexts(n.pendingReads, ctx)
+	canceled = canceled || removed
+	if canceled {
+		n.maybeStartReadRound()
+	}
+	return canceled
+}
+
 // Ready reports pending output without discarding it.
 func (n *Node) Ready() Ready {
-	ready := Ready{Messages: n.messages}
+	n.maybeStartReadRound()
+	ready := Ready{Messages: n.messages, ReadStates: cloneReadStates(n.readStates)}
 	if n.hardStateDirty {
 		hardState := n.hardState
 		ready.HardState = &hardState
@@ -227,11 +292,17 @@ func (n *Node) Advance() {
 	if ack.committed && ack.appliedTo > n.lastApplied {
 		n.lastApplied = ack.appliedTo
 	}
+	if ack.readStates >= len(n.readStates) {
+		n.readStates = nil
+	} else if ack.readStates > 0 {
+		n.readStates = n.readStates[ack.readStates:]
+	}
 	n.readyAck = readyAck{}
 }
 
 func (n *Node) readyWithoutCapture() Ready {
-	ready := Ready{Messages: n.messages}
+	n.maybeStartReadRound()
+	ready := Ready{Messages: n.messages, ReadStates: cloneReadStates(n.readStates)}
 	if n.hardStateDirty {
 		hardState := n.hardState
 		ready.HardState = &hardState
@@ -253,6 +324,7 @@ func (n *Node) captureReady(ready Ready) {
 		messageCount: len(ready.Messages),
 		entries:      len(ready.Entries) > 0,
 		committed:    len(ready.CommittedEntries) > 0,
+		readStates:   len(ready.ReadStates),
 	}
 	if ready.HardState != nil {
 		ack.hard = *ready.HardState
@@ -314,6 +386,7 @@ func (n *Node) startElection() {
 }
 
 func (n *Node) becomeFollower(term uint64) {
+	n.cancelPendingReads()
 	if term != n.hardState.Term {
 		n.hardState.Term = term
 		n.hardState.VotedFor = 0
@@ -329,6 +402,7 @@ func (n *Node) becomeFollower(term uint64) {
 }
 
 func (n *Node) becomeFollowerSameTerm() {
+	n.cancelPendingReads()
 	n.role = follower
 	n.heartbeatElapsed = 0
 	n.votes = nil
@@ -403,11 +477,11 @@ func (n *Node) handleAppendEntries(m *raftpb.Message, req *raftpb.AppendEntriesR
 	n.electionElapsed = 0
 	requestLastIndex, valid := appendRequestLastIndex(req)
 	if !valid {
-		n.sendAppendEntriesResponse(NodeID(m.From), false, 0)
+		n.sendAppendEntriesResponse(NodeID(m.From), false, 0, req.ReadRound)
 		return
 	}
 	if !n.log.matches(req.PrevLogIndex, req.PrevLogTerm) {
-		n.sendAppendEntriesResponse(NodeID(m.From), false, 0)
+		n.sendAppendEntriesResponse(NodeID(m.From), false, 0, req.ReadRound)
 		return
 	}
 	if changed := n.log.appendFromLeader(req.Entries); changed != 0 && changed < n.unstableIndex {
@@ -416,12 +490,16 @@ func (n *Node) handleAppendEntries(m *raftpb.Message, req *raftpb.AppendEntriesR
 	if req.LeaderCommit > n.commitIndex {
 		n.commitIndex = min(req.LeaderCommit, requestLastIndex)
 	}
-	n.sendAppendEntriesResponse(NodeID(m.From), true, requestLastIndex)
+	n.sendAppendEntriesResponse(NodeID(m.From), true, requestLastIndex, req.ReadRound)
 }
 
 func (n *Node) handleAppendEntriesResponse(m *raftpb.Message, resp *raftpb.AppendEntriesResp) {
 	peer := NodeID(m.From)
 	if n.role != leader || !n.isPeer(peer) || peer == n.config.ID {
+		return
+	}
+	if resp.ReadRound != 0 {
+		n.handleReadRoundResponse(peer, resp)
 		return
 	}
 	pending := n.inflight[peer]
@@ -445,6 +523,7 @@ func (n *Node) handleAppendEntriesResponse(m *raftpb.Message, resp *raftpb.Appen
 		}
 		n.nextIndex[peer] = n.matchIndex[peer] + 1
 		commitAdvanced := n.advanceCommit()
+		n.maybeStartReadRound()
 		if n.nextIndex[peer] <= n.log.lastIndex() || commitAdvanced {
 			n.sendAppend(peer, false)
 		}
@@ -467,7 +546,7 @@ func (n *Node) rejectLowerTermRequest(m *raftpb.Message) {
 	case m.GetRequestVote() != nil:
 		n.sendRequestVoteResponse(NodeID(m.From), false)
 	case m.GetAppendEntries() != nil:
-		n.sendAppendEntriesResponse(NodeID(m.From), false, 0)
+		n.sendAppendEntriesResponse(NodeID(m.From), false, 0, m.GetAppendEntries().GetReadRound())
 	}
 }
 
@@ -483,7 +562,7 @@ func (n *Node) sendRequestVoteResponse(to NodeID, granted bool) {
 	})
 }
 
-func (n *Node) sendAppendEntriesResponse(to NodeID, success bool, matchIndex uint64) {
+func (n *Node) sendAppendEntriesResponse(to NodeID, success bool, matchIndex, readRound uint64) {
 	n.messages = append(n.messages, &raftpb.Message{
 		From: uint64(n.config.ID),
 		To:   uint64(to),
@@ -492,6 +571,7 @@ func (n *Node) sendAppendEntriesResponse(to NodeID, success bool, matchIndex uin
 			Term:       n.hardState.Term,
 			Success:    success,
 			MatchIndex: matchIndex,
+			ReadRound:  readRound,
 		}},
 	})
 }
@@ -511,6 +591,149 @@ func appendRequestLastIndex(req *raftpb.AppendEntriesReq) (uint64, bool) {
 
 func (n *Node) sendHeartbeats() {
 	n.broadcastAppend(false)
+	n.sendReadHeartbeats()
+}
+
+func (n *Node) maybeStartReadRound() {
+	if n.role != leader || n.activeRead != nil || len(n.pendingReads) == 0 ||
+		!n.hasCommittedCurrentTermEntry() {
+		return
+	}
+	// Never reuse a round identity: a delayed equal-index response must remain
+	// distinguishable forever. Exhaustion is practically unreachable, but an
+	// explicit retryable cancellation is safer than uint64 wraparound.
+	if n.nextReadRound == ^uint64(0) {
+		for _, ctx := range n.pendingReads {
+			n.readStates = append(n.readStates, ReadState{Ctx: ctx, Canceled: true})
+		}
+		n.pendingReads = nil
+		return
+	}
+	n.nextReadRound++
+	n.activeRead = &readConfirmation{
+		round:    n.nextReadRound,
+		term:     n.hardState.Term,
+		index:    n.commitIndex,
+		contexts: n.pendingReads,
+		acks:     map[NodeID]struct{}{n.config.ID: {}},
+		expected: make(map[NodeID]uint64, len(n.peers)-1),
+	}
+	n.pendingReads = nil
+	if len(n.activeRead.acks) >= len(n.peers)/2+1 {
+		n.confirmActiveRead()
+		return
+	}
+	n.sendReadHeartbeats()
+}
+
+func (n *Node) hasCommittedCurrentTermEntry() bool {
+	term, ok := n.log.term(n.commitIndex)
+	return ok && term == n.hardState.Term
+}
+
+func (n *Node) sendReadHeartbeats() {
+	if n.role != leader || n.activeRead == nil {
+		return
+	}
+	for _, peer := range n.peers {
+		if peer == n.config.ID {
+			continue
+		}
+		prevIndex := n.matchIndex[peer]
+		if pending := n.inflight[peer]; pending != nil && pending.prevIndex > prevIndex {
+			prevIndex = pending.prevIndex
+		}
+		if prevIndex < n.log.snapshot.Index {
+			prevIndex = n.log.snapshot.Index
+		}
+		prevTerm, ok := n.log.term(prevIndex)
+		if !ok {
+			continue
+		}
+		n.activeRead.expected[peer] = prevIndex
+		n.messages = append(n.messages, &raftpb.Message{
+			From: uint64(n.config.ID),
+			To:   uint64(peer),
+			Term: n.hardState.Term,
+			Body: &raftpb.Message_AppendEntries{AppendEntries: &raftpb.AppendEntriesReq{
+				Term:         n.hardState.Term,
+				LeaderId:     uint64(n.config.ID),
+				PrevLogIndex: prevIndex,
+				PrevLogTerm:  prevTerm,
+				LeaderCommit: n.commitIndex,
+				ReadRound:    n.activeRead.round,
+			}},
+		})
+	}
+}
+
+func (n *Node) handleReadRoundResponse(peer NodeID, resp *raftpb.AppendEntriesResp) {
+	active := n.activeRead
+	if active == nil || resp.ReadRound != active.round || resp.Term != active.term ||
+		n.hardState.Term != active.term || !resp.Success {
+		return
+	}
+	expected, ok := active.expected[peer]
+	if !ok || resp.MatchIndex != expected {
+		return
+	}
+	active.acks[peer] = struct{}{}
+	if len(active.acks) >= len(n.peers)/2+1 {
+		n.confirmActiveRead()
+	}
+}
+
+func (n *Node) confirmActiveRead() {
+	active := n.activeRead
+	if active == nil {
+		return
+	}
+	for _, ctx := range active.contexts {
+		n.readStates = append(n.readStates, ReadState{Ctx: ctx, Index: active.index})
+	}
+	n.activeRead = nil
+	n.maybeStartReadRound()
+}
+
+func (n *Node) cancelPendingReads() {
+	if n.activeRead != nil {
+		for _, ctx := range n.activeRead.contexts {
+			n.readStates = append(n.readStates, ReadState{Ctx: ctx, Canceled: true})
+		}
+		n.activeRead = nil
+	}
+	for _, ctx := range n.pendingReads {
+		n.readStates = append(n.readStates, ReadState{Ctx: ctx, Canceled: true})
+	}
+	n.pendingReads = nil
+}
+
+func cloneReadStates(states []ReadState) []ReadState {
+	if len(states) == 0 {
+		return nil
+	}
+	cloned := make([]ReadState, len(states))
+	for i := range states {
+		cloned[i] = states[i]
+		cloned[i].Ctx = append([]byte(nil), states[i].Ctx...)
+	}
+	return cloned
+}
+
+func removeReadContexts(contexts [][]byte, target []byte) ([][]byte, bool) {
+	kept := contexts[:0]
+	removed := false
+	for _, ctx := range contexts {
+		if bytes.Equal(ctx, target) {
+			removed = true
+			continue
+		}
+		kept = append(kept, ctx)
+	}
+	for i := len(kept); i < len(contexts); i++ {
+		contexts[i] = nil
+	}
+	return kept, removed
 }
 
 func (n *Node) appendLocal(typ raftpb.EntryType, data []byte) uint64 {

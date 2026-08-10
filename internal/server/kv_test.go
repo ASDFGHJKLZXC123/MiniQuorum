@@ -76,6 +76,38 @@ func TestKVApplierNOOPAdvancesIndexWithoutTouchingAnyWaiter(t *testing.T) {
 	}
 }
 
+func TestKVApplierReadStateWaitsUntilAppliedIndex(t *testing.T) {
+	applier := NewKVApplier(mapsm.New())
+	token, ch := applier.registerRead()
+	applier.HandleReadState(raft.ReadState{Ctx: token, Index: 2})
+	select {
+	case outcome := <-ch:
+		t.Fatalf("read released at applied index 0: %+v", outcome)
+	default:
+	}
+
+	if err := applier.Apply(&raftpb.Entry{Index: 1, Term: 1, Type: raftpb.EntryType_NOOP}); err != nil {
+		t.Fatalf("Apply(NOOP@1) error = %v", err)
+	}
+	select {
+	case outcome := <-ch:
+		t.Fatalf("read released at applied index 1: %+v", outcome)
+	default:
+	}
+
+	if err := applier.Apply(&raftpb.Entry{Index: 2, Term: 1, Type: raftpb.EntryType_NOOP}); err != nil {
+		t.Fatalf("Apply(NOOP@2) error = %v", err)
+	}
+	select {
+	case outcome := <-ch:
+		if outcome.index != 2 || outcome.canceled || outcome.rejected || outcome.err != nil {
+			t.Fatalf("applied-index outcome = %+v, want confirmed index 2", outcome)
+		}
+	default:
+		t.Fatal("read still blocked after applied index reached confirmation index")
+	}
+}
+
 // TestKVApplierResolvesEveryWaiterAtACommittedIndexRegardlessOfRegistrationOrder
 // is the adversarial case byIndex used to lose: two waiters registered at the
 // same index for different terms (this node proposed at (5,3), lost and
@@ -309,6 +341,188 @@ func TestKVServiceExecutePutThenGetGoesThroughApply(t *testing.T) {
 	}
 }
 
+func TestKVServiceReadIndexReadsDirectlyWithoutAppendingGET(t *testing.T) {
+	store := storage.NewMemStorage()
+	sm := &countingReadSM{StateMachine: mapsm.New()}
+	applier := NewKVApplier(sm)
+	node := raft.NewNode(raft.Config{ID: 1, Peers: []raft.NodeID{1}, ElectionTickMin: 1, ElectionTickMax: 2}, raft.InitialState{}, fixedTestRand{})
+	host := &Host{Node: node, Storage: store, Transport: noopTransport{}, Applier: applier, SelfID: 1}
+	if err := host.Tick(); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+
+	logService := NewKVService(host, applier, map[raft.NodeID]string{1: "n1:1"})
+	if resp, err := logService.Execute(context.Background(), &raftpb.ExecuteRequest{Cmd: &raftpb.Command{
+		ClientId: 7, Seq: 1, Op: raftpb.Op_PUT, Key: []byte("k"), Value: []byte("v"),
+	}}); err != nil || !resp.GetOk() {
+		t.Fatalf("Execute(PUT) = (%+v,%v), want success", resp, err)
+	}
+	before := store.LastIndex()
+
+	readService := NewKVServiceWithReadMode(host, applier, map[raft.NodeID]string{1: "n1:1"}, ReadModeReadIndex)
+	resp, err := readService.Execute(context.Background(), &raftpb.ExecuteRequest{Cmd: &raftpb.Command{
+		ClientId: 7, Seq: 2, Op: raftpb.Op_GET, Key: []byte("k"),
+	}})
+	if err != nil {
+		t.Fatalf("Execute(ReadIndex GET) error = %v", err)
+	}
+	if !resp.GetOk() || !resp.GetFound() || string(resp.GetValue()) != "v" || resp.GetNotLeader() != nil {
+		t.Fatalf("Execute(ReadIndex GET) = %+v, want direct value v", resp)
+	}
+	if after := store.LastIndex(); after != before {
+		t.Fatalf("ReadIndex GET changed Raft last index from %d to %d", before, after)
+	}
+	if got := sm.readCount(); got != 1 {
+		t.Fatalf("StateMachine.Read calls = %d, want 1", got)
+	}
+}
+
+func TestNewKVServiceKeepsProgrammaticLogReadCompatibilityDefault(t *testing.T) {
+	svc := NewKVService(nil, nil, nil)
+	if svc.reads != ReadModeLog {
+		t.Fatalf("NewKVService read mode = %q, want explicit compatibility default log", svc.reads)
+	}
+}
+
+func TestKVServiceReadIndexFollowerStillRedirects(t *testing.T) {
+	node := raft.NewNode(raft.Config{ID: 3, Peers: []raft.NodeID{1, 2, 3}}, raft.InitialState{}, fixedTestRand{})
+	host := &Host{Node: node, Storage: storage.NewMemStorage(), Transport: noopTransport{}, SelfID: 3}
+	applier := NewKVApplier(mapsm.New())
+	host.Applier = applier
+	peers := map[raft.NodeID]string{1: "n1:1", 2: "n2:1", 3: "n3:1"}
+	svc := NewKVServiceWithReadMode(host, applier, peers, ReadModeReadIndex)
+
+	if err := host.Step(&raftpb.Message{
+		From: 2, To: 3, Term: 5,
+		Body: &raftpb.Message_AppendEntries{AppendEntries: &raftpb.AppendEntriesReq{Term: 5, LeaderId: 2}},
+	}); err != nil {
+		t.Fatalf("Step() error = %v", err)
+	}
+	resp, err := svc.Execute(context.Background(), &raftpb.ExecuteRequest{Cmd: &raftpb.Command{Op: raftpb.Op_GET, Key: []byte("k")}})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if hint := resp.GetNotLeader(); hint == nil || hint.GetLeaderId() != 2 || hint.GetLeaderAddr() != "n2:1" {
+		t.Fatalf("ReadIndex follower response = %+v, want node-2 redirect", resp)
+	}
+}
+
+func TestKVServiceReadIndexStepDownReturnsRetryableError(t *testing.T) {
+	transport := newReadCaptureTransport()
+	applier := NewKVApplier(mapsm.New())
+	node := raft.NewNode(raft.Config{ID: 1, Peers: []raft.NodeID{1, 2, 3}, ElectionTickMin: 1, ElectionTickMax: 2}, raft.InitialState{}, fixedTestRand{})
+	host := &Host{Node: node, Storage: storage.NewMemStorage(), Transport: transport, Applier: applier, SelfID: 1}
+	if err := host.Tick(); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if err := host.Step(&raftpb.Message{
+		From: 2, To: 1, Term: 1,
+		Body: &raftpb.Message_RequestVoteResp{RequestVoteResp: &raftpb.RequestVoteResp{Term: 1, VoteGranted: true}},
+	}); err != nil {
+		t.Fatalf("Step(vote) error = %v", err)
+	}
+	if err := host.Step(ackAppend(2, 1, 0)); err != nil {
+		t.Fatalf("Step(probe ack) error = %v", err)
+	}
+	if err := host.Step(ackAppend(2, 1, 1)); err != nil {
+		t.Fatalf("Step(NOOP ack) error = %v", err)
+	}
+
+	svc := NewKVServiceWithReadMode(host, applier, map[raft.NodeID]string{1: "n1:1", 2: "n2:1", 3: "n3:1"}, ReadModeReadIndex)
+	done := executeAsync(svc, &raftpb.Command{Op: raftpb.Op_GET, Key: []byte("k")})
+	transport.waitForReadRound(t)
+	if err := host.Step(&raftpb.Message{
+		From: 2, To: 1, Term: 2,
+		Body: &raftpb.Message_RequestVote{RequestVote: &raftpb.RequestVoteReq{
+			Term: 2, CandidateId: 2, LastLogIndex: 1, LastLogTerm: 1,
+		}},
+	}); err != nil {
+		t.Fatalf("Step(higher-term vote) error = %v", err)
+	}
+	result := awaitExecute(t, done)
+	if status.Code(result.err) != codes.Unavailable {
+		t.Fatalf("Execute after step-down = (%+v,%v), want retryable Unavailable", result.resp, result.err)
+	}
+}
+
+func TestKVServiceContextCancellationRemovesQueuedAndActiveReadTokens(t *testing.T) {
+	transport := newReadCaptureTransport()
+	applier := NewKVApplier(mapsm.New())
+	node := raft.NewNode(raft.Config{ID: 1, Peers: []raft.NodeID{1, 2, 3}, ElectionTickMin: 1, ElectionTickMax: 2}, raft.InitialState{}, fixedTestRand{})
+	host := &Host{Node: node, Storage: storage.NewMemStorage(), Transport: transport, Applier: applier, SelfID: 1}
+	if err := host.Tick(); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if err := host.Step(&raftpb.Message{
+		From: 2, To: 1, Term: 1,
+		Body: &raftpb.Message_RequestVoteResp{RequestVoteResp: &raftpb.RequestVoteResp{Term: 1, VoteGranted: true}},
+	}); err != nil {
+		t.Fatalf("Step(vote) error = %v", err)
+	}
+	if err := host.Step(ackAppend(2, 1, 0)); err != nil {
+		t.Fatalf("Step(probe ack) error = %v", err)
+	}
+	if err := host.Step(ackAppend(2, 1, 1)); err != nil {
+		t.Fatalf("Step(NOOP ack) error = %v", err)
+	}
+
+	svc := NewKVServiceWithReadMode(host, applier, map[raft.NodeID]string{1: "n1:1", 2: "n2:1", 3: "n3:1"}, ReadModeReadIndex)
+	activeCtx, cancelActive := context.WithCancel(context.Background())
+	queuedCtx, cancelQueued := context.WithCancel(context.Background())
+	activeDone := executeWithContextAsync(activeCtx, svc, &raftpb.Command{Op: raftpb.Op_GET, Key: []byte("active")})
+	transport.waitForReadRound(t)
+	// waitForReadRound can observe follower 2's send while RequestRead is still
+	// sending follower 3's message. LeaderHint is a Host.mu barrier; drain only
+	// after it returns so both messages from the original round are consumed.
+	_, _ = host.LeaderHint()
+	transport.drainReadRounds()
+	queuedDone := executeWithContextAsync(queuedCtx, svc, &raftpb.Command{Op: raftpb.Op_GET, Key: []byte("queued")})
+	waitForReadWaiterCount(t, applier, 2)
+
+	// Cancel the token still queued behind the in-flight round first, then the
+	// active token. Each Execute returns only after KVService has synchronously
+	// called through Host.CancelRead into Node.CancelRead.
+	cancelQueued()
+	if result := awaitExecute(t, queuedDone); status.Code(result.err) != codes.Canceled {
+		t.Fatalf("queued canceled Execute = (%+v,%v), want Canceled", result.resp, result.err)
+	}
+	cancelActive()
+	if result := awaitExecute(t, activeDone); status.Code(result.err) != codes.Canceled {
+		t.Fatalf("active canceled Execute = (%+v,%v), want Canceled", result.resp, result.err)
+	}
+	assertNoStrandedReadWaiters(t, applier)
+
+	// A heartbeat interval would retry an active read. The capture channel was
+	// drained by waitForReadRound, so any new signal proves a retained token.
+	if err := host.Tick(); err != nil {
+		t.Fatalf("Tick(1) error = %v", err)
+	}
+	if err := host.Tick(); err != nil {
+		t.Fatalf("Tick(2) error = %v", err)
+	}
+	select {
+	case <-transport.rounds:
+		t.Fatal("context-canceled ReadIndex token was retained and retried")
+	default:
+	}
+}
+
+func TestKVServiceReadIndexSaveFailureIsFailStopAndLeavesNoWaiter(t *testing.T) {
+	store := &failAfterNSavesStorage{inner: storage.NewMemStorage(), okSaves: 1, err: errors.New("read save boom")}
+	applier := NewKVApplier(mapsm.New())
+	host := singleNodeLeaderHost(t, store, applier)
+	svc := NewKVServiceWithReadMode(host, applier, map[raft.NodeID]string{1: "n1:1"}, ReadModeReadIndex)
+
+	resp, err := svc.Execute(context.Background(), &raftpb.ExecuteRequest{Cmd: &raftpb.Command{Op: raftpb.Op_GET, Key: []byte("k")}})
+	if status.Code(err) != codes.Unavailable || resp != nil {
+		t.Fatalf("Execute on read Ready Save failure = (%+v,%v), want nil/Unavailable", resp, err)
+	}
+	assertNoStrandedReadWaiters(t, applier)
+	if tickErr := host.Tick(); !errors.Is(tickErr, host.stopped) || tickErr == nil {
+		t.Fatalf("Tick() after read fail-stop = %v, want same fail-stop error", tickErr)
+	}
+}
+
 // --- KVService: waiter cleanup on a fail-stopping Propose -------------------
 //
 // packet 2C correction: Execute registers a waiter before the Ready
@@ -382,6 +596,15 @@ func assertNoStrandedWaiters(t *testing.T, applier *KVApplier) {
 	}
 	if len(applier.byIndex) != 0 {
 		t.Fatalf("byIndex not cleaned up after a fail-stopping Propose: %v", applier.byIndex)
+	}
+}
+
+func assertNoStrandedReadWaiters(t *testing.T, applier *KVApplier) {
+	t.Helper()
+	applier.mu.Lock()
+	defer applier.mu.Unlock()
+	if len(applier.readWaiters) != 0 {
+		t.Fatalf("read waiters not fully drained: %v", applier.readWaiters)
 	}
 }
 
@@ -468,6 +691,28 @@ func TestKVApplierFailStopDrainsEveryWaiterExactlyOnce(t *testing.T) {
 			t.Fatalf("waiter %s delivered a second outcome: %+v", name, outcome)
 		default:
 		}
+	}
+}
+
+func TestKVApplierFailStopDrainsReadWaiterExactlyOnce(t *testing.T) {
+	applier := NewKVApplier(mapsm.New())
+	_, ch := applier.registerRead()
+	wantErr := errors.New("read fail-stop")
+	applier.FailStop(wantErr)
+	select {
+	case outcome := <-ch:
+		if !errors.Is(outcome.err, wantErr) {
+			t.Fatalf("read outcome.err = %v, want %v", outcome.err, wantErr)
+		}
+	default:
+		t.Fatal("read waiter left unresolved by FailStop")
+	}
+	assertNoStrandedReadWaiters(t, applier)
+	applier.FailStop(wantErr)
+	select {
+	case outcome := <-ch:
+		t.Fatalf("read waiter delivered twice: %+v", outcome)
+	default:
 	}
 }
 
@@ -595,6 +840,15 @@ func executeAsync(svc *KVService, cmd *raftpb.Command) <-chan executeResult {
 	return done
 }
 
+func executeWithContextAsync(ctx context.Context, svc *KVService, cmd *raftpb.Command) <-chan executeResult {
+	done := make(chan executeResult, 1)
+	go func() {
+		resp, err := svc.Execute(ctx, &raftpb.ExecuteRequest{Cmd: cmd})
+		done <- executeResult{resp: resp, err: err}
+	}()
+	return done
+}
+
 func awaitExecute(t *testing.T, done <-chan executeResult) executeResult {
 	t.Helper()
 	select {
@@ -621,6 +875,23 @@ func waitForWaiterCount(t *testing.T, applier *KVApplier, want int) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("waiters = %d, want %d before deadline", got, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitForReadWaiterCount(t *testing.T, applier *KVApplier, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		applier.mu.Lock()
+		got := len(applier.readWaiters)
+		applier.mu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("read waiters = %d, want %d before deadline", got, want)
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -754,3 +1025,61 @@ func (s *countingErrStorage) Entries(uint64, uint64) ([]raftpb.Entry, error) {
 }
 func (s *countingErrStorage) FirstIndex() uint64 { return 1 }
 func (s *countingErrStorage) LastIndex() uint64  { return 0 }
+
+type countingReadSM struct {
+	statemachine.StateMachine
+
+	mu    sync.Mutex
+	reads int
+}
+
+func (s *countingReadSM) Read(key []byte) (statemachine.Result, error) {
+	s.mu.Lock()
+	s.reads++
+	s.mu.Unlock()
+	return s.StateMachine.Read(key)
+}
+
+func (s *countingReadSM) readCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reads
+}
+
+type readCaptureTransport struct {
+	rounds chan struct{}
+}
+
+func newReadCaptureTransport() *readCaptureTransport {
+	return &readCaptureTransport{rounds: make(chan struct{}, 1)}
+}
+
+func (t *readCaptureTransport) Send(_ raft.NodeID, message *raftpb.Message) {
+	request := message.GetAppendEntries()
+	if request == nil || request.GetReadRound() == 0 {
+		return
+	}
+	select {
+	case t.rounds <- struct{}{}:
+	default:
+	}
+}
+
+func (t *readCaptureTransport) waitForReadRound(testingT *testing.T) {
+	testingT.Helper()
+	select {
+	case <-t.rounds:
+	case <-time.After(5 * time.Second):
+		testingT.Fatal("ReadIndex heartbeat round was never sent")
+	}
+}
+
+func (t *readCaptureTransport) drainReadRounds() {
+	for {
+		select {
+		case <-t.rounds:
+		default:
+			return
+		}
+	}
+}

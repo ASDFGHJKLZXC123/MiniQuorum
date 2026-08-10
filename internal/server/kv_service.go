@@ -21,7 +21,16 @@ type KVService struct {
 	host    *Host
 	applier *KVApplier
 	peers   map[raft.NodeID]string
+	reads   ReadMode
 }
+
+// ReadMode selects the GET implementation. Writes always use the Raft log.
+type ReadMode string
+
+const (
+	ReadModeLog       ReadMode = "log"
+	ReadModeReadIndex ReadMode = "readindex"
+)
 
 var _ raftpb.KVServer = (*KVService)(nil)
 
@@ -29,20 +38,30 @@ var _ raftpb.KVServer = (*KVService)(nil)
 // (including this node) to its client-reachable address, used to fill in
 // NotLeader hints.
 func NewKVService(host *Host, applier *KVApplier, peers map[raft.NodeID]string) *KVService {
+	return NewKVServiceWithReadMode(host, applier, peers, ReadModeLog)
+}
+
+// NewKVServiceWithReadMode constructs a KVService with the Phase 6 A/B read
+// lever. ReadModeLog preserves the pre-Phase-6 path exactly.
+func NewKVServiceWithReadMode(host *Host, applier *KVApplier, peers map[raft.NodeID]string, reads ReadMode) *KVService {
 	peerCopy := make(map[raft.NodeID]string, len(peers))
 	for id, addr := range peers {
 		peerCopy[id] = addr
 	}
-	return &KVService{host: host, applier: applier, peers: peerCopy}
+	return &KVService{host: host, applier: applier, peers: peerCopy, reads: reads}
 }
 
-// Execute proposes cmd through the Raft log (GETs included) and returns once
-// the matching entry has been applied, or answers NotLeader if this node
-// cannot propose it.
+// Execute routes GET through the configured read path; every write, and every
+// GET in log mode, keeps the pre-Phase-6 propose-and-apply path. The daemon's
+// Phase-6 default is ReadIndex; NewKVService intentionally remains the
+// programmatic compatibility constructor for callers that need log reads.
 func (s *KVService) Execute(ctx context.Context, req *raftpb.ExecuteRequest) (*raftpb.ExecuteResponse, error) {
 	cmd := req.GetCmd()
 	if err := validateCommand(cmd); err != nil {
 		return nil, err
+	}
+	if cmd.GetOp() == raftpb.Op_GET && s.reads == ReadModeReadIndex {
+		return s.executeReadIndex(ctx, cmd.GetKey())
 	}
 	data, err := proto.Marshal(cmd)
 	if err != nil {
@@ -81,6 +100,39 @@ func (s *KVService) Execute(ctx context.Context, req *raftpb.ExecuteRequest) (*r
 		return &raftpb.ExecuteResponse{Ok: true, Value: outcome.result.Value, Found: outcome.result.Found}, nil
 	case <-ctx.Done():
 		s.applier.cancel(index, term)
+		return nil, status.FromContextError(ctx.Err()).Err()
+	}
+}
+
+func (s *KVService) executeReadIndex(ctx context.Context, key []byte) (*raftpb.ExecuteResponse, error) {
+	token, outcomeCh := s.applier.registerRead()
+	if err := s.host.RequestRead(token); err != nil {
+		s.applier.cancelRead(token)
+		return nil, status.Errorf(codes.Unavailable, "raft host stopped: %v", err)
+	}
+
+	select {
+	case outcome := <-outcomeCh:
+		if outcome.err != nil {
+			return nil, status.Errorf(codes.Unavailable, "raft host stopped: %v", outcome.err)
+		}
+		if outcome.rejected {
+			return s.notLeaderResponse(), nil
+		}
+		if outcome.canceled {
+			return nil, status.Error(codes.Unavailable, "read index canceled after leadership change")
+		}
+		result, err := s.applier.read(key)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "state-machine read: %v", err)
+		}
+		return &raftpb.ExecuteResponse{Ok: true, Value: result.Value, Found: result.Found}, nil
+	case <-ctx.Done():
+		s.applier.cancelRead(token)
+		// Remove the core-owned token too. Host serialization gives cancellation
+		// a total order with a concurrent quorum response; either outcome may win,
+		// but an abandoned queued/active token can never be retained indefinitely.
+		_ = s.host.CancelRead(token)
 		return nil, status.FromContextError(ctx.Err()).Err()
 	}
 }

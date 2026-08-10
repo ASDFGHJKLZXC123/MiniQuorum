@@ -31,6 +31,25 @@ const (
 	defaultMaxDelayMS     = VirtualTime(10)
 )
 
+// ReadMode selects how deterministic workload GETs are served. The Sim
+// Config zero value remains log for compatibility with pre-Phase-6 direct
+// simulator callers; simharness explicitly selects its Phase-6 default.
+type ReadMode string
+
+const (
+	ReadModeLog       ReadMode = "log"
+	ReadModeReadIndex ReadMode = "readindex"
+)
+
+// ParseReadMode validates the shared sim/simharness A/B selector.
+func ParseReadMode(value string) (ReadMode, error) {
+	mode := ReadMode(value)
+	if mode != ReadModeLog && mode != ReadModeReadIndex {
+		return "", fmt.Errorf("sim: unsupported read mode %q (want log or readindex)", value)
+	}
+	return mode, nil
+}
+
 // Config configures one Sim run. NodeIDs fixes both cluster membership and
 // the deterministic tie-break order for same-time events; it must never be
 // derived from map iteration by the caller.
@@ -40,13 +59,16 @@ type Config struct {
 	// zero value is map, preserving every pre-Phase-5 simulation caller.
 	Engine            string
 	LSMFlushThreshold int64
-	NodeIDs           []raft.NodeID
-	ElectionTickMin   int
-	ElectionTickMax   int
-	HeartbeatTicks    int
-	TickIntervalMS    VirtualTime // default 50
-	MinDelayMS        VirtualTime // default 1
-	MaxDelayMS        VirtualTime // default 10
+	// Reads selects log or readindex GETs. Empty preserves the original log
+	// path for direct Config users; the Phase-6 harness passes readindex.
+	Reads           ReadMode
+	NodeIDs         []raft.NodeID
+	ElectionTickMin int
+	ElectionTickMax int
+	HeartbeatTicks  int
+	TickIntervalMS  VirtualTime // default 50
+	MinDelayMS      VirtualTime // default 1
+	MaxDelayMS      VirtualTime // default 10
 }
 
 // simNode is the sim's per-node bookkeeping. storage outlives crashes; it
@@ -95,6 +117,7 @@ type Sim struct {
 	seed              int64
 	engine            string
 	lsmFlushThreshold int64
+	reads             ReadMode
 
 	order []raft.NodeID
 	nodes map[raft.NodeID]*simNode
@@ -229,6 +252,13 @@ func newSim(cfg Config, schedule FaultSchedule, crashStorage bool) (*Sim, error)
 	if engine != "map" && engine != "lsm" {
 		return nil, fmt.Errorf("sim: unsupported engine %q (want map or lsm)", engine)
 	}
+	reads := cfg.Reads
+	if reads == "" {
+		reads = ReadModeLog
+	}
+	if _, err := ParseReadMode(string(reads)); err != nil {
+		return nil, err
+	}
 	if cfg.LSMFlushThreshold < 0 {
 		return nil, fmt.Errorf("sim: negative LSM flush threshold %d", cfg.LSMFlushThreshold)
 	}
@@ -263,6 +293,7 @@ func newSim(cfg Config, schedule FaultSchedule, crashStorage bool) (*Sim, error)
 		seed:              cfg.Seed,
 		engine:            engine,
 		lsmFlushThreshold: cfg.LSMFlushThreshold,
+		reads:             reads,
 		order:             order,
 		nodes:             make(map[raft.NodeID]*simNode, len(order)),
 		partition:         make(map[partitionKey]struct{}),
@@ -405,6 +436,7 @@ func (s *Sim) Resume(id raft.NodeID) {
 	}
 	sn.paused = false
 	s.record("resume node=%d", id)
+	s.flushDeferredWorkloadReadCancels(sn)
 }
 
 // SetClockSkew sets id's per-node tick-rate multiplier: a rate of

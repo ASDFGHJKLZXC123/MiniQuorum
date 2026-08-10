@@ -27,6 +27,7 @@ type historyArtifact struct {
 	ArtifactVersion   int             `json:"artifact_version"`
 	Seed              int64           `json:"seed"`
 	Engine            string          `json:"engine"`
+	Reads             string          `json:"reads"`
 	LSMFlushThreshold int64           `json:"lsm_flush_threshold"`
 	History           checker.History `json:"history"`
 }
@@ -40,6 +41,11 @@ func ArtifactBytes(result Result) (map[string][]byte, error) {
 	}
 	summaryValue := result.Summary
 	summaryValue.Engine = engine
+	reads := result.Reads
+	if reads == "" {
+		reads = sim.ReadModeReadIndex
+	}
+	summaryValue.Reads = string(reads)
 	summaryValue.LSMFlushThreshold = result.LSMFlushThreshold
 	schedule, err := sim.EncodeFaultSchedule(result.Schedule)
 	if err != nil {
@@ -50,6 +56,7 @@ func ArtifactBytes(result Result) (map[string][]byte, error) {
 		ArtifactVersion:   ArtifactVersion,
 		Seed:              result.Seed,
 		Engine:            engine,
+		Reads:             string(reads),
 		LSMFlushThreshold: result.LSMFlushThreshold,
 		History:           result.History,
 	})
@@ -68,8 +75,8 @@ func ArtifactBytes(result Result) (map[string][]byte, error) {
 		}
 	}
 	violation := []byte(fmt.Sprintf(
-		"seed=%d\nengine=%s\nlsm_flush_threshold=%d\nreproduce=go run ./cmd/simreplay -engine %s -lsm-flush-threshold %d -seed %d -schedule %s\nresult=%s\nlogical_operations=%d\ncompleted_operations=%d\nopen_operations=%d\nschedule=%s\nhistory=%s\nvisualization=%s\n",
-		result.Seed, engine, result.LSMFlushThreshold, engine, result.LSMFlushThreshold, result.Seed, ScheduleFile, checkResultName(summaryValue), summaryValue.LogicalOperations,
+		"seed=%d\nengine=%s\nreads=%s\nlsm_flush_threshold=%d\nreproduce=go run ./cmd/simreplay -engine %s -lsm-flush-threshold %d -seed %d -reads %s -schedule %s\nresult=%s\nlogical_operations=%d\ncompleted_operations=%d\nopen_operations=%d\nschedule=%s\nhistory=%s\nvisualization=%s\n",
+		result.Seed, engine, reads, result.LSMFlushThreshold, engine, result.LSMFlushThreshold, result.Seed, reads, ScheduleFile, checkResultName(summaryValue), summaryValue.LogicalOperations,
 		summaryValue.CompletedOperations, summaryValue.OpenOperations, ScheduleFile, HistoryFile, VisualizationFile,
 	))
 	checkResult, info := porcupine.CheckEventsVerbose(checker.KVModel, result.History.PorcupineEvents(), 0*time.Second)

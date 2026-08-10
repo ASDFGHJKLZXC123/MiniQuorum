@@ -361,13 +361,15 @@ func (x *RequestVoteResp) GetVoteGranted() bool {
 }
 
 type AppendEntriesReq struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
-	LeaderId      uint64                 `protobuf:"varint,2,opt,name=leaderId,proto3" json:"leaderId,omitempty"`
-	PrevLogIndex  uint64                 `protobuf:"varint,3,opt,name=prevLogIndex,proto3" json:"prevLogIndex,omitempty"`
-	PrevLogTerm   uint64                 `protobuf:"varint,4,opt,name=prevLogTerm,proto3" json:"prevLogTerm,omitempty"`
-	Entries       []*Entry               `protobuf:"bytes,5,rep,name=entries,proto3" json:"entries,omitempty"`
-	LeaderCommit  uint64                 `protobuf:"varint,6,opt,name=leaderCommit,proto3" json:"leaderCommit,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	Term         uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	LeaderId     uint64                 `protobuf:"varint,2,opt,name=leaderId,proto3" json:"leaderId,omitempty"`
+	PrevLogIndex uint64                 `protobuf:"varint,3,opt,name=prevLogIndex,proto3" json:"prevLogIndex,omitempty"`
+	PrevLogTerm  uint64                 `protobuf:"varint,4,opt,name=prevLogTerm,proto3" json:"prevLogTerm,omitempty"`
+	Entries      []*Entry               `protobuf:"bytes,5,rep,name=entries,proto3" json:"entries,omitempty"`
+	LeaderCommit uint64                 `protobuf:"varint,6,opt,name=leaderCommit,proto3" json:"leaderCommit,omitempty"`
+	// Non-zero only for an explicit ReadIndex confirmation heartbeat.
+	ReadRound     uint64 `protobuf:"varint,7,opt,name=readRound,proto3" json:"readRound,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -444,11 +446,20 @@ func (x *AppendEntriesReq) GetLeaderCommit() uint64 {
 	return 0
 }
 
+func (x *AppendEntriesReq) GetReadRound() uint64 {
+	if x != nil {
+		return x.ReadRound
+	}
+	return 0
+}
+
 type AppendEntriesResp struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
-	Success       bool                   `protobuf:"varint,2,opt,name=success,proto3" json:"success,omitempty"`
-	MatchIndex    uint64                 `protobuf:"varint,3,opt,name=matchIndex,proto3" json:"matchIndex,omitempty"`
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Term       uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	Success    bool                   `protobuf:"varint,2,opt,name=success,proto3" json:"success,omitempty"`
+	MatchIndex uint64                 `protobuf:"varint,3,opt,name=matchIndex,proto3" json:"matchIndex,omitempty"`
+	// Exact echo of the request's readRound; zero for ordinary replication.
+	ReadRound     uint64 `protobuf:"varint,4,opt,name=readRound,proto3" json:"readRound,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -500,6 +511,13 @@ func (x *AppendEntriesResp) GetSuccess() bool {
 func (x *AppendEntriesResp) GetMatchIndex() uint64 {
 	if x != nil {
 		return x.MatchIndex
+	}
+	return 0
+}
+
+func (x *AppendEntriesResp) GetReadRound() uint64 {
+	if x != nil {
+		return x.ReadRound
 	}
 	return 0
 }
@@ -1008,20 +1026,22 @@ const file_proto_raft_proto_rawDesc = "" +
 	"\vlastLogTerm\x18\x04 \x01(\x04R\vlastLogTerm\"G\n" +
 	"\x0fRequestVoteResp\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12 \n" +
-	"\vvoteGranted\x18\x02 \x01(\bR\vvoteGranted\"\xd9\x01\n" +
+	"\vvoteGranted\x18\x02 \x01(\bR\vvoteGranted\"\xf7\x01\n" +
 	"\x10AppendEntriesReq\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x1a\n" +
 	"\bleaderId\x18\x02 \x01(\x04R\bleaderId\x12\"\n" +
 	"\fprevLogIndex\x18\x03 \x01(\x04R\fprevLogIndex\x12 \n" +
 	"\vprevLogTerm\x18\x04 \x01(\x04R\vprevLogTerm\x12+\n" +
 	"\aentries\x18\x05 \x03(\v2\x11.miniquorum.EntryR\aentries\x12\"\n" +
-	"\fleaderCommit\x18\x06 \x01(\x04R\fleaderCommit\"a\n" +
+	"\fleaderCommit\x18\x06 \x01(\x04R\fleaderCommit\x12\x1c\n" +
+	"\treadRound\x18\a \x01(\x04R\treadRound\"\x7f\n" +
 	"\x11AppendEntriesResp\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x18\n" +
 	"\asuccess\x18\x02 \x01(\bR\asuccess\x12\x1e\n" +
 	"\n" +
 	"matchIndex\x18\x03 \x01(\x04R\n" +
-	"matchIndex\"\xe0\x01\n" +
+	"matchIndex\x12\x1c\n" +
+	"\treadRound\x18\x04 \x01(\x04R\treadRound\"\xe0\x01\n" +
 	"\x14InstallSnapshotChunk\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x1a\n" +
 	"\bleaderId\x18\x02 \x01(\x04R\bleaderId\x12,\n" +

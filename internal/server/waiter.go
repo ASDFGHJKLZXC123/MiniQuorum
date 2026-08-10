@@ -1,8 +1,10 @@
 package server
 
 import (
+	"encoding/binary"
 	"sync"
 
+	"miniquorum/internal/raft"
 	"miniquorum/internal/statemachine"
 	raftpb "miniquorum/proto"
 )
@@ -29,6 +31,19 @@ type waiterOutcome struct {
 	err error
 }
 
+type readWaiter struct {
+	confirmed bool
+	index     uint64
+	ch        chan readOutcome
+}
+
+type readOutcome struct {
+	index    uint64
+	canceled bool
+	rejected bool
+	err      error
+}
+
 // KVApplier bridges the entry-aware StateMachine to the Host's single
 // Ready-processing path (via Applier) and to the KV service's per-request
 // waiters. It has no goroutines of its own; Apply always runs synchronously
@@ -46,20 +61,25 @@ type KVApplier struct {
 	// able to find and resolve all of them, not just whichever registered
 	// last.
 	byIndex map[uint64]map[uint64]struct{}
+
+	nextReadToken uint64
+	readWaiters   map[string]*readWaiter
 }
 
 // NewKVApplier constructs a KVApplier over sm.
 func NewKVApplier(sm statemachine.StateMachine) *KVApplier {
 	return &KVApplier{
-		sm:      sm,
-		waiters: make(map[waiterKey]chan waiterOutcome),
-		byIndex: make(map[uint64]map[uint64]struct{}),
+		sm:          sm,
+		waiters:     make(map[waiterKey]chan waiterOutcome),
+		byIndex:     make(map[uint64]map[uint64]struct{}),
+		readWaiters: make(map[string]*readWaiter),
 	}
 }
 
 var (
-	_ Applier          = (*KVApplier)(nil)
-	_ FailStopNotifier = (*KVApplier)(nil)
+	_ Applier           = (*KVApplier)(nil)
+	_ FailStopNotifier  = (*KVApplier)(nil)
+	_ ReadStateNotifier = (*KVApplier)(nil)
 )
 
 // Apply satisfies Applier: it applies entry to the state machine, then
@@ -70,7 +90,81 @@ func (a *KVApplier) Apply(entry *raftpb.Entry) error {
 		return err
 	}
 	a.fulfill(entry.GetIndex(), entry.GetTerm(), result)
+	a.fulfillConfirmedReads(a.sm.AppliedIndex())
 	return nil
+}
+
+func (a *KVApplier) registerRead() ([]byte, <-chan readOutcome) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for {
+		a.nextReadToken++
+		if a.nextReadToken == 0 {
+			continue
+		}
+		token := make([]byte, 8)
+		binary.BigEndian.PutUint64(token, a.nextReadToken)
+		id := string(token)
+		if _, exists := a.readWaiters[id]; exists {
+			continue
+		}
+		ch := make(chan readOutcome, 1)
+		a.readWaiters[id] = &readWaiter{ch: ch}
+		return token, ch
+	}
+}
+
+func (a *KVApplier) cancelRead(token []byte) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.readWaiters, string(token))
+}
+
+// HandleReadState records a confirmation only after Raft has proven a
+// current-term quorum. A confirmation ahead of the local applied index stays
+// pending until Apply advances the state machine far enough.
+func (a *KVApplier) HandleReadState(state raft.ReadState) {
+	a.mu.Lock()
+	waiter, ok := a.readWaiters[string(state.Ctx)]
+	if !ok {
+		a.mu.Unlock()
+		return
+	}
+	if state.Canceled {
+		delete(a.readWaiters, string(state.Ctx))
+		a.mu.Unlock()
+		waiter.ch <- readOutcome{canceled: true, rejected: state.Rejected}
+		return
+	}
+	waiter.confirmed = true
+	waiter.index = state.Index
+	if a.sm.AppliedIndex() < state.Index {
+		a.mu.Unlock()
+		return
+	}
+	delete(a.readWaiters, string(state.Ctx))
+	a.mu.Unlock()
+	waiter.ch <- readOutcome{index: state.Index}
+}
+
+func (a *KVApplier) fulfillConfirmedReads(applied uint64) {
+	a.mu.Lock()
+	ready := make([]*readWaiter, 0)
+	for token, waiter := range a.readWaiters {
+		if !waiter.confirmed || waiter.index > applied {
+			continue
+		}
+		delete(a.readWaiters, token)
+		ready = append(ready, waiter)
+	}
+	a.mu.Unlock()
+	for _, waiter := range ready {
+		waiter.ch <- readOutcome{index: waiter.index}
+	}
+}
+
+func (a *KVApplier) read(key []byte) (statemachine.Result, error) {
+	return a.sm.Read(key)
 }
 
 // register records interest in (index, term) and returns the channel that
@@ -137,6 +231,10 @@ func (a *KVApplier) FailStop(err error) {
 		delete(a.waiters, key)
 		a.removeFromIndexLocked(key.index, key.term)
 		ch <- waiterOutcome{err: err}
+	}
+	for token, waiter := range a.readWaiters {
+		delete(a.readWaiters, token)
+		waiter.ch <- readOutcome{err: err}
 	}
 }
 

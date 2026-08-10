@@ -30,15 +30,19 @@ import (
 	raftpb "miniquorum/proto"
 )
 
+const defaultReadMode = "readindex"
+
 func main() {
 	var id uint64
 	var peersFlag string
 	var dataDir string
 	var engineFlag string
+	var readsFlag string
 	flag.Uint64Var(&id, "id", 0, "this node ID")
 	flag.StringVar(&peersFlag, "peers", "", "comma-separated id=address peers")
 	flag.StringVar(&dataDir, "data-dir", "", "directory for this node's durable Raft log")
 	flag.StringVar(&engineFlag, "engine", "map", "state-machine engine: map or lsm")
+	flag.StringVar(&readsFlag, "reads", defaultReadMode, "read path: log or readindex")
 	flag.Parse()
 	if id == 0 {
 		log.Print("--id is required")
@@ -61,6 +65,11 @@ func main() {
 	engineName, err := parseEngine(engineFlag)
 	if err != nil {
 		log.Printf("invalid --engine: %v", err)
+		return
+	}
+	readMode, err := parseReadMode(readsFlag)
+	if err != nil {
+		log.Printf("invalid --reads: %v", err)
 		return
 	}
 	store, err := openDataDir(dataDir)
@@ -130,7 +139,7 @@ func main() {
 	host.Transport = transport
 	applier := server.NewKVApplier(sm)
 	host.Applier = applier
-	raftpb.RegisterKVServer(transport.Server(), server.NewKVService(host, applier, peers))
+	raftpb.RegisterKVServer(transport.Server(), server.NewKVServiceWithReadMode(host, applier, peers, readMode))
 
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -148,7 +157,7 @@ func main() {
 	defer ticker.Stop()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log.Printf("miniquorumd node=%d listening=%s data-dir=%s engine=%s started", id, addr, dataDir, engineName)
+	log.Printf("miniquorumd node=%d listening=%s data-dir=%s engine=%s reads=%s started", id, addr, dataDir, engineName, readMode)
 	for {
 		select {
 		case <-ctx.Done():
@@ -172,6 +181,15 @@ func parseEngine(value string) (string, error) {
 		return value, nil
 	default:
 		return "", fmt.Errorf("want map or lsm, got %q", value)
+	}
+}
+
+func parseReadMode(value string) (server.ReadMode, error) {
+	switch server.ReadMode(value) {
+	case server.ReadModeLog, server.ReadModeReadIndex:
+		return server.ReadMode(value), nil
+	default:
+		return "", fmt.Errorf("want log or readindex, got %q", value)
 	}
 }
 

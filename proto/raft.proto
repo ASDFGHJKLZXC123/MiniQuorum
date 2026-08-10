@@ -37,12 +37,16 @@ message AppendEntriesReq {
   uint64 prevLogTerm = 4;
   repeated Entry entries = 5;
   uint64 leaderCommit = 6;
+  // Non-zero only for an explicit ReadIndex confirmation heartbeat.
+  uint64 readRound = 7;
 }
 
 message AppendEntriesResp {
   uint64 term = 1;
   bool success = 2;
   uint64 matchIndex = 3;
+  // Exact echo of the request's readRound; zero for ordinary replication.
+  uint64 readRound = 4;
 }
 
 message InstallSnapshotChunk {

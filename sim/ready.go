@@ -149,6 +149,7 @@ func (s *Sim) markProcessCrashed(sn *simNode) {
 	// so a later restart starts fresh rather than inheriting a stale freeze
 	// from before the crash.
 	sn.paused = false
+	s.discardDeferredWorkloadReadCancels(sn.id)
 }
 
 // markProcessHalted enters fail-stop and invalidates any pending tick owned
@@ -238,8 +239,16 @@ func (s *Sim) processReady(sn *simNode, rd raft.Ready) {
 		})
 		sn.lastApplied = rd.CommittedEntries[i].Index
 	}
+	// Read confirmations are delivered only after every committed entry in
+	// this durable Ready has applied, matching the production host lifecycle.
+	// A confirmation ahead of lastApplied remains registered and is revisited
+	// by the next Ready that advances application far enough.
+	for i := range rd.ReadStates {
+		s.observeWorkloadReadState(sn.id, rd.ReadStates[i])
+	}
+	s.fulfillConfirmedWorkloadReads(sn)
 	sn.node.Advance()
-	s.record("node=%d ready hardstate=%v msgs=%d committed=%d", sn.id, rd.HardState != nil, len(rd.Messages), len(rd.CommittedEntries))
+	s.record("node=%d ready hardstate=%v msgs=%d committed=%d readstates=%d", sn.id, rd.HardState != nil, len(rd.Messages), len(rd.CommittedEntries), len(rd.ReadStates))
 }
 
 // handleLSMProcessCrash is the common host boundary for a SimFS crash while

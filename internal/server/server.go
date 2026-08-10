@@ -27,6 +27,12 @@ type FailStopNotifier interface {
 	FailStop(err error)
 }
 
+// ReadStateNotifier is optionally implemented by an Applier that routes
+// asynchronous Raft read confirmations to waiting server requests.
+type ReadStateNotifier interface {
+	HandleReadState(raft.ReadState)
+}
+
 // Host coordinates a deterministic Raft node and its external dependencies.
 // raft.Node is not safe for concurrent use, and the real server drives it
 // from three sources (a tick timer, inbound transport messages, and KV
@@ -109,6 +115,31 @@ func (h *Host) Propose(data []byte, onProposed func(index, term uint64)) (index,
 	return index, term, isLeader, h.processReadyLocked()
 }
 
+// RequestRead submits an owned token to Raft's asynchronous ReadIndex path and
+// drains any immediately available heartbeat, rejection, or confirmation.
+func (h *Host) RequestRead(ctx []byte) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.stopped != nil {
+		return h.stopped
+	}
+	h.Node.RequestRead(ctx)
+	return h.processReadyLocked()
+}
+
+// CancelRead synchronously removes a caller-abandoned token from either the
+// queued or active ReadIndex round. It shares Host.mu with Tick and Step, so a
+// quorum response and an RPC cancellation have one deterministic order.
+func (h *Host) CancelRead(ctx []byte) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.stopped != nil {
+		return h.stopped
+	}
+	h.Node.CancelRead(ctx)
+	return h.processReadyLocked()
+}
+
 // LeaderHint returns the node's best-known leader without racing Tick, Step,
 // or Propose. It is a best-known hint only, tracked entirely by the host
 // (see the leaderHint field): it may be stale or unknown (ok==false) around
@@ -164,6 +195,11 @@ func processReady(node readyNode, store readyStorage, transport transport.Transp
 			if err := applier.Apply(&ready.CommittedEntries[i]); err != nil {
 				return fmt.Errorf("state-machine apply: %w", err)
 			}
+		}
+	}
+	if notifier, ok := applier.(ReadStateNotifier); ok {
+		for i := range ready.ReadStates {
+			notifier.HandleReadState(ready.ReadStates[i])
 		}
 	}
 	// 4. Acknowledge only after all preceding work completed.
