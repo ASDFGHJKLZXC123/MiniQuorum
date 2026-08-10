@@ -1,5 +1,7 @@
 package raft
 
+import "fmt"
+
 import raftpb "miniquorum/proto"
 
 // raftLog is the in-memory log owned by the deterministic core. Storage is
@@ -22,6 +24,12 @@ type logEntry struct {
 func newRaftLog(snapshot SnapshotMeta, entries []raftpb.Entry) raftLog {
 	log := raftLog{snapshot: snapshot, entries: make([]logEntry, 0, len(entries))}
 	for i := range entries {
+		// Storage may retain a small physical tail overlap before the newest
+		// state-machine snapshot. The core's logical log begins strictly after
+		// InitialState.Snapshot; pre-snapshot entries remain storage-only.
+		if entries[i].Index <= snapshot.Index {
+			continue
+		}
 		log.entries = append(log.entries, logEntry{
 			index: entries[i].Index,
 			term:  entries[i].Term,
@@ -103,6 +111,30 @@ func (l *raftLog) appendLocal(term uint64, typ raftpb.EntryType, data []byte) ui
 		data:  append([]byte(nil), data...),
 	})
 	return index
+}
+
+func (l *raftLog) compact(meta SnapshotMeta) error {
+	if meta.Index < l.snapshot.Index {
+		return fmt.Errorf("raft: compact index regresses from %d to %d", l.snapshot.Index, meta.Index)
+	}
+	if meta.Index == l.snapshot.Index {
+		if meta.Term != l.snapshot.Term {
+			return fmt.Errorf("raft: compact term changed at index %d from %d to %d", meta.Index, l.snapshot.Term, meta.Term)
+		}
+		return nil
+	}
+	term, ok := l.term(meta.Index)
+	if !ok || term != meta.Term {
+		return fmt.Errorf("raft: compact boundary %d/%d does not match log term %d (present=%v)", meta.Index, meta.Term, term, ok)
+	}
+	cut := 0
+	for cut < len(l.entries) && l.entries[cut].index <= meta.Index {
+		cut++
+	}
+	clear(l.entries[:cut])
+	l.entries = append([]logEntry(nil), l.entries[cut:]...)
+	l.snapshot = meta
+	return nil
 }
 
 // appendFromLeader applies the Raft conflict rule. Matching entries are kept;

@@ -34,3 +34,19 @@ type StateMachine interface {
 	CreateSnapshot(dir string, meta raft.SnapshotMeta) error
 	RestoreSnapshot(dir string) (raft.SnapshotMeta, error)
 }
+
+// SnapshotDirectoryFS is the directory-lifecycle subset needed by the server
+// snapshot manager. Persistent engines expose their injected filesystem via
+// SnapshotDirectoryFSProvider so creation, cleanup, and crash tests all cross
+// the same durability boundary. State machines without a provider use the
+// server's real-filesystem adapter.
+type SnapshotDirectoryFS interface {
+	MkdirAll(name string) error
+	RemoveAll(name string) error
+	List(name string) ([]string, error)
+	SyncDir(name string) error
+}
+
+type SnapshotDirectoryFSProvider interface {
+	SnapshotDirectoryFS() SnapshotDirectoryFS
+}

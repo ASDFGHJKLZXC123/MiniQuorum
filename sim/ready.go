@@ -120,7 +120,7 @@ func (s *Sim) handleRestart(id raft.NodeID) {
 			return
 		}
 		if replay, ok := stateMachine.(interface{ BeginReplay(uint64, uint64) error }); ok {
-			if replayErr := replay.BeginReplay(sn.storage.FirstIndex(), sn.storage.LastIndex()); replayErr != nil {
+			if replayErr := replay.BeginReplay(init.Applied+1, sn.storage.LastIndex()); replayErr != nil {
 				s.markProcessHalted(sn)
 				s.record("restart node=%d replay_lifecycle_error=%v fail-stop", id, replayErr)
 				return
@@ -129,7 +129,7 @@ func (s *Sim) handleRestart(id raft.NodeID) {
 		sn.sm = stateMachine
 		sn.applied = nil
 		sn.results = nil
-		sn.lastApplied = 0
+		sn.lastApplied = init.Applied
 	}
 	s.record("restart node=%d", id)
 	s.scheduleTick(id, s.now+s.nextTickDelay(sn))
@@ -329,7 +329,28 @@ func recoveredInitialState(store storageReader) (raft.InitialState, error) {
 	if err != nil {
 		return raft.InitialState{}, err
 	}
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		return raft.InitialState{}, err
+	}
+	compacted, err := store.Compacted()
+	if err != nil {
+		return raft.InitialState{}, err
+	}
+	if err := validateRecoveredMetadata(snapshot, compacted); err != nil {
+		return raft.InitialState{}, fmt.Errorf("sim: recovery metadata: %w", err)
+	}
 	first, last := store.FirstIndex(), store.LastIndex()
+	if compacted.Index == ^uint64(0) {
+		return raft.InitialState{}, fmt.Errorf("sim: compacted index overflows half-open range")
+	}
+	wantFirst := compacted.Index + 1
+	if first != wantFirst {
+		return raft.InitialState{}, fmt.Errorf("sim: first index %d, want compacted index + 1 = %d", first, wantFirst)
+	}
+	if last < snapshot.Index {
+		return raft.InitialState{}, fmt.Errorf("sim: last index %d precedes snapshot index %d", last, snapshot.Index)
+	}
 	var entries []raftpb.Entry
 	if last >= first {
 		if last == ^uint64(0) {
@@ -340,11 +361,60 @@ func recoveredInitialState(store storageReader) (raft.InitialState, error) {
 			return raft.InitialState{}, err
 		}
 	}
-	return raft.InitialState{HardState: hard, Entries: entries}, nil
+	if err := validateRecoveredEntries(snapshot, compacted, first, last, entries); err != nil {
+		return raft.InitialState{}, fmt.Errorf("sim: recovery log: %w", err)
+	}
+	return raft.InitialState{HardState: hard, Entries: entries, Snapshot: compacted, Applied: snapshot.Index}, nil
+}
+
+func validateRecoveredMetadata(snapshot, compacted raft.SnapshotMeta) error {
+	for _, item := range []struct {
+		name string
+		meta raft.SnapshotMeta
+	}{{"snapshot", snapshot}, {"compacted", compacted}} {
+		if item.meta.Index == 0 && item.meta.Term != 0 || item.meta.Index != 0 && item.meta.Term == 0 {
+			return fmt.Errorf("%s metadata has invalid index/term %d/%d", item.name, item.meta.Index, item.meta.Term)
+		}
+	}
+	if compacted.Index > snapshot.Index {
+		return fmt.Errorf("compacted index %d exceeds snapshot index %d", compacted.Index, snapshot.Index)
+	}
+	if compacted.Index == snapshot.Index && compacted.Term != snapshot.Term {
+		return fmt.Errorf("compacted term %d differs from snapshot term %d at index %d", compacted.Term, snapshot.Term, snapshot.Index)
+	}
+	return nil
+}
+
+func validateRecoveredEntries(snapshot, compacted raft.SnapshotMeta, first, last uint64, entries []raftpb.Entry) error {
+	wantCount := uint64(0)
+	if last >= first {
+		wantCount = last - first + 1
+	}
+	if uint64(len(entries)) != wantCount {
+		return fmt.Errorf("loaded %d entries for contiguous range [%d,%d], want %d", len(entries), first, last, wantCount)
+	}
+	for offset := range entries {
+		want := first + uint64(offset)
+		if entries[offset].Index != want {
+			return fmt.Errorf("entry offset %d has index %d, want %d", offset, entries[offset].Index, want)
+		}
+	}
+	if compacted.Index < snapshot.Index {
+		offset := snapshot.Index - first
+		if offset >= uint64(len(entries)) {
+			return fmt.Errorf("retained overlap is missing snapshot index %d", snapshot.Index)
+		}
+		if entries[offset].Term != snapshot.Term {
+			return fmt.Errorf("snapshot term %d at index %d differs from retained log term %d", snapshot.Term, snapshot.Index, entries[offset].Term)
+		}
+	}
+	return nil
 }
 
 type storageReader interface {
 	HardState() (raft.HardState, error)
+	Snapshot() (raft.SnapshotMeta, error)
+	Compacted() (raft.SnapshotMeta, error)
 	Entries(lo, hi uint64) ([]raftpb.Entry, error)
 	FirstIndex() uint64
 	LastIndex() uint64

@@ -121,6 +121,8 @@ func (fs *CountingFS) OpenAppend(name string) (File, error) {
 	return &countingFile{underlying: file, path: name, class: classifyCountingFile(name), fs: fs}, nil
 }
 
+func (fs *CountingFS) MkdirAll(name string) error           { return fs.base.MkdirAll(name) }
+func (fs *CountingFS) RemoveAll(name string) error          { return fs.base.RemoveAll(name) }
 func (fs *CountingFS) SyncDir(name string) error            { return fs.base.SyncDir(name) }
 func (fs *CountingFS) Rename(oldName, newName string) error { return fs.base.Rename(oldName, newName) }
 func (fs *CountingFS) Link(oldName, newName string) error   { return fs.base.Link(oldName, newName) }

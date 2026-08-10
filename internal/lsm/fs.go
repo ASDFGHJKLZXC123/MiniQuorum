@@ -39,6 +39,8 @@ type FileInfo struct {
 // FS is the single injected filesystem boundary for every LSM file
 // operation. Core LSM code does not import os.
 type FS interface {
+	MkdirAll(name string) error
+	RemoveAll(name string) error
 	Create(name string) (File, error)
 	Open(name string) (File, error)
 	OpenAppend(name string) (File, error)
@@ -56,6 +58,8 @@ type FSOp string
 
 const (
 	FSOpCreate     FSOp = "create"
+	FSOpMkdirAll   FSOp = "mkdir-all"
+	FSOpRemoveAll  FSOp = "remove-all"
 	FSOpOpen       FSOp = "open"
 	FSOpOpenAppend FSOp = "open-append"
 	FSOpRead       FSOp = "read"

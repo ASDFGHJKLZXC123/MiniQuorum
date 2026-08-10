@@ -73,6 +73,7 @@ type Engine struct {
 	fs                    FS
 	dir                   string
 	poisoned              error
+	readPoisoned          error
 	unresolved            []File
 	obsolete              []obsoleteFile
 	obsoleteDirDirty      bool
@@ -616,6 +617,9 @@ func (engine *Engine) lookupLocked(key []byte) (value []byte, tombstone bool, se
 	if engine.closed {
 		return nil, false, 0, false, errors.New("lsm: engine is closed")
 	}
+	if engine.readPoisoned != nil {
+		return nil, false, 0, false, fmt.Errorf("lsm: reads are fail-stopped after uncertain snapshot adoption: %w", engine.readPoisoned)
+	}
 
 	consider := func(candidateValue []byte, candidateTombstone bool, candidateSeq uint64, candidateFound bool) error {
 		if !candidateFound {
@@ -763,6 +767,13 @@ func (engine *Engine) checkOpenLocked() error {
 func (engine *Engine) poisonLocked(err error) {
 	if engine.poisoned == nil {
 		engine.poisoned = err
+	}
+}
+
+func (engine *Engine) poisonReadsLocked(err error) {
+	engine.poisonLocked(err)
+	if engine.readPoisoned == nil {
+		engine.readPoisoned = err
 	}
 }
 

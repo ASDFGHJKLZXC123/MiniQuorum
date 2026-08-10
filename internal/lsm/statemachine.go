@@ -2,13 +2,13 @@ package lsm
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"sort"
 
 	"google.golang.org/protobuf/proto"
 
-	"miniquorum/internal/raft"
 	"miniquorum/internal/statemachine"
 	raftpb "miniquorum/proto"
 )
@@ -47,9 +47,9 @@ type stateDedupRecord struct {
 var _ statemachine.StateMachine = (*StateMachine)(nil)
 
 // OpenStateMachine opens one persistent LSM state machine. dir is the
-// engine-only directory; callers keep their Raft log in its existing data
-// directory and must replay the complete retained log from index zero after a
-// process restart. FlushedIndex is deliberately not used as a replay start.
+// engine-only directory; callers keep the Raft log and snapshot directories
+// outside it. After startup RestoreSnapshot establishes the applied snapshot
+// index, and the host replays only the committed suffix after that index.
 func OpenStateMachine(dir string, options Options) (*StateMachine, error) {
 	engine, err := Open(dir, options)
 	if err != nil {
@@ -62,10 +62,9 @@ func OpenStateMachine(dir string, options Options) (*StateMachine, error) {
 	}, nil
 }
 
-// BeginReplay records the exact retained-log interval for a pre-snapshot
-// process restart. It never applies entries itself: Raft still establishes
-// commitment and emits them through the ordinary Ready lifecycle. Retained
-// entries must begin at index 1 until Phase 6 introduces snapshots.
+// BeginReplay records the exact post-snapshot interval for process restart.
+// It never applies entries itself: Raft still establishes commitment and
+// emits them through the ordinary Ready lifecycle.
 func (m *StateMachine) BeginReplay(firstIndex, lastIndex uint64) error {
 	m.engine.mu.Lock()
 	defer m.engine.mu.Unlock()
@@ -74,8 +73,12 @@ func (m *StateMachine) BeginReplay(firstIndex, lastIndex uint64) error {
 		m.replayCeiling = 0
 		return nil
 	}
-	if firstIndex != 1 {
-		return fmt.Errorf("lsm: pre-snapshot replay starts at %d, want 1", firstIndex)
+	wantFirst := m.applied + 1
+	if wantFirst == 0 {
+		return errors.New("lsm: replay start overflows applied index")
+	}
+	if firstIndex != wantFirst {
+		return fmt.Errorf("lsm: replay starts at %d, want snapshot index + 1 = %d", firstIndex, wantFirst)
 	}
 	m.replaying = true
 	m.replayCeiling = lastIndex
@@ -85,6 +88,13 @@ func (m *StateMachine) BeginReplay(firstIndex, lastIndex uint64) error {
 // Engine exposes the underlying engine for force-flush and storage lifecycle
 // seams. Callers must not bypass StateMachine.Apply for replicated writes.
 func (m *StateMachine) Engine() *Engine { return m.engine }
+
+// SnapshotDirectoryFS keeps server-owned snapshot namespace operations on
+// the engine's injected filesystem boundary (RealFS in production, SimFS in
+// deterministic crash tests).
+func (m *StateMachine) SnapshotDirectoryFS() statemachine.SnapshotDirectoryFS {
+	return m.engine.fs
+}
 
 // Close releases engine file handles. It is deliberately outside the frozen
 // StateMachine interface because ordinary MapStateMachine instances have no
@@ -292,16 +302,6 @@ func (m *StateMachine) Hash() uint64 {
 	}
 
 	return h.Sum64()
-}
-
-// CreateSnapshot is a Phase 6 stub.
-func (*StateMachine) CreateSnapshot(string, raft.SnapshotMeta) error {
-	return statemachine.ErrSnapshotUnsupported
-}
-
-// RestoreSnapshot is a Phase 6 stub.
-func (*StateMachine) RestoreSnapshot(string) (raft.SnapshotMeta, error) {
-	return raft.SnapshotMeta{}, statemachine.ErrSnapshotUnsupported
 }
 
 func cloneStateResult(result statemachine.Result) statemachine.Result {

@@ -6,6 +6,7 @@ import (
 	"io"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -185,6 +186,8 @@ func validateSimFault(op FSOp, occurrence uint64, point SimFaultPoint) error {
 func isDeclaredFSOp(op FSOp) bool {
 	switch op {
 	case FSOpCreate,
+		FSOpMkdirAll,
+		FSOpRemoveAll,
 		FSOpOpen,
 		FSOpOpenAppend,
 		FSOpRead,
@@ -202,6 +205,34 @@ func isDeclaredFSOp(op FSOp) bool {
 	default:
 		return false
 	}
+}
+
+func (fs *SimFS) MkdirAll(name string) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	name = cleanPath(name)
+	event, err := fs.beginLocked(FSOpMkdirAll, name, "")
+	if err != nil {
+		return err
+	}
+	return fs.finishLocked(event)
+}
+
+func (fs *SimFS) RemoveAll(name string) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	name = cleanPath(name)
+	event, err := fs.beginLocked(FSOpRemoveAll, name, "")
+	if err != nil {
+		return err
+	}
+	prefix := name + string(filepath.Separator)
+	for liveName := range fs.live {
+		if liveName == name || strings.HasPrefix(liveName, prefix) {
+			delete(fs.live, liveName)
+		}
+	}
+	return fs.finishLocked(event)
 }
 
 // ResetEvents clears evidence and per-operation occurrence counters. It does
@@ -337,9 +368,31 @@ func (fs *SimFS) SyncDir(name string) error {
 	if err != nil {
 		return err
 	}
+	liveChildren := make(map[string]struct{})
+	prefix := name + string(filepath.Separator)
+	for liveName := range fs.live {
+		if !strings.HasPrefix(liveName, prefix) {
+			continue
+		}
+		remainder := strings.TrimPrefix(liveName, prefix)
+		child := strings.SplitN(remainder, string(filepath.Separator), 2)[0]
+		if child != "" {
+			liveChildren[child] = struct{}{}
+		}
+	}
 	for durableName := range fs.durableNames {
 		if filepath.Dir(durableName) == name {
 			delete(fs.durableNames, durableName)
+			continue
+		}
+		if strings.HasPrefix(durableName, prefix) {
+			remainder := strings.TrimPrefix(durableName, prefix)
+			child := strings.SplitN(remainder, string(filepath.Separator), 2)[0]
+			if _, exists := liveChildren[child]; !exists {
+				// Syncing the parent makes removal of an implicit child
+				// directory durable, rendering its complete subtree unreachable.
+				delete(fs.durableNames, durableName)
+			}
 		}
 	}
 	for liveName, node := range fs.live {
@@ -409,11 +462,21 @@ func (fs *SimFS) List(name string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	var names []string
+	children := make(map[string]struct{})
+	prefix := name + string(filepath.Separator)
 	for liveName := range fs.live {
-		if filepath.Dir(liveName) == name {
-			names = append(names, filepath.Base(liveName))
+		if !strings.HasPrefix(liveName, prefix) {
+			continue
 		}
+		remainder := strings.TrimPrefix(liveName, prefix)
+		child := strings.SplitN(remainder, string(filepath.Separator), 2)[0]
+		if child != "" {
+			children[child] = struct{}{}
+		}
+	}
+	names := make([]string, 0, len(children))
+	for child := range children {
+		names = append(names, child)
 	}
 	sort.Strings(names)
 	if err := fs.finishLocked(event); err != nil {

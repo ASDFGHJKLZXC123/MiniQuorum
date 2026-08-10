@@ -136,19 +136,59 @@ func (cs *CrashStorage) Save(hs *raft.HardState, entries []raftpb.Entry) error {
 	return nil
 }
 
+// SaveSnapshot implements the Phase 6 storage boundary. Snapshot metadata is
+// a separate durable record in disklog; the simulator keeps the same logical
+// durability independently of Save's pre-existing fault schedule.
+func (cs *CrashStorage) SaveSnapshot(meta raft.SnapshotMeta) error {
+	if cs.crashed {
+		return ErrCrashed
+	}
+	if err := cs.view.SaveSnapshot(meta); err != nil {
+		return err
+	}
+	compacted, err := cs.view.Compacted()
+	if err != nil {
+		return err
+	}
+	cs.durable = appendSnapshotRecord(cs.durable, meta, compacted)
+	return nil
+}
+
 // HardState implements storage.Storage; while crashed it reports the
 // surviving platter image.
 func (cs *CrashStorage) HardState() (raft.HardState, error) { return cs.view.HardState() }
 
+// Snapshot implements storage.Storage.
+func (cs *CrashStorage) Snapshot() (raft.SnapshotMeta, error) { return cs.view.Snapshot() }
+
+// Compacted implements storage.Storage.
+func (cs *CrashStorage) Compacted() (raft.SnapshotMeta, error) { return cs.view.Compacted() }
+
 // Entries implements storage.Storage with MemStorage's exact bounds
 // semantics; while crashed it reports the surviving platter image.
-func (cs *CrashStorage) Entries(lo, hi uint64) ([]raftpb.Entry, error) { return cs.view.Entries(lo, hi) }
+func (cs *CrashStorage) Entries(lo, hi uint64) ([]raftpb.Entry, error) {
+	return cs.view.Entries(lo, hi)
+}
 
 // FirstIndex implements storage.Storage.
 func (cs *CrashStorage) FirstIndex() uint64 { return cs.view.FirstIndex() }
 
 // LastIndex implements storage.Storage.
 func (cs *CrashStorage) LastIndex() uint64 { return cs.view.LastIndex() }
+
+// Compact implements storage.Storage's logical prefix deletion. The encoded
+// byte log remains an evidence stream; recovery reapplies the persisted
+// compaction floor after folding it.
+func (cs *CrashStorage) Compact(uptoIndex uint64) error {
+	if cs.crashed {
+		return ErrCrashed
+	}
+	if err := cs.view.Compact(uptoIndex); err != nil {
+		return err
+	}
+	cs.durable = appendCompactRecord(cs.durable, uptoIndex)
+	return nil
+}
 
 // Crash kills the storage between batches, as a virtual-time-scheduled kill
 // would: the dirty buffer is empty, so exactly the durable bytes survive.
@@ -255,6 +295,8 @@ const (
 	recordKindHardState byte = 1
 	recordKindEntries   byte = 2
 	recordKindTruncate  byte = 3
+	recordKindSnapshot  byte = 4
+	recordKindCompact   byte = 5
 )
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
@@ -295,6 +337,23 @@ func appendEntriesRecord(dst []byte, entries []raftpb.Entry) []byte {
 	return appendRecord(dst, payload)
 }
 
+func appendSnapshotRecord(dst []byte, snapshot, compacted raft.SnapshotMeta) []byte {
+	payload := make([]byte, 33)
+	payload[0] = recordKindSnapshot
+	binary.LittleEndian.PutUint64(payload[1:9], snapshot.Index)
+	binary.LittleEndian.PutUint64(payload[9:17], snapshot.Term)
+	binary.LittleEndian.PutUint64(payload[17:25], compacted.Index)
+	binary.LittleEndian.PutUint64(payload[25:33], compacted.Term)
+	return appendRecord(dst, payload)
+}
+
+func appendCompactRecord(dst []byte, uptoIndex uint64) []byte {
+	payload := make([]byte, 9)
+	payload[0] = recordKindCompact
+	binary.LittleEndian.PutUint64(payload[1:9], uptoIndex)
+	return appendRecord(dst, payload)
+}
+
 // parseRecords folds every complete record in data, in byte order, into a
 // fresh view, and returns the byte length of that complete prefix. Trailing
 // bytes that do not form a whole record are a torn tail: ignored here,
@@ -303,7 +362,7 @@ func appendEntriesRecord(dst []byte, entries []raftpb.Entry) []byte {
 // its first index) and honors a complete truncate record by itself — even
 // when the entries record that followed it tore away.
 func parseRecords(data []byte) (*storage.MemStorage, int, error) {
-	var state recoveredState
+	state := recoveredState{storage.NewMemStorage()}
 	offset := 0
 	for {
 		rest := data[offset:]
@@ -325,14 +384,11 @@ func parseRecords(data []byte) (*storage.MemStorage, int, error) {
 	}
 }
 
-// recoveredState is the record fold target. It holds plain hard state and
-// entries because a truncate record is a pure suffix drop, which
-// Storage.Save cannot express; the other record kinds fold with Save's exact
-// cut-and-append semantics, so the materialized view is identical to folding
-// them through a MemStorage.
+// recoveredState folds every durable event through MemStorage in byte order.
+// Snapshot installation must occur at its exact position in that history so
+// a later valid X+1 suffix is not mistaken for part of the discarded old log.
 type recoveredState struct {
-	hard    raft.HardState
-	entries []raftpb.Entry
+	storage *storage.MemStorage
 }
 
 func (s *recoveredState) apply(payload []byte) error {
@@ -344,11 +400,11 @@ func (s *recoveredState) apply(payload []byte) error {
 		if len(payload) != 17 {
 			return fmt.Errorf("sim: hard-state record payload is %d bytes, want 17", len(payload))
 		}
-		s.hard = raft.HardState{
+		hard := raft.HardState{
 			Term:     binary.LittleEndian.Uint64(payload[1:9]),
 			VotedFor: raft.NodeID(binary.LittleEndian.Uint64(payload[9:17])),
 		}
-		return nil
+		return s.storage.Save(&hard, nil)
 	case recordKindTruncate:
 		if len(payload) != 9 {
 			return fmt.Errorf("sim: truncate record payload is %d bytes, want 9", len(payload))
@@ -357,15 +413,35 @@ func (s *recoveredState) apply(payload []byte) error {
 		if from == 0 {
 			return errors.New("sim: truncate record from index 0")
 		}
-		s.entries = truncateFromIndex(s.entries, from)
-		return nil
+		return s.storage.TruncateSuffix(from)
 	case recordKindEntries:
 		entries, err := decodeEntriesBody(payload[1:])
 		if err != nil {
 			return err
 		}
-		s.entries = append(truncateFromIndex(s.entries, entries[0].Index), entries...)
+		return s.storage.Save(nil, entries)
+	case recordKindSnapshot:
+		if len(payload) != 33 {
+			return fmt.Errorf("sim: snapshot record payload is %d bytes, want 33", len(payload))
+		}
+		snapshot := raft.SnapshotMeta{Index: binary.LittleEndian.Uint64(payload[1:9]), Term: binary.LittleEndian.Uint64(payload[9:17])}
+		wantCompacted := raft.SnapshotMeta{Index: binary.LittleEndian.Uint64(payload[17:25]), Term: binary.LittleEndian.Uint64(payload[25:33])}
+		if err := s.storage.SaveSnapshot(snapshot); err != nil {
+			return fmt.Errorf("sim: replay snapshot record: %w", err)
+		}
+		gotCompacted, err := s.storage.Compacted()
+		if err != nil {
+			return err
+		}
+		if gotCompacted != wantCompacted {
+			return fmt.Errorf("sim: snapshot record compacted meta %+v, replay derived %+v", wantCompacted, gotCompacted)
+		}
 		return nil
+	case recordKindCompact:
+		if len(payload) != 9 {
+			return fmt.Errorf("sim: compact record payload is %d bytes, want 9", len(payload))
+		}
+		return s.storage.Compact(binary.LittleEndian.Uint64(payload[1:9]))
 	default:
 		return fmt.Errorf("sim: unknown record kind %d", payload[0])
 	}
@@ -374,26 +450,7 @@ func (s *recoveredState) apply(payload []byte) error {
 // view materializes the folded state as a MemStorage so reads keep the
 // frozen bounds semantics. MemStorage.Save never fails.
 func (s *recoveredState) view() *storage.MemStorage {
-	view := storage.NewMemStorage()
-	_ = view.Save(&s.hard, nil)
-	if len(s.entries) > 0 {
-		_ = view.Save(nil, s.entries)
-	}
-	return view
-}
-
-// truncateFromIndex drops the suffix at index and above: the cut
-// Storage.Save applies before appending an overlapping batch, and the whole
-// effect of a truncate record.
-func truncateFromIndex(entries []raftpb.Entry, index uint64) []raftpb.Entry {
-	cut := len(entries)
-	for i := range entries {
-		if entries[i].Index >= index {
-			cut = i
-			break
-		}
-	}
-	return entries[:cut]
+	return s.storage
 }
 
 func decodeEntriesBody(body []byte) ([]raftpb.Entry, error) {

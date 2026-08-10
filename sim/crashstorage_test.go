@@ -671,6 +671,46 @@ func TestCrashStorageHostCrashRecoverAndMisuse(t *testing.T) {
 	}
 }
 
+func TestCrashStorageInstalledSnapshotRecoveryKeepsLaterValidSuffix(t *testing.T) {
+	store, err := NewCrashStorage(1, FaultSchedule{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := []raftpb.Entry{
+		{Index: 1, Term: 1, Type: raftpb.EntryType_NORMAL},
+		{Index: 2, Term: 1, Type: raftpb.EntryType_NORMAL},
+		{Index: 3, Term: 1, Type: raftpb.EntryType_NORMAL},
+		{Index: 4, Term: 1, Type: raftpb.EntryType_NORMAL},
+	}
+	if err := store.Save(&raft.HardState{Term: 2}, old); err != nil {
+		t.Fatal(err)
+	}
+	installed := raft.SnapshotMeta{Index: 2, Term: 2}
+	if err := store.SaveSnapshot(installed); err != nil {
+		t.Fatal(err)
+	}
+	wantSuffix := []raftpb.Entry{{Index: 3, Term: 2, Type: raftpb.EntryType_NORMAL, Data: []byte("valid-after-install")}}
+	if err := store.Save(nil, wantSuffix); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Crash(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := store.Snapshot(); err != nil || got != installed {
+		t.Fatalf("Snapshot() = %+v,%v, want %+v", got, err, installed)
+	}
+	if got, err := store.Compacted(); err != nil || got != installed {
+		t.Fatalf("Compacted() = %+v,%v, want %+v", got, err, installed)
+	}
+	got, err := store.Entries(3, 4)
+	if err != nil || !reflect.DeepEqual(got, wantSuffix) {
+		t.Fatalf("recovered suffix = %#v,%v, want %#v", got, err, wantSuffix)
+	}
+}
+
 // TestCrashStorageArmedAfterSendCrashFiresAtNextSaveAsBackstop documents the
 // host contract for CrashAfterSend: the crash is meant to fire via
 // CrashIfArmed right after the send step, and a host that instead reaches
