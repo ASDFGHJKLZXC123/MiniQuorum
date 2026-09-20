@@ -452,7 +452,15 @@ func (n *Node) handleAppendEntries(m *raftpb.Message, req *raftpb.AppendEntriesR
 		return
 	}
 	if !n.log.matches(req.PrevLogIndex, req.PrevLogTerm) {
-		n.sendAppendEntriesResponse(NodeID(m.From), false, 0)
+		// A predecessor strictly below the compacted base is unavailable rather
+		// than conflicting. Point the leader at that retained boundary without
+		// claiming success; a term mismatch at the boundary remains an ordinary
+		// rejection because the boundary itself is still comparable.
+		hint := uint64(0)
+		if req.PrevLogIndex < n.log.snapshot.Index {
+			hint = n.log.snapshot.Index
+		}
+		n.sendAppendEntriesResponse(NodeID(m.From), false, hint)
 		return
 	}
 	if changed := n.log.appendFromLeader(req.Entries); changed != 0 && changed < n.unstableIndex {
@@ -496,6 +504,21 @@ func (n *Node) handleAppendEntriesResponse(m *raftpb.Message, resp *raftpb.Appen
 		if n.nextIndex[peer] <= n.log.lastIndex() || commitAdvanced {
 			n.sendAppend(peer, false)
 		}
+		return
+	}
+
+	// A non-zero index on failure is a compaction reposition hint, never an
+	// acknowledgement. Accept only bounded hints that move strictly beyond the
+	// exact request still in flight. Stale, duplicate, and invalid hints leave
+	// that request intact so its eventual success remains attributable.
+	if hint := resp.MatchIndex; hint != 0 {
+		if hint == ^uint64(0) || hint > n.log.lastIndex() ||
+			hint <= pending.prevIndex || hint+1 <= n.nextIndex[peer] {
+			return
+		}
+		n.inflight[peer] = nil
+		n.nextIndex[peer] = hint + 1
+		n.sendAppend(peer, false)
 		return
 	}
 
