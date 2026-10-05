@@ -2,8 +2,9 @@ package mapsm
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -200,18 +201,68 @@ func TestHashIsOrderIndependentAndCoversFullState(t *testing.T) {
 	}
 }
 
-func TestSnapshotStubs(t *testing.T) {
-	sm := New()
-	applyCommand(t, sm, 1, 1, &raftpb.Command{ClientId: 1, Seq: 1, Op: raftpb.Op_PUT, Key: []byte("k"), Value: []byte("v")})
-	before := sm.Hash()
-	if err := sm.CreateSnapshot(t.TempDir(), raft.SnapshotMeta{Index: 1, Term: 2}); !errors.Is(err, statemachine.ErrSnapshotUnsupported) {
-		t.Fatalf("CreateSnapshot() error = %v, want ErrSnapshotUnsupported", err)
+func TestSnapshotRoundTripPreservesExactStateDedupMetaAndDeterministicBytes(t *testing.T) {
+	first, second := New(), New()
+	commands := []*raftpb.Command{
+		{ClientId: 10, Seq: 1, Op: raftpb.Op_PUT, Key: []byte("beta"), Value: []byte("two")},
+		{ClientId: 20, Seq: 1, Op: raftpb.Op_PUT, Key: []byte("alpha"), Value: []byte("one")},
 	}
-	if _, err := sm.RestoreSnapshot(t.TempDir()); !errors.Is(err, statemachine.ErrSnapshotUnsupported) {
-		t.Fatalf("RestoreSnapshot() error = %v, want ErrSnapshotUnsupported", err)
+	applyCommand(t, first, 1, 1, commands[0])
+	applyCommand(t, first, 2, 1, commands[1])
+	applyCommand(t, second, 1, 1, commands[1])
+	applyCommand(t, second, 2, 1, commands[0])
+	for _, sm := range []*MapStateMachine{first, second} {
+		got := applyCommand(t, sm, 3, 1, &raftpb.Command{ClientId: 30, Seq: 7, Op: raftpb.Op_GET, Key: []byte("alpha")})
+		if !got.Found || !bytes.Equal(got.Value, []byte("one")) {
+			t.Fatalf("pre-snapshot GET result = %#v, want found one", got)
+		}
 	}
-	if got := sm.Hash(); got != before {
-		t.Fatalf("snapshot stubs mutated state: hash = %x, want %x", got, before)
+	if first.Hash() != second.Hash() {
+		t.Fatalf("logically identical pre-snapshot hashes differ: %x != %x", first.Hash(), second.Hash())
+	}
+
+	meta := raft.SnapshotMeta{Index: 3, Term: 7}
+	firstDir, secondDir := t.TempDir(), t.TempDir()
+	if err := first.CreateSnapshot(firstDir, meta); err != nil {
+		t.Fatalf("first CreateSnapshot(): %v", err)
+	}
+	if err := second.CreateSnapshot(secondDir, meta); err != nil {
+		t.Fatalf("second CreateSnapshot(): %v", err)
+	}
+	firstBytes, err := os.ReadFile(filepath.Join(firstDir, mapSnapshotFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBytes, err := os.ReadFile(filepath.Join(secondDir, mapSnapshotFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(firstBytes, secondBytes) {
+		t.Fatal("deterministic snapshots differ for identical state built in different map insertion orders")
+	}
+
+	restored := New()
+	gotMeta, err := restored.RestoreSnapshot(firstDir)
+	if err != nil {
+		t.Fatalf("RestoreSnapshot(): %v", err)
+	}
+	if gotMeta != meta {
+		t.Fatalf("RestoreSnapshot() meta = %+v, want %+v", gotMeta, meta)
+	}
+	if got, want := restored.Hash(), first.Hash(); got != want {
+		t.Fatalf("restored Hash() = %x, want %x", got, want)
+	}
+	if got, err := restored.Read([]byte("beta")); err != nil || !got.Found || !bytes.Equal(got.Value, []byte("two")) {
+		t.Fatalf("restored Read(beta) = %#v, %v; want found two", got, err)
+	}
+
+	applyCommand(t, restored, 4, 7, &raftpb.Command{ClientId: 40, Seq: 1, Op: raftpb.Op_PUT, Key: []byte("alpha"), Value: []byte("new")})
+	retry := applyCommand(t, restored, 5, 7, &raftpb.Command{ClientId: 30, Seq: 7, Op: raftpb.Op_GET, Key: []byte("alpha")})
+	if !retry.Found || !bytes.Equal(retry.Value, []byte("one")) {
+		t.Fatalf("deduplicated GET retry = %#v, want cached pre-snapshot one", retry)
+	}
+	if got, err := restored.Read([]byte("alpha")); err != nil || !got.Found || !bytes.Equal(got.Value, []byte("new")) {
+		t.Fatalf("Read(alpha) after dedup retry = %#v, %v; want current new", got, err)
 	}
 }
 

@@ -35,10 +35,16 @@ func main() {
 	var peersFlag string
 	var dataDir string
 	var engineFlag string
+	var snapshotEntries uint64
+	var snapshotBytes uint64
+	var snapshotTail uint64
 	flag.Uint64Var(&id, "id", 0, "this node ID")
 	flag.StringVar(&peersFlag, "peers", "", "comma-separated id=address peers")
 	flag.StringVar(&dataDir, "data-dir", "", "directory for this node's durable Raft log")
 	flag.StringVar(&engineFlag, "engine", "map", "state-machine engine: map or lsm")
+	flag.Uint64Var(&snapshotEntries, "snapshot-entries", server.DefaultSnapshotEntryThreshold, "snapshot after more than this many applied Raft entries")
+	flag.Uint64Var(&snapshotBytes, "snapshot-bytes", server.DefaultSnapshotByteThreshold, "snapshot after more than this many applied Raft-log bytes")
+	flag.Uint64Var(&snapshotTail, "snapshot-tail", server.DefaultSnapshotTailEntries, "Raft entries retained behind each snapshot")
 	flag.Parse()
 	if id == 0 {
 		log.Print("--id is required")
@@ -74,16 +80,6 @@ func main() {
 		}
 	}()
 
-	rnd, err := newProdRand()
-	if err != nil {
-		log.Printf("seed election jitter rand: %v", err)
-		return
-	}
-	node, err := server.NewRecoveredNode(raft.Config{ID: raft.NodeID(id), Peers: peerIDs(peers)}, store, rnd)
-	if err != nil {
-		log.Printf("recover node: %v", err)
-		return
-	}
 	var sm statemachine.StateMachine
 	var closeStateMachine func() error
 	switch engineName {
@@ -105,11 +101,6 @@ func main() {
 			log.Printf("open LSM state machine: %v", openErr)
 			return
 		}
-		if replayErr := lsmStateMachine.BeginReplay(store.FirstIndex(), store.LastIndex()); replayErr != nil {
-			_ = lsmStateMachine.Close()
-			log.Printf("prepare LSM replay: %v", replayErr)
-			return
-		}
 		sm = lsmStateMachine
 		closeStateMachine = lsmStateMachine.Close
 	}
@@ -120,8 +111,37 @@ func main() {
 			}
 		}()
 	}
+	snapshotDir := filepath.Join(dataDir, "snapshots")
+	snapshotMeta, err := server.RecoverSnapshot(snapshotDir, store, sm)
+	if err != nil {
+		log.Printf("recover state-machine snapshot: %v", err)
+		return
+	}
+	if replay, ok := sm.(interface{ BeginReplay(uint64, uint64) error }); ok {
+		if replayErr := replay.BeginReplay(snapshotMeta.Index+1, store.LastIndex()); replayErr != nil {
+			log.Printf("prepare state-machine replay: %v", replayErr)
+			return
+		}
+	}
+	rnd, err := newProdRand()
+	if err != nil {
+		log.Printf("seed election jitter rand: %v", err)
+		return
+	}
+	node, err := server.NewRecoveredNode(raft.Config{ID: raft.NodeID(id), Peers: peerIDs(peers)}, store, rnd)
+	if err != nil {
+		log.Printf("recover node: %v", err)
+		return
+	}
+	snapshotter, err := server.NewSnapshotManager(server.SnapshotConfig{
+		Dir: snapshotDir, EntryThreshold: snapshotEntries, ByteThreshold: snapshotBytes, TailEntries: snapshotTail,
+	}, store, sm, node)
+	if err != nil {
+		log.Printf("configure snapshots: %v", err)
+		return
+	}
 
-	host := &server.Host{Node: node, Storage: store, SelfID: raft.NodeID(id)}
+	host := &server.Host{Node: node, Storage: store, SelfID: raft.NodeID(id), Snapshotter: snapshotter}
 	transport := transportgrpc.New(peers, func(m *raftpb.Message) {
 		if err := host.Step(m); err != nil {
 			log.Printf("miniquorumd node=%d fail-stop (step): %v", id, err)

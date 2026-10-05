@@ -19,6 +19,14 @@ type realFile struct {
 
 var _ File = (*realFile)(nil)
 
+func (RealFS) MkdirAll(name string) error {
+	return normalizeRealFSError(os.MkdirAll(name, 0o700))
+}
+
+func (RealFS) RemoveAll(name string) error {
+	return normalizeRealFSError(os.RemoveAll(name))
+}
+
 func (RealFS) Create(name string) (File, error) {
 	file, err := os.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {

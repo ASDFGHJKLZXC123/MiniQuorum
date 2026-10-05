@@ -23,14 +23,23 @@ after every simulator event.
 
 ## AppendEntries rejection backoff (Phase 2A)
 
-Leader retry uses the paper's linear fallback: each rejected AppendEntries
-decrements that follower's `nextIndex` by one and retries the suffix. The
-conflict-index optimization was intentionally skipped because rejections carry
-no conflict term/index hint; `matchIndex` identifies only the range covered by
-a successful request. The implementation keeps one logical request in flight
-per follower and deterministically resends that same request on a heartbeat
-until a response arrives. This keeps the Phase 2 implementation simple, at the
-cost of O(log length) retries for a severely divergent follower.
+Phase 2 used the paper's linear fallback: each rejected AppendEntries
+decremented that follower's `nextIndex` by one and retried the suffix. General
+conflict-term/index hints were omitted, leaving O(log length) retries for a
+severely divergent follower. The implementation keeps one logical request in
+flight per follower and deterministically resends it on a heartbeat until a
+response arrives.
+
+Phase 6A adds a compaction-specific exception. If the request's predecessor is
+strictly below a follower's compacted boundary, the follower rejects it and
+places that boundary in the response's `matchIndex` field as a reposition hint.
+A valid forward hint changes only the leader's `nextIndex`; it never advances
+acknowledged progress or commitment. A subsequent successful request must
+still acknowledge exactly `prevLogIndex + len(entries)`. Stale, duplicate, and
+out-of-range nonzero hints leave the current request intact. Other rejections
+carry zero and retain the linear fallback. This prevents a lost acknowledgement
+followed by independent follower compaction from trapping the leader in retries
+against an already discarded predecessor.
 
 ## Leadership-lost is wire-compatible with NotLeader (Phase 2C)
 

@@ -28,6 +28,34 @@ func TestProcessReadyOrdersSaveSendApplyAndAdvance(t *testing.T) {
 	}
 }
 
+func TestProcessReadyChecksSnapshotAfterWholeApplyBatchBeforeAdvance(t *testing.T) {
+	events := make([]string, 0, 7)
+	node := &testNode{events: &events, ready: raft.Ready{
+		Messages:         []*raftpb.Message{{To: 2}},
+		CommittedEntries: []raftpb.Entry{{Index: 4}, {Index: 5}},
+	}}
+	observer := &testSnapshotObserver{events: &events}
+	if err := processReadyObserved(node, &testStorage{events: &events}, &testTransport{events: &events}, &testApplier{events: &events}, observer); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"save", "send:2", "apply:4", "apply:5", "snapshot:4-5", "advance"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("events = %v, want %v", events, want)
+	}
+}
+
+func TestProcessReadySnapshotFailureSuppressesAdvance(t *testing.T) {
+	events := make([]string, 0, 5)
+	wantErr := errors.New("snapshot failed")
+	node := &testNode{events: &events, ready: raft.Ready{CommittedEntries: []raftpb.Entry{{Index: 4}}}}
+	err := processReadyObserved(node, &testStorage{events: &events}, &testTransport{events: &events}, &testApplier{events: &events}, &testSnapshotObserver{events: &events, err: wantErr})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("processReadyObserved() error = %v, want %v", err, wantErr)
+	}
+	if want := []string{"save", "apply:4", "snapshot:4-4"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("events = %v, want no Advance after snapshot failure: %v", events, want)
+	}
+}
+
 func TestProcessReadySaveFailureHasNoOtherEffects(t *testing.T) {
 	events := make([]string, 0, 1)
 	wantErr := errors.New("save failed")
@@ -98,6 +126,16 @@ type testApplier struct {
 	events    *[]string
 	failIndex uint64
 	err       error
+}
+
+type testSnapshotObserver struct {
+	events *[]string
+	err    error
+}
+
+func (o *testSnapshotObserver) ObserveApplied(entries []raftpb.Entry) error {
+	*o.events = append(*o.events, "snapshot:"+strconv.FormatUint(entries[0].Index, 10)+"-"+strconv.FormatUint(entries[len(entries)-1].Index, 10))
+	return o.err
 }
 
 func (a *testApplier) Apply(entry *raftpb.Entry) error {

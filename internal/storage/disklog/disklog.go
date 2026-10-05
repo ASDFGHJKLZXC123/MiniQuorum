@@ -60,6 +60,8 @@ const DefaultRotateSize = 8 << 20
 
 const (
 	segmentSuffix    = ".seg"
+	snapshotMetaName = "SNAPSHOT"
+	snapshotTempName = "SNAPSHOT.tmp"
 	frameStart       = byte(0xFA)
 	frameEnd         = byte(0xFB)
 	frameSymbolBase  = byte(0x40)
@@ -67,7 +69,10 @@ const (
 	frameHeaderSize  = 8 // uint32 payload length + uint32 crc32c
 	frameMarkerBytes = 2
 	encodedByteWidth = 2
+	snapshotMetaSize = 52 // magic, state snapshot, compacted base, segment floor, crc32c
 )
+
+var snapshotMetaMagic = [8]byte{'M', 'Q', 'S', 'N', 'A', 'P', '0', '2'}
 
 // ErrCorrupt marks startup damage that cannot be attributed to the sole
 // removable torn tail: EOF after a start marker and before its terminator in
@@ -110,8 +115,11 @@ type DiskLog struct {
 	activeSeq  uint64
 	activeSize int64
 
-	hard    raft.HardState
-	entries []raftpb.Entry
+	hard         raft.HardState
+	snapshot     raft.SnapshotMeta
+	compacted    raft.SnapshotMeta
+	segmentFloor uint64
+	entries      []raftpb.Entry
 
 	// failed poisons every later Save after a failed durable step: bytes
 	// appended after a partial frame would read back as mid-log corruption.
@@ -129,10 +137,11 @@ func Open(dir string, opts Options) (*DiskLog, error) {
 		return nil, fmt.Errorf("disklog: negative rotate size %d", opts.RotateSize)
 	}
 	l := &DiskLog{
-		dirPath:    dir,
-		rotateSize: opts.RotateSize,
-		syncFile:   opts.syncFile,
-		syncDir:    opts.syncDir,
+		dirPath:      dir,
+		rotateSize:   opts.RotateSize,
+		syncFile:     opts.syncFile,
+		syncDir:      opts.syncDir,
+		segmentFloor: 1,
 	}
 	if l.rotateSize == 0 {
 		l.rotateSize = DefaultRotateSize
@@ -148,11 +157,25 @@ func Open(dir string, opts Options) (*DiskLog, error) {
 		return nil, fmt.Errorf("disklog: open dir: %w", err)
 	}
 	l.dir = dirFile
-	seqs, err := listSegments(dir)
+	err = l.removeSnapshotTemp()
+	if err == nil {
+		l.snapshot, l.compacted, l.segmentFloor, err = l.loadSnapshotMeta()
+	}
+	seqs := []uint64(nil)
+	if err == nil {
+		seqs, err = listSegments(dir)
+	}
+	if err == nil && len(seqs) > 0 {
+		seqs, err = l.discardRetiredSegmentPrefix(seqs)
+	}
 	if err == nil {
 		if len(seqs) == 0 {
-			l.active, err = l.createSegment(1)
-			l.activeSeq, l.activeSize = 1, 0
+			if l.snapshot != (raft.SnapshotMeta{}) || l.compacted != (raft.SnapshotMeta{}) {
+				err = fmt.Errorf("%w: snapshot metadata exists but every Raft segment is missing", ErrCorrupt)
+			} else {
+				l.active, err = l.createSegment(1)
+				l.activeSeq, l.activeSize = 1, 0
+			}
 		} else {
 			err = l.recover(seqs)
 		}
@@ -184,7 +207,7 @@ func (l *DiskLog) Save(hs *raft.HardState, entries []raftpb.Entry) error {
 	if hs == nil && len(entries) == 0 {
 		return nil // nothing new to make durable
 	}
-	last := lastIndex(l.entries)
+	last := l.lastIndexLocked()
 	if err := checkContiguous(entries, last); err != nil {
 		return err // nothing hit the disk; the log stays usable
 	}
@@ -219,6 +242,110 @@ func (l *DiskLog) Save(hs *raft.HardState, entries []raftpb.Entry) error {
 	return nil
 }
 
+// SaveSnapshot durably publishes the newest snapshot position in a separate
+// fixed-size record. The state-machine snapshot directory is already durable
+// when the server calls this method; file sync, rename, then directory sync
+// make this metadata the later side of that ordering boundary.
+func (l *DiskLog) SaveSnapshot(meta raft.SnapshotMeta) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return errClosed
+	}
+	if l.failed != nil {
+		return fmt.Errorf("disklog: poisoned by earlier failure: %w", l.failed)
+	}
+	if err := validateSnapshotAdvance(l.snapshot, meta); err != nil {
+		return err
+	}
+	if meta == l.snapshot {
+		return nil
+	}
+	compacted := l.compacted
+	installed := false
+	if meta.Index != 0 {
+		if term, ok := l.entryTermLocked(meta.Index); !ok || term != meta.Term {
+			// An installed snapshot need not have a matching local entry X.
+			// With no valid overlap, publish X as both state snapshot and log
+			// base; Compact(X) may later reclaim whole physical segments.
+			compacted = meta
+			installed = true
+		}
+	}
+	if installed {
+		// A suffix is reusable after InstallSnapshot only when its entry X has
+		// the snapshot term. Durably invalidate X+1 and later before publishing
+		// SNAPSHOT, so neither side of a crash can resurrect a conflicting tail.
+		batch, err := appendFrame(nil, &raftpb.LogRecord{Body: &raftpb.LogRecord_Truncate{Truncate: &raftpb.TruncateRecord{FromIndex: meta.Index + 1}}})
+		if err != nil {
+			return err
+		}
+		if err := l.rotateIfNeeded(int64(len(batch))); err != nil {
+			l.failed = err
+			return err
+		}
+		if err := l.appendActiveLocked(batch); err != nil {
+			l.failed = err
+			return err
+		}
+		l.truncateEntries(meta.Index + 1)
+	}
+	if err := l.persistSnapshotStateLocked(meta, compacted, l.segmentFloor); err != nil {
+		if installed {
+			l.failed = err
+		}
+		return err
+	}
+	l.snapshot = meta
+	l.compacted = compacted
+	if installed {
+		// X and below are covered by the snapshot; the standalone truncate
+		// record above already invalidated the old suffix.
+		clear(l.entries)
+		l.entries = nil
+	} else if compacted.Index == meta.Index {
+		l.dropCompactedEntriesLocked()
+	}
+	return nil
+}
+
+func (l *DiskLog) persistSnapshotStateLocked(snapshot, compacted raft.SnapshotMeta, segmentFloor uint64) error {
+	data := encodeSnapshotMeta(snapshot, compacted, segmentFloor)
+	tempPath := filepath.Join(l.dirPath, snapshotTempName)
+	if err := os.Remove(tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("disklog: remove stale snapshot metadata temp: %w", err)
+	}
+	file, err := os.OpenFile(tempPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("disklog: create snapshot metadata temp: %w", err)
+	}
+	failed := func(cause error) error {
+		l.failed = cause
+		return cause
+	}
+	if n, writeErr := file.Write(data); writeErr != nil {
+		_ = file.Close()
+		return failed(fmt.Errorf("disklog: write snapshot metadata: %w", writeErr))
+	} else if n != len(data) {
+		_ = file.Close()
+		return failed(fmt.Errorf("disklog: write snapshot metadata: wrote %d of %d bytes: %w", n, len(data), io.ErrShortWrite))
+	}
+	if err := l.syncFile(file); err != nil {
+		_ = file.Close()
+		return failed(fmt.Errorf("disklog: sync snapshot metadata: %w", err))
+	}
+	if err := file.Close(); err != nil {
+		return failed(fmt.Errorf("disklog: close snapshot metadata: %w", err))
+	}
+	if err := os.Rename(tempPath, filepath.Join(l.dirPath, snapshotMetaName)); err != nil {
+		return failed(fmt.Errorf("disklog: publish snapshot metadata: %w", err))
+	}
+	if err := l.syncDir(l.dir); err != nil {
+		return failed(fmt.Errorf("disklog: sync dir after snapshot metadata: %w", err))
+	}
+	return nil
+}
+
 // HardState returns the last saved (or recovered) hard state.
 func (l *DiskLog) HardState() (raft.HardState, error) {
 	l.mu.RLock()
@@ -226,11 +353,27 @@ func (l *DiskLog) HardState() (raft.HardState, error) {
 	return l.hard, nil
 }
 
+// Snapshot returns the last durably published snapshot position.
+func (l *DiskLog) Snapshot() (raft.SnapshotMeta, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.snapshot, nil
+}
+
+// Compacted returns the durable predecessor of the retained Raft log. It is
+// intentionally distinct from Snapshot so the overlap (Compacted, Snapshot]
+// remains available to replication after restart.
+func (l *DiskLog) Compacted() (raft.SnapshotMeta, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.compacted, nil
+}
+
 // Entries returns deep copies of the stored entries in [lo, hi).
 func (l *DiskLog) Entries(lo, hi uint64) ([]raftpb.Entry, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	first, last := firstLast(l.entries)
+	first, last := l.firstLastLocked()
 	if lo > hi || lo < first || hi > last+1 {
 		return nil, storage.ErrOutOfBounds
 	}
@@ -241,7 +384,7 @@ func (l *DiskLog) Entries(lo, hi uint64) ([]raftpb.Entry, error) {
 func (l *DiskLog) FirstIndex() uint64 {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	first, _ := firstLast(l.entries)
+	first, _ := l.firstLastLocked()
 	return first
 }
 
@@ -249,7 +392,140 @@ func (l *DiskLog) FirstIndex() uint64 {
 func (l *DiskLog) LastIndex() uint64 {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	return lastIndex(l.entries)
+	return l.lastIndexLocked()
+}
+
+// Compact removes only complete, closed segment files whose every physical
+// EntriesRecord ends at or before uptoIndex. A fresh active segment carrying
+// a durable HardState checkpoint is created first, so prefix deletion cannot
+// discard the latest term/vote state. A segment straddling the boundary is
+// retained whole.
+func (l *DiskLog) Compact(uptoIndex uint64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return errClosed
+	}
+	if l.failed != nil {
+		return fmt.Errorf("disklog: poisoned by earlier failure: %w", l.failed)
+	}
+	if uptoIndex > l.snapshot.Index {
+		return fmt.Errorf("%w: compact through %d, snapshot index %d", storage.ErrCompactionBeyondSnapshot, uptoIndex, l.snapshot.Index)
+	}
+	if uptoIndex == 0 {
+		return nil
+	}
+	if uptoIndex < l.compacted.Index {
+		return nil
+	}
+	base := l.compacted
+	if uptoIndex > base.Index {
+		term, ok := l.termLocked(uptoIndex)
+		if !ok {
+			return fmt.Errorf("disklog: compact index %d has no retained term", uptoIndex)
+		}
+		base = raft.SnapshotMeta{Index: uptoIndex, Term: term}
+	}
+	// First create a durable HardState checkpoint in a fresh survivor. If a
+	// crash precedes metadata publication, the old segment floor still causes
+	// recovery to replay the full prefix plus this harmless checkpoint.
+	if err := l.rotateForCompactionLocked(); err != nil {
+		l.failed = err
+		return err
+	}
+	checkpoint, err := encodeBatch(&l.hard, nil, l.lastIndexLocked())
+	if err != nil {
+		return err
+	}
+	if err := l.appendActiveLocked(checkpoint); err != nil {
+		l.failed = err
+		return err
+	}
+
+	seqs, err := listSegments(l.dirPath)
+	if err != nil {
+		return err
+	}
+	deleteCount := 0
+	discardEveryClosed := uptoIndex == l.snapshot.Index && l.compacted.Index == l.snapshot.Index && len(l.entries) == 0
+	for _, seq := range seqs {
+		if seq == l.activeSeq {
+			break
+		}
+		if discardEveryClosed {
+			// InstallSnapshot with a missing/conflicting boundary durably
+			// invalidated its entire old suffix before setting B=X. With no
+			// subsequently appended live tail, every pre-checkpoint segment is
+			// obsolete even if its physical history once contained indexes >X.
+			deleteCount++
+			continue
+		}
+		maxIndex, hasEntries, scanErr := l.segmentEntryMaximum(seq)
+		if scanErr != nil {
+			return scanErr
+		}
+		if hasEntries && maxIndex > uptoIndex {
+			break
+		}
+		deleteCount++
+	}
+	if deleteCount >= len(seqs) {
+		l.failed = ErrCorrupt
+		return fmt.Errorf("%w: compaction selected every segment including active %s", ErrCorrupt, segmentName(l.activeSeq))
+	}
+	newFloor := seqs[deleteCount]
+	// Publish B and the exact first surviving segment before the first unlink.
+	// Recovery can ignore a leftover physical prefix, but it rejects a missing
+	// declared survivor instead of mistaking data loss for prior compaction.
+	if base != l.compacted || newFloor != l.segmentFloor {
+		if err := l.persistSnapshotStateLocked(l.snapshot, base, newFloor); err != nil {
+			return err
+		}
+		l.compacted = base
+		l.segmentFloor = newFloor
+	}
+	if deleteCount == 0 {
+		l.dropCompactedEntriesLocked()
+		return nil
+	}
+	for _, seq := range seqs[:deleteCount] {
+		if err := os.Remove(l.segmentPath(seq)); err != nil {
+			l.failed = err
+			return fmt.Errorf("disklog: remove compacted segment %s: %w", segmentName(seq), err)
+		}
+		// Sync every oldest-prefix deletion before attempting the next. Thus
+		// every crash-visible namespace is a contiguous suffix, never a
+		// persisted middle gap whose recovery meaning would be ambiguous.
+		if err := l.syncDir(l.dir); err != nil {
+			l.failed = err
+			return fmt.Errorf("disklog: sync dir after removing %s: %w", segmentName(seq), err)
+		}
+	}
+	remaining := seqs[deleteCount:]
+	if err := l.rebuildMirrorLocked(remaining); err != nil {
+		l.failed = err
+		return err
+	}
+	return nil
+}
+
+func (l *DiskLog) termLocked(index uint64) (uint64, bool) {
+	if index == l.snapshot.Index {
+		return l.snapshot.Term, true
+	}
+	if index == l.compacted.Index {
+		return l.compacted.Term, true
+	}
+	return l.entryTermLocked(index)
+}
+
+func (l *DiskLog) entryTermLocked(index uint64) (uint64, bool) {
+	for i := range l.entries {
+		if l.entries[i].Index == index {
+			return l.entries[i].Term, true
+		}
+	}
+	return 0, false
 }
 
 // Close releases the directory and active-segment handles. Every successful
@@ -314,6 +590,170 @@ func (l *DiskLog) createSegment(seq uint64) (*os.File, error) {
 	return f, nil
 }
 
+func (l *DiskLog) rotateForCompactionLocked() error {
+	if l.active == nil {
+		return errors.New("disklog: no active segment")
+	}
+	if l.activeSeq == math.MaxUint64 {
+		return errors.New("disklog: segment sequence overflow")
+	}
+	if err := l.active.Close(); err != nil {
+		return fmt.Errorf("disklog: close %s for compaction: %w", segmentName(l.activeSeq), err)
+	}
+	l.active = nil
+	next, err := l.createSegment(l.activeSeq + 1)
+	if err != nil {
+		return err
+	}
+	l.active = next
+	l.activeSeq++
+	l.activeSize = 0
+	return nil
+}
+
+func (l *DiskLog) appendActiveLocked(batch []byte) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	if n, err := l.active.Write(batch); err != nil {
+		return fmt.Errorf("disklog: write %s: %w", segmentName(l.activeSeq), err)
+	} else if n != len(batch) {
+		return fmt.Errorf("disklog: write %s: wrote %d of %d bytes: %w", segmentName(l.activeSeq), n, len(batch), io.ErrShortWrite)
+	}
+	if err := l.syncFile(l.active); err != nil {
+		return fmt.Errorf("disklog: sync %s: %w", segmentName(l.activeSeq), err)
+	}
+	l.activeSize += int64(len(batch))
+	return nil
+}
+
+func validateSnapshotAdvance(current, next raft.SnapshotMeta) error {
+	if next.Index == math.MaxUint64 {
+		return errors.New("disklog: snapshot index overflows first index")
+	}
+	if next.Index == 0 {
+		if next.Term != 0 {
+			return errors.New("disklog: zero snapshot index has nonzero term")
+		}
+		if current != (raft.SnapshotMeta{}) {
+			return fmt.Errorf("disklog: snapshot index regresses from %d to 0", current.Index)
+		}
+		return nil
+	}
+	if next.Term == 0 {
+		return fmt.Errorf("disklog: snapshot index %d has zero term", next.Index)
+	}
+	if next.Index < current.Index {
+		return fmt.Errorf("disklog: snapshot index regresses from %d to %d", current.Index, next.Index)
+	}
+	if next.Index == current.Index && current != (raft.SnapshotMeta{}) && next.Term != current.Term {
+		return fmt.Errorf("disklog: snapshot term changed at index %d from %d to %d", next.Index, current.Term, next.Term)
+	}
+	return nil
+}
+
+func encodeSnapshotMeta(snapshot, compacted raft.SnapshotMeta, segmentFloor uint64) []byte {
+	data := make([]byte, snapshotMetaSize)
+	copy(data[:8], snapshotMetaMagic[:])
+	binary.LittleEndian.PutUint64(data[8:16], snapshot.Index)
+	binary.LittleEndian.PutUint64(data[16:24], snapshot.Term)
+	binary.LittleEndian.PutUint64(data[24:32], compacted.Index)
+	binary.LittleEndian.PutUint64(data[32:40], compacted.Term)
+	binary.LittleEndian.PutUint64(data[40:48], segmentFloor)
+	binary.LittleEndian.PutUint32(data[48:52], crc32.Checksum(data[:48], castagnoli))
+	return data
+}
+
+func decodeSnapshotMeta(data []byte) (raft.SnapshotMeta, raft.SnapshotMeta, uint64, error) {
+	if len(data) != snapshotMetaSize {
+		return raft.SnapshotMeta{}, raft.SnapshotMeta{}, 0, fmt.Errorf("%w: snapshot metadata is %d bytes, want %d", ErrCorrupt, len(data), snapshotMetaSize)
+	}
+	if string(data[:8]) != string(snapshotMetaMagic[:]) {
+		return raft.SnapshotMeta{}, raft.SnapshotMeta{}, 0, fmt.Errorf("%w: snapshot metadata magic mismatch", ErrCorrupt)
+	}
+	if stored, computed := binary.LittleEndian.Uint32(data[48:52]), crc32.Checksum(data[:48], castagnoli); stored != computed {
+		return raft.SnapshotMeta{}, raft.SnapshotMeta{}, 0, fmt.Errorf("%w: snapshot metadata crc32c mismatch: stored %08x, computed %08x", ErrCorrupt, stored, computed)
+	}
+	snapshot := raft.SnapshotMeta{Index: binary.LittleEndian.Uint64(data[8:16]), Term: binary.LittleEndian.Uint64(data[16:24])}
+	compacted := raft.SnapshotMeta{Index: binary.LittleEndian.Uint64(data[24:32]), Term: binary.LittleEndian.Uint64(data[32:40])}
+	segmentFloor := binary.LittleEndian.Uint64(data[40:48])
+	if err := validateSnapshotAdvance(raft.SnapshotMeta{}, snapshot); err != nil {
+		return raft.SnapshotMeta{}, raft.SnapshotMeta{}, 0, fmt.Errorf("%w: invalid state snapshot metadata: %v", ErrCorrupt, err)
+	}
+	if err := validateSnapshotAdvance(raft.SnapshotMeta{}, compacted); err != nil {
+		return raft.SnapshotMeta{}, raft.SnapshotMeta{}, 0, fmt.Errorf("%w: invalid compacted metadata: %v", ErrCorrupt, err)
+	}
+	if compacted.Index > snapshot.Index {
+		return raft.SnapshotMeta{}, raft.SnapshotMeta{}, 0, fmt.Errorf("%w: compacted index %d exceeds state snapshot index %d", ErrCorrupt, compacted.Index, snapshot.Index)
+	}
+	if segmentFloor == 0 {
+		return raft.SnapshotMeta{}, raft.SnapshotMeta{}, 0, fmt.Errorf("%w: snapshot metadata has zero segment floor", ErrCorrupt)
+	}
+	return snapshot, compacted, segmentFloor, nil
+}
+
+func (l *DiskLog) removeSnapshotTemp() error {
+	path := filepath.Join(l.dirPath, snapshotTempName)
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("disklog: remove orphan snapshot metadata temp: %w", err)
+	}
+	if err := l.syncDir(l.dir); err != nil {
+		return fmt.Errorf("disklog: sync dir after orphan snapshot metadata cleanup: %w", err)
+	}
+	return nil
+}
+
+func (l *DiskLog) loadSnapshotMeta() (raft.SnapshotMeta, raft.SnapshotMeta, uint64, error) {
+	path := filepath.Join(l.dirPath, snapshotMetaName)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return raft.SnapshotMeta{}, raft.SnapshotMeta{}, 1, nil
+	}
+	if err != nil {
+		return raft.SnapshotMeta{}, raft.SnapshotMeta{}, 0, fmt.Errorf("disklog: read snapshot metadata: %w", err)
+	}
+	snapshot, compacted, segmentFloor, err := decodeSnapshotMeta(data)
+	if err != nil {
+		return raft.SnapshotMeta{}, raft.SnapshotMeta{}, 0, err
+	}
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return raft.SnapshotMeta{}, raft.SnapshotMeta{}, 0, fmt.Errorf("disklog: open snapshot metadata for recovery sync: %w", err)
+	}
+	if err := l.syncFile(file); err != nil {
+		_ = file.Close()
+		return raft.SnapshotMeta{}, raft.SnapshotMeta{}, 0, fmt.Errorf("disklog: recovery sync snapshot metadata: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return raft.SnapshotMeta{}, raft.SnapshotMeta{}, 0, fmt.Errorf("disklog: close snapshot metadata after recovery sync: %w", err)
+	}
+	return snapshot, compacted, segmentFloor, nil
+}
+
+// discardRetiredSegmentPrefix completes any crash-interrupted deletion that
+// followed atomic publication of segmentFloor. Files below the floor are
+// known obsolete; the floor itself must exist exactly, or startup reports
+// data loss instead of treating a missing leading segment as compaction.
+func (l *DiskLog) discardRetiredSegmentPrefix(seqs []uint64) ([]uint64, error) {
+	position := sort.Search(len(seqs), func(i int) bool { return seqs[i] >= l.segmentFloor })
+	if position == len(seqs) || seqs[position] != l.segmentFloor {
+		first := seqs[0]
+		return nil, fmt.Errorf("%w: segment sequence gap: declared first segment %s is missing (first present %s)", ErrCorrupt, segmentName(l.segmentFloor), segmentName(first))
+	}
+	for _, seq := range seqs[:position] {
+		if err := os.Remove(l.segmentPath(seq)); err != nil {
+			return nil, fmt.Errorf("disklog: remove retired segment %s during recovery: %w", segmentName(seq), err)
+		}
+		if err := l.syncDir(l.dir); err != nil {
+			return nil, fmt.Errorf("disklog: sync dir after removing retired segment %s: %w", segmentName(seq), err)
+		}
+	}
+	return seqs[position:], nil
+}
+
 // recover replays every segment into the mirror, reopens the last one for
 // appending, and then — before the log serves anything — makes everything it
 // recovered durable: it syncs every segment file and then the directory,
@@ -336,6 +776,10 @@ func (l *DiskLog) recover(seqs []uint64) error {
 			return err
 		}
 	}
+	if err := l.validateRecoveredSnapshotTailLocked(); err != nil {
+		return err
+	}
+	l.dropCompactedEntriesLocked()
 	last := seqs[len(seqs)-1]
 	f, err := os.OpenFile(l.segmentPath(last), os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
@@ -357,6 +801,39 @@ func (l *DiskLog) recover(seqs []uint64) error {
 	}
 	if err := l.syncDir(l.dir); err != nil {
 		return fmt.Errorf("disklog: recovery sync dir: %w", err)
+	}
+	return nil
+}
+
+func (l *DiskLog) validateRecoveredSnapshotTailLocked() error {
+	if l.compacted.Index > l.snapshot.Index {
+		return fmt.Errorf("%w: compacted index %d exceeds snapshot index %d", ErrCorrupt, l.compacted.Index, l.snapshot.Index)
+	}
+	if l.compacted.Index == l.snapshot.Index {
+		if l.compacted.Term != l.snapshot.Term {
+			return fmt.Errorf("%w: compacted/snapshot term mismatch at index %d: %d != %d", ErrCorrupt, l.snapshot.Index, l.compacted.Term, l.snapshot.Term)
+		}
+		return nil
+	}
+	want := l.compacted.Index + 1
+	position := -1
+	for i := range l.entries {
+		if l.entries[i].Index == want {
+			position = i
+			break
+		}
+	}
+	if position < 0 {
+		return fmt.Errorf("%w: retained overlap is missing first index %d", ErrCorrupt, want)
+	}
+	for index := want; index <= l.snapshot.Index; index++ {
+		offset := position + int(index-want)
+		if offset >= len(l.entries) || l.entries[offset].Index != index {
+			return fmt.Errorf("%w: retained overlap is missing index %d", ErrCorrupt, index)
+		}
+		if index == l.snapshot.Index && l.entries[offset].Term != l.snapshot.Term {
+			return fmt.Errorf("%w: snapshot term %d at index %d does not match retained log term %d", ErrCorrupt, l.snapshot.Term, index, l.entries[offset].Term)
+		}
 	}
 	return nil
 }
@@ -427,6 +904,83 @@ func (l *DiskLog) replaySegment(seq uint64, final bool) error {
 		offset = terminator + 1
 	}
 	return nil
+}
+
+// segmentEntryMaximum scans a closed segment without mutating storage and
+// reports the greatest physically encoded entry index. Compact deliberately
+// uses physical coverage: if a segment ever contained an entry beyond the
+// boundary, retaining that whole segment is conservative and crash-safe.
+func (l *DiskLog) segmentEntryMaximum(seq uint64) (uint64, bool, error) {
+	buf, err := os.ReadFile(l.segmentPath(seq))
+	if err != nil {
+		return 0, false, fmt.Errorf("disklog: read %s for compaction: %w", segmentName(seq), err)
+	}
+	var maximum uint64
+	hasEntries := false
+	offset := 0
+	for offset < len(buf) {
+		if buf[offset] != frameStart {
+			return 0, false, fmt.Errorf("%w: %s offset %d: invalid record boundary during compaction", ErrCorrupt, segmentName(seq), offset)
+		}
+		terminator := -1
+		for position := offset + 1; position < len(buf); position++ {
+			symbol := buf[position]
+			if symbol == frameEnd {
+				terminator = position
+				break
+			}
+			if symbol == frameStart || !isFrameSymbol(symbol) {
+				return 0, false, fmt.Errorf("%w: %s offset %d: malformed frame during compaction", ErrCorrupt, segmentName(seq), offset)
+			}
+		}
+		if terminator < 0 {
+			return 0, false, fmt.Errorf("%w: %s offset %d: unterminated closed segment during compaction", ErrCorrupt, segmentName(seq), offset)
+		}
+		record, err := decodeTerminatedFrame(buf[offset+1 : terminator])
+		if err != nil {
+			return 0, false, fmt.Errorf("%w: %s offset %d: %v", ErrCorrupt, segmentName(seq), offset, err)
+		}
+		if body := record.GetEntries(); body != nil {
+			for _, entry := range body.GetEntries() {
+				if entry.GetIndex() > maximum {
+					maximum = entry.GetIndex()
+				}
+				hasEntries = true
+			}
+		}
+		offset = terminator + 1
+	}
+	return maximum, hasEntries, nil
+}
+
+func (l *DiskLog) rebuildMirrorLocked(seqs []uint64) error {
+	scratch := &DiskLog{
+		dirPath:   l.dirPath,
+		snapshot:  l.snapshot,
+		compacted: l.compacted,
+		syncFile:  l.syncFile,
+	}
+	for index, seq := range seqs {
+		if err := scratch.replaySegment(seq, index == len(seqs)-1); err != nil {
+			return fmt.Errorf("disklog: rebuild mirror after compaction: %w", err)
+		}
+	}
+	l.hard = scratch.hard
+	l.entries = scratch.entries
+	l.dropCompactedEntriesLocked()
+	return nil
+}
+
+func (l *DiskLog) dropCompactedEntriesLocked() {
+	cut := 0
+	for cut < len(l.entries) && l.entries[cut].Index <= l.compacted.Index {
+		cut++
+	}
+	if cut == 0 {
+		return
+	}
+	clear(l.entries[:cut])
+	l.entries = append([]raftpb.Entry(nil), l.entries[cut:]...)
 }
 
 func isFrameSymbol(b byte) bool {
@@ -525,8 +1079,9 @@ func (l *DiskLog) applyRecord(record *raftpb.LogRecord) error {
 		if len(incoming) == 0 {
 			return errors.New("empty entries record")
 		}
-		last := lastIndex(l.entries)
-		if first := incoming[0].GetIndex(); first == 0 || first > last+1 {
+		last := l.lastIndexLocked()
+		first := incoming[0].GetIndex()
+		if first == 0 || first > last+1 {
 			return fmt.Errorf("entries record first index %d does not extend last index %d", first, last)
 		}
 		for i := 1; i < len(incoming); i++ {
@@ -773,9 +1328,9 @@ func entryPointers(entries []raftpb.Entry) []*raftpb.Entry {
 	return pointers
 }
 
-// listSegments returns the segment sequence numbers in dir, which must be
-// contiguous from one; segments are never deleted in this phase, so a gap
-// means lost log. Foreign file names are ignored.
+// listSegments returns the segment sequence numbers in dir. Compaction may
+// delete a whole prefix, so the first sequence is arbitrary; every retained
+// successor must still be contiguous. Foreign file names are ignored.
 func listSegments(dir string) ([]uint64, error) {
 	dirEntries, err := os.ReadDir(dir)
 	if err != nil {
@@ -788,9 +1343,9 @@ func listSegments(dir string) ([]uint64, error) {
 		}
 	}
 	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
-	for i, seq := range seqs {
-		if seq != uint64(i)+1 {
-			return nil, fmt.Errorf("%w: segment sequence gap: want %s, have %s", ErrCorrupt, segmentName(uint64(i)+1), segmentName(seq))
+	for i := 1; i < len(seqs); i++ {
+		if seqs[i] != seqs[i-1]+1 {
+			return nil, fmt.Errorf("%w: segment sequence gap: want %s, have %s", ErrCorrupt, segmentName(seqs[i-1]+1), segmentName(seqs[i]))
 		}
 	}
 	return seqs, nil
@@ -821,15 +1376,16 @@ func (l *DiskLog) segmentPath(seq uint64) string {
 	return filepath.Join(l.dirPath, segmentName(seq))
 }
 
-func firstLast(entries []raftpb.Entry) (uint64, uint64) {
+func (l *DiskLog) firstLastLocked() (uint64, uint64) {
+	entries := l.entries
 	if len(entries) == 0 {
-		return 1, 0
+		return l.compacted.Index + 1, l.snapshot.Index
 	}
-	return entries[0].Index, entries[len(entries)-1].Index
+	return entries[0].Index, max(entries[len(entries)-1].Index, l.snapshot.Index)
 }
 
-func lastIndex(entries []raftpb.Entry) uint64 {
-	_, last := firstLast(entries)
+func (l *DiskLog) lastIndexLocked() uint64 {
+	_, last := l.firstLastLocked()
 	return last
 }
 

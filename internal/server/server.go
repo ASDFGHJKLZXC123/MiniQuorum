@@ -16,6 +16,12 @@ type Applier interface {
 	Apply(*raftpb.Entry) error
 }
 
+// SnapshotObserver receives one complete committed-entry batch after every
+// entry has applied and before the Ready is advanced.
+type SnapshotObserver interface {
+	ObserveApplied([]raftpb.Entry) error
+}
+
 // FailStopNotifier is optionally implemented by an Applier that must learn
 // when the host permanently fail-stops (a Ready batch's Storage.Save or
 // state-machine Apply failed). The Host notifies exactly once, on the
@@ -35,10 +41,11 @@ type FailStopNotifier interface {
 // occurs the node is fail-stopped: every subsequent call returns that error
 // without touching the node again.
 type Host struct {
-	Node      *raft.Node
-	Storage   storage.Storage
-	Transport transport.Transport
-	Applier   Applier
+	Node        *raft.Node
+	Storage     storage.Storage
+	Transport   transport.Transport
+	Applier     Applier
+	Snapshotter SnapshotObserver
 	// SelfID is this node's own ID, used only to record itself as the
 	// best-known leader after a successful leader Propose. raft.Node keeps
 	// no exported notion of "self" the host can query, so the host is told.
@@ -133,7 +140,7 @@ func (h *Host) recordLeaderHintLocked(id raft.NodeID) {
 }
 
 func (h *Host) processReadyLocked() error {
-	if err := processReady(h.Node, h.Storage, h.Transport, h.Applier); err != nil {
+	if err := processReadyObserved(h.Node, h.Storage, h.Transport, h.Applier, h.Snapshotter); err != nil {
 		h.stopped = err
 		// This is the sole stopped transition and it runs at most once: every
 		// entry point returns early while stopped, so processReadyLocked can
@@ -148,6 +155,10 @@ func (h *Host) processReadyLocked() error {
 }
 
 func processReady(node readyNode, store readyStorage, transport transport.Transport, applier Applier) error {
+	return processReadyObserved(node, store, transport, applier, nil)
+}
+
+func processReadyObserved(node readyNode, store readyStorage, transport transport.Transport, applier Applier, snapshotter SnapshotObserver) error {
 	ready := node.Ready()
 
 	// 1. Persist the hard state and entries atomically before any side effect.
@@ -166,7 +177,15 @@ func processReady(node readyNode, store readyStorage, transport transport.Transp
 			}
 		}
 	}
-	// 4. Acknowledge only after all preceding work completed.
+	// 4. Check the snapshot trigger only after the whole apply batch. Snapshot
+	// publication and compaction therefore complete before Advance can allow
+	// the core to expose another batch.
+	if snapshotter != nil && len(ready.CommittedEntries) > 0 {
+		if err := snapshotter.ObserveApplied(ready.CommittedEntries); err != nil {
+			return fmt.Errorf("snapshot post-apply: %w", err)
+		}
+	}
+	// 5. Acknowledge only after all preceding work completed.
 	node.Advance()
 	return nil
 }

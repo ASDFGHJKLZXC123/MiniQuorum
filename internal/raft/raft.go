@@ -2,6 +2,7 @@
 package raft
 
 import (
+	"fmt"
 	"sort"
 
 	raftpb "miniquorum/proto"
@@ -40,7 +41,11 @@ type SnapshotMeta struct {
 type InitialState struct {
 	HardState HardState
 	Entries   []raftpb.Entry
-	Snapshot  SnapshotMeta
+	// Snapshot is the compacted Raft-log base B. Applied is the newer
+	// state-machine snapshot index X; B may trail X to retain an overlap for
+	// replication without reapplying (B,X] during startup.
+	Snapshot SnapshotMeta
+	Applied  uint64
 }
 
 // Ready is the host-owned output batch. It remains pending until Advance.
@@ -117,6 +122,10 @@ func NewNode(cfg Config, init InitialState, rnd Rand) *Node {
 	if cfg.HeartbeatTicks == 0 {
 		cfg.HeartbeatTicks = 2
 	}
+	applied := init.Applied
+	if applied < init.Snapshot.Index {
+		applied = init.Snapshot.Index
+	}
 	n := &Node{
 		config:      cfg,
 		peers:       orderedPeers(cfg.Peers),
@@ -124,8 +133,8 @@ func NewNode(cfg Config, init InitialState, rnd Rand) *Node {
 		hardState:   init.HardState,
 		role:        follower,
 		log:         newRaftLog(init.Snapshot, init.Entries),
-		commitIndex: init.Snapshot.Index,
-		lastApplied: init.Snapshot.Index,
+		commitIndex: applied,
+		lastApplied: applied,
 	}
 	n.unstableIndex = n.log.lastIndex() + 1
 	n.resetElectionTimeout()
@@ -147,6 +156,42 @@ func (n *Node) Tick() {
 	if n.electionElapsed >= n.electionTimeout {
 		n.startElection()
 	}
+}
+
+// Compact advances the in-memory log base after the host has durably
+// compacted storage. The host serializes this call with Tick/Step/Propose and
+// invokes it before advancing the Ready whose entries made the snapshot.
+func (n *Node) Compact(meta SnapshotMeta) error {
+	appliedThrough := n.lastApplied
+	if n.readyAck.valid && n.readyAck.committed && n.readyAck.appliedTo > appliedThrough {
+		// The host may compact from its post-apply snapshot hook immediately
+		// before Advance acknowledges this Ready. The hook contract guarantees
+		// the captured committed batch has actually applied.
+		appliedThrough = n.readyAck.appliedTo
+	}
+	if meta.Index > appliedThrough {
+		return fmt.Errorf("raft: compact index %d exceeds applied or pending-applied index %d", meta.Index, appliedThrough)
+	}
+	if err := n.log.compact(meta); err != nil {
+		return err
+	}
+
+	// An outstanding request whose predecessor is below the new base cannot be
+	// reconstructed after compaction: some or all of its payload has left the
+	// live log. Drop that logical request so the next heartbeat builds a fresh
+	// request from the retained boundary (or, once supported, routes the peer to
+	// snapshot transfer). Requests based at the boundary remain byte-for-byte
+	// reproducible and keep their one-in-flight acknowledgement identity.
+	for _, peer := range n.peers {
+		if peer == n.config.ID {
+			continue
+		}
+		pending := n.inflight[peer]
+		if pending != nil && pending.prevIndex < meta.Index {
+			n.inflight[peer] = nil
+		}
+	}
+	return nil
 }
 
 // Step supplies one inbound transport message.
@@ -407,14 +452,25 @@ func (n *Node) handleAppendEntries(m *raftpb.Message, req *raftpb.AppendEntriesR
 		return
 	}
 	if !n.log.matches(req.PrevLogIndex, req.PrevLogTerm) {
-		n.sendAppendEntriesResponse(NodeID(m.From), false, 0)
+		// A predecessor strictly below the compacted base is unavailable rather
+		// than conflicting. Point the leader at that retained boundary without
+		// claiming success; a term mismatch at the boundary remains an ordinary
+		// rejection because the boundary itself is still comparable.
+		hint := uint64(0)
+		if req.PrevLogIndex < n.log.snapshot.Index {
+			hint = n.log.snapshot.Index
+		}
+		n.sendAppendEntriesResponse(NodeID(m.From), false, hint)
 		return
 	}
 	if changed := n.log.appendFromLeader(req.Entries); changed != 0 && changed < n.unstableIndex {
 		n.unstableIndex = changed
 	}
 	if req.LeaderCommit > n.commitIndex {
-		n.commitIndex = min(req.LeaderCommit, requestLastIndex)
+		candidate := min(req.LeaderCommit, requestLastIndex)
+		if candidate > n.commitIndex {
+			n.commitIndex = candidate
+		}
 	}
 	n.sendAppendEntriesResponse(NodeID(m.From), true, requestLastIndex)
 }
@@ -448,6 +504,21 @@ func (n *Node) handleAppendEntriesResponse(m *raftpb.Message, resp *raftpb.Appen
 		if n.nextIndex[peer] <= n.log.lastIndex() || commitAdvanced {
 			n.sendAppend(peer, false)
 		}
+		return
+	}
+
+	// A non-zero index on failure is a compaction reposition hint, never an
+	// acknowledgement. Accept only bounded hints that move strictly beyond the
+	// exact request still in flight. Stale, duplicate, and invalid hints leave
+	// that request intact so its eventual success remains attributable.
+	if hint := resp.MatchIndex; hint != 0 {
+		if hint == ^uint64(0) || hint > n.log.lastIndex() ||
+			hint <= pending.prevIndex || hint+1 <= n.nextIndex[peer] {
+			return
+		}
+		n.inflight[peer] = nil
+		n.nextIndex[peer] = hint + 1
+		n.sendAppend(peer, false)
 		return
 	}
 

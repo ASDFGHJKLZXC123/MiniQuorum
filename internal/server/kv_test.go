@@ -404,11 +404,17 @@ func (s *failAfterNSavesStorage) Save(hs *raft.HardState, entries []raftpb.Entry
 }
 
 func (s *failAfterNSavesStorage) HardState() (raft.HardState, error) { return s.inner.HardState() }
+func (s *failAfterNSavesStorage) SaveSnapshot(meta raft.SnapshotMeta) error {
+	return s.inner.SaveSnapshot(meta)
+}
+func (s *failAfterNSavesStorage) Snapshot() (raft.SnapshotMeta, error)  { return s.inner.Snapshot() }
+func (s *failAfterNSavesStorage) Compacted() (raft.SnapshotMeta, error) { return s.inner.Compacted() }
 func (s *failAfterNSavesStorage) Entries(lo, hi uint64) ([]raftpb.Entry, error) {
 	return s.inner.Entries(lo, hi)
 }
-func (s *failAfterNSavesStorage) FirstIndex() uint64 { return s.inner.FirstIndex() }
-func (s *failAfterNSavesStorage) LastIndex() uint64  { return s.inner.LastIndex() }
+func (s *failAfterNSavesStorage) FirstIndex() uint64         { return s.inner.FirstIndex() }
+func (s *failAfterNSavesStorage) LastIndex() uint64          { return s.inner.LastIndex() }
+func (s *failAfterNSavesStorage) Compact(index uint64) error { return s.inner.Compact(index) }
 
 // failingOnNormalSM wraps a real StateMachine but fails Apply for NORMAL
 // entries, while letting NOOP entries (the election's term-start no-op)
@@ -676,11 +682,17 @@ func (s *armedFailStorage) Save(hs *raft.HardState, entries []raftpb.Entry) erro
 }
 
 func (s *armedFailStorage) HardState() (raft.HardState, error) { return s.inner.HardState() }
+func (s *armedFailStorage) SaveSnapshot(meta raft.SnapshotMeta) error {
+	return s.inner.SaveSnapshot(meta)
+}
+func (s *armedFailStorage) Snapshot() (raft.SnapshotMeta, error)  { return s.inner.Snapshot() }
+func (s *armedFailStorage) Compacted() (raft.SnapshotMeta, error) { return s.inner.Compacted() }
 func (s *armedFailStorage) Entries(lo, hi uint64) ([]raftpb.Entry, error) {
 	return s.inner.Entries(lo, hi)
 }
-func (s *armedFailStorage) FirstIndex() uint64 { return s.inner.FirstIndex() }
-func (s *armedFailStorage) LastIndex() uint64  { return s.inner.LastIndex() }
+func (s *armedFailStorage) FirstIndex() uint64         { return s.inner.FirstIndex() }
+func (s *armedFailStorage) LastIndex() uint64          { return s.inner.LastIndex() }
+func (s *armedFailStorage) Compact(index uint64) error { return s.inner.Compact(index) }
 
 // failOnNthNormalSM wraps a real StateMachine but fails the nth NORMAL apply
 // (1-based), letting NOOPs and every other client entry apply for real — so
@@ -748,9 +760,13 @@ func (s *countingErrStorage) Save(*raft.HardState, []raftpb.Entry) error {
 	return s.err
 }
 
-func (s *countingErrStorage) HardState() (raft.HardState, error) { return raft.HardState{}, nil }
+func (s *countingErrStorage) HardState() (raft.HardState, error)    { return raft.HardState{}, nil }
+func (s *countingErrStorage) SaveSnapshot(raft.SnapshotMeta) error  { return nil }
+func (s *countingErrStorage) Snapshot() (raft.SnapshotMeta, error)  { return raft.SnapshotMeta{}, nil }
+func (s *countingErrStorage) Compacted() (raft.SnapshotMeta, error) { return raft.SnapshotMeta{}, nil }
 func (s *countingErrStorage) Entries(uint64, uint64) ([]raftpb.Entry, error) {
 	return nil, storage.ErrOutOfBounds
 }
-func (s *countingErrStorage) FirstIndex() uint64 { return 1 }
-func (s *countingErrStorage) LastIndex() uint64  { return 0 }
+func (s *countingErrStorage) FirstIndex() uint64   { return 1 }
+func (s *countingErrStorage) LastIndex() uint64    { return 0 }
+func (s *countingErrStorage) Compact(uint64) error { return nil }

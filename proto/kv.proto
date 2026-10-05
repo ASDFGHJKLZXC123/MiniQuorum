@@ -36,3 +36,47 @@ message NotLeader {
 service KV {
   rpc Execute(ExecuteRequest) returns (ExecuteResponse);
 }
+
+// StateMachineSnapshot is the deterministic Phase 6 snapshot envelope. Map
+// snapshots populate key_values and LSM snapshots populate files; both carry
+// the complete deduplication table and the server-supplied Raft position.
+message StateMachineSnapshot {
+  uint32 format_version = 1;
+  SnapshotEngine engine = 2;
+  SnapshotMetadata meta = 3;
+  repeated SnapshotKeyValue key_values = 4;
+  repeated SnapshotDedupRecord dedup = 5;
+  repeated SnapshotFile files = 6;
+}
+
+enum SnapshotEngine {
+  SNAPSHOT_ENGINE_UNSPECIFIED = 0;
+  SNAPSHOT_ENGINE_MAP = 1;
+  SNAPSHOT_ENGINE_LSM = 2;
+}
+
+message SnapshotMetadata {
+  uint64 index = 1;
+  uint64 term = 2;
+}
+
+message SnapshotKeyValue {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message SnapshotDedupRecord {
+  uint64 client_id = 1;
+  uint64 last_seq = 2;
+  bytes value = 3;
+  bool found = 4;
+}
+
+// SnapshotFile lists every LSM data file covered by META.pb. checksum_sha256
+// authenticates exact bytes before restore/adoption; META.pb itself is not
+// self-referential and therefore is not listed.
+message SnapshotFile {
+  string name = 1;
+  uint64 size = 2;
+  bytes checksum_sha256 = 3;
+}

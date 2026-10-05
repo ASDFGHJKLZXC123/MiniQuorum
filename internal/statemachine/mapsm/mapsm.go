@@ -2,9 +2,14 @@
 package mapsm
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 
@@ -23,6 +28,9 @@ type MapStateMachine struct {
 	values  map[string][]byte
 	dedup   map[uint64]dedupRecord
 	applied uint64
+	// snapshotDurable advances only after STATE.pb and its directory have
+	// crossed their fsync boundary (or after a successful restore).
+	snapshotDurable uint64
 }
 
 type dedupRecord struct {
@@ -153,14 +161,207 @@ func (m *MapStateMachine) Hash() uint64 {
 	return h.Sum64()
 }
 
-// CreateSnapshot is a Phase 6 stub.
-func (*MapStateMachine) CreateSnapshot(string, raft.SnapshotMeta) error {
-	return statemachine.ErrSnapshotUnsupported
+const (
+	mapSnapshotFormatVersion = uint32(1)
+	mapSnapshotFilename      = "STATE.pb"
+	mapSnapshotTempFilename  = "STATE.pb.tmp"
+)
+
+// CreateSnapshot writes one deterministic protobuf containing sorted KV
+// pairs, the complete client dedup table, and the server-supplied Raft meta.
+// The state lock remains held through file and directory fsync, matching the
+// apply-loop quiescence contract.
+func (m *MapStateMachine) CreateSnapshot(dir string, meta raft.SnapshotMeta) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if meta.Index != m.applied {
+		return fmt.Errorf("mapsm: snapshot index %d does not equal applied index %d", meta.Index, m.applied)
+	}
+	if meta.Index == 0 && meta.Term != 0 || meta.Index != 0 && meta.Term == 0 {
+		return fmt.Errorf("mapsm: invalid snapshot meta index=%d term=%d", meta.Index, meta.Term)
+	}
+
+	snapshot := &raftpb.StateMachineSnapshot{
+		FormatVersion: mapSnapshotFormatVersion,
+		Engine:        raftpb.SnapshotEngine_SNAPSHOT_ENGINE_MAP,
+		Meta:          &raftpb.SnapshotMetadata{Index: meta.Index, Term: meta.Term},
+	}
+	keys := make([]string, 0, len(m.values))
+	for key := range m.values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		snapshot.KeyValues = append(snapshot.KeyValues, &raftpb.SnapshotKeyValue{
+			Key:   []byte(key),
+			Value: cloneBytes(m.values[key]),
+		})
+	}
+	clientIDs := make([]uint64, 0, len(m.dedup))
+	for clientID := range m.dedup {
+		clientIDs = append(clientIDs, clientID)
+	}
+	sort.Slice(clientIDs, func(i, j int) bool { return clientIDs[i] < clientIDs[j] })
+	for _, clientID := range clientIDs {
+		record := m.dedup[clientID]
+		snapshot.Dedup = append(snapshot.Dedup, &raftpb.SnapshotDedupRecord{
+			ClientId: clientID,
+			LastSeq:  record.lastSeq,
+			Value:    cloneBytes(record.lastResult.Value),
+			Found:    record.lastResult.Found,
+		})
+	}
+	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(snapshot)
+	if err != nil {
+		return fmt.Errorf("mapsm: marshal snapshot: %w", err)
+	}
+	if err := writeMapSnapshot(dir, data); err != nil {
+		return err
+	}
+	m.snapshotDurable = meta.Index
+	return nil
 }
 
-// RestoreSnapshot is a Phase 6 stub.
-func (*MapStateMachine) RestoreSnapshot(string) (raft.SnapshotMeta, error) {
-	return raft.SnapshotMeta{}, statemachine.ErrSnapshotUnsupported
+// RestoreSnapshot validates a complete snapshot before atomically replacing
+// the in-memory maps under the state lock.
+func (m *MapStateMachine) RestoreSnapshot(dir string) (raft.SnapshotMeta, error) {
+	data, err := os.ReadFile(filepath.Join(dir, mapSnapshotFilename))
+	if err != nil {
+		return raft.SnapshotMeta{}, fmt.Errorf("mapsm: read snapshot: %w", err)
+	}
+	snapshot := &raftpb.StateMachineSnapshot{}
+	if err := proto.Unmarshal(data, snapshot); err != nil {
+		return raft.SnapshotMeta{}, fmt.Errorf("mapsm: decode snapshot: %w", err)
+	}
+	meta, values, dedup, err := decodeMapSnapshot(snapshot)
+	if err != nil {
+		return raft.SnapshotMeta{}, err
+	}
+
+	m.mu.Lock()
+	m.values = values
+	m.dedup = dedup
+	m.applied = meta.Index
+	m.snapshotDurable = meta.Index
+	m.mu.Unlock()
+	return meta, nil
+}
+
+// DurableIndex is the server's belt-and-suspenders truncation watermark.
+func (m *MapStateMachine) DurableIndex() uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.snapshotDurable
+}
+
+func decodeMapSnapshot(snapshot *raftpb.StateMachineSnapshot) (raft.SnapshotMeta, map[string][]byte, map[uint64]dedupRecord, error) {
+	if snapshot.GetFormatVersion() != mapSnapshotFormatVersion {
+		return raft.SnapshotMeta{}, nil, nil, fmt.Errorf("mapsm: snapshot format version %d, want %d", snapshot.GetFormatVersion(), mapSnapshotFormatVersion)
+	}
+	if snapshot.GetEngine() != raftpb.SnapshotEngine_SNAPSHOT_ENGINE_MAP {
+		return raft.SnapshotMeta{}, nil, nil, fmt.Errorf("mapsm: snapshot engine %s, want map", snapshot.GetEngine())
+	}
+	if snapshot.GetMeta() == nil {
+		return raft.SnapshotMeta{}, nil, nil, errors.New("mapsm: snapshot metadata is missing")
+	}
+	if len(snapshot.GetFiles()) != 0 {
+		return raft.SnapshotMeta{}, nil, nil, errors.New("mapsm: map snapshot unexpectedly lists LSM files")
+	}
+	meta := raft.SnapshotMeta{Index: snapshot.GetMeta().GetIndex(), Term: snapshot.GetMeta().GetTerm()}
+	if meta.Index == 0 && meta.Term != 0 || meta.Index != 0 && meta.Term == 0 {
+		return raft.SnapshotMeta{}, nil, nil, fmt.Errorf("mapsm: invalid snapshot meta index=%d term=%d", meta.Index, meta.Term)
+	}
+	values := make(map[string][]byte, len(snapshot.GetKeyValues()))
+	var previousKey []byte
+	for index, pair := range snapshot.GetKeyValues() {
+		if pair == nil {
+			return raft.SnapshotMeta{}, nil, nil, fmt.Errorf("mapsm: nil key/value record %d", index)
+		}
+		if index != 0 && bytes.Compare(previousKey, pair.GetKey()) >= 0 {
+			return raft.SnapshotMeta{}, nil, nil, errors.New("mapsm: snapshot keys are not strictly sorted")
+		}
+		key := cloneBytes(pair.GetKey())
+		values[string(key)] = cloneBytes(pair.GetValue())
+		previousKey = key
+	}
+	dedup := make(map[uint64]dedupRecord, len(snapshot.GetDedup()))
+	var previousClient uint64
+	for index, record := range snapshot.GetDedup() {
+		if record == nil {
+			return raft.SnapshotMeta{}, nil, nil, fmt.Errorf("mapsm: nil dedup record %d", index)
+		}
+		if index != 0 && record.GetClientId() <= previousClient {
+			return raft.SnapshotMeta{}, nil, nil, errors.New("mapsm: snapshot dedup records are not strictly sorted")
+		}
+		dedup[record.GetClientId()] = dedupRecord{
+			lastSeq: record.GetLastSeq(),
+			lastResult: statemachine.Result{
+				Value: cloneBytes(record.GetValue()),
+				Found: record.GetFound(),
+			},
+		}
+		previousClient = record.GetClientId()
+	}
+	return meta, values, dedup, nil
+}
+
+func writeMapSnapshot(dir string, data []byte) error {
+	if dir == "" {
+		return errors.New("mapsm: snapshot directory is empty")
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("mapsm: create snapshot directory: %w", err)
+	}
+	if err := syncMapDirectory(filepath.Dir(dir)); err != nil {
+		return fmt.Errorf("mapsm: sync snapshot parent directory: %w", err)
+	}
+	tempPath := filepath.Join(dir, mapSnapshotTempFilename)
+	if err := os.Remove(tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("mapsm: remove stale snapshot temp: %w", err)
+	}
+	finalPath := filepath.Join(dir, mapSnapshotFilename)
+	if _, err := os.Stat(finalPath); err == nil {
+		return fmt.Errorf("mapsm: snapshot file already exists: %s", finalPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("mapsm: stat snapshot file: %w", err)
+	}
+	file, err := os.OpenFile(tempPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("mapsm: create snapshot temp: %w", err)
+	}
+	if n, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("mapsm: write snapshot: %w", err)
+	} else if n != len(data) {
+		_ = file.Close()
+		return fmt.Errorf("mapsm: write snapshot: wrote %d of %d bytes: %w", n, len(data), io.ErrShortWrite)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("mapsm: sync snapshot file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("mapsm: close snapshot file: %w", err)
+	}
+	if err := os.Rename(tempPath, finalPath); err != nil {
+		return fmt.Errorf("mapsm: publish snapshot file: %w", err)
+	}
+	if err := syncMapDirectory(dir); err != nil {
+		return fmt.Errorf("mapsm: sync snapshot directory: %w", err)
+	}
+	return nil
+}
+
+func syncMapDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := dir.Sync(); err != nil {
+		_ = dir.Close()
+		return err
+	}
+	return dir.Close()
 }
 
 func (m *MapStateMachine) advanceAppliedIndex(index uint64) {

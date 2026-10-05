@@ -73,6 +73,55 @@ func (Op) EnumDescriptor() ([]byte, []int) {
 	return file_proto_kv_proto_rawDescGZIP(), []int{0}
 }
 
+type SnapshotEngine int32
+
+const (
+	SnapshotEngine_SNAPSHOT_ENGINE_UNSPECIFIED SnapshotEngine = 0
+	SnapshotEngine_SNAPSHOT_ENGINE_MAP         SnapshotEngine = 1
+	SnapshotEngine_SNAPSHOT_ENGINE_LSM         SnapshotEngine = 2
+)
+
+// Enum value maps for SnapshotEngine.
+var (
+	SnapshotEngine_name = map[int32]string{
+		0: "SNAPSHOT_ENGINE_UNSPECIFIED",
+		1: "SNAPSHOT_ENGINE_MAP",
+		2: "SNAPSHOT_ENGINE_LSM",
+	}
+	SnapshotEngine_value = map[string]int32{
+		"SNAPSHOT_ENGINE_UNSPECIFIED": 0,
+		"SNAPSHOT_ENGINE_MAP":         1,
+		"SNAPSHOT_ENGINE_LSM":         2,
+	}
+)
+
+func (x SnapshotEngine) Enum() *SnapshotEngine {
+	p := new(SnapshotEngine)
+	*p = x
+	return p
+}
+
+func (x SnapshotEngine) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (SnapshotEngine) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_kv_proto_enumTypes[1].Descriptor()
+}
+
+func (SnapshotEngine) Type() protoreflect.EnumType {
+	return &file_proto_kv_proto_enumTypes[1]
+}
+
+func (x SnapshotEngine) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use SnapshotEngine.Descriptor instead.
+func (SnapshotEngine) EnumDescriptor() ([]byte, []int) {
+	return file_proto_kv_proto_rawDescGZIP(), []int{1}
+}
+
 type Command struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ClientId      uint64                 `protobuf:"varint,1,opt,name=client_id,json=clientId,proto3" json:"client_id,omitempty"`
@@ -313,6 +362,328 @@ func (x *NotLeader) GetLeaderAddr() string {
 	return ""
 }
 
+// StateMachineSnapshot is the deterministic Phase 6 snapshot envelope. Map
+// snapshots populate key_values and LSM snapshots populate files; both carry
+// the complete deduplication table and the server-supplied Raft position.
+type StateMachineSnapshot struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	FormatVersion uint32                 `protobuf:"varint,1,opt,name=format_version,json=formatVersion,proto3" json:"format_version,omitempty"`
+	Engine        SnapshotEngine         `protobuf:"varint,2,opt,name=engine,proto3,enum=miniquorum.SnapshotEngine" json:"engine,omitempty"`
+	Meta          *SnapshotMetadata      `protobuf:"bytes,3,opt,name=meta,proto3" json:"meta,omitempty"`
+	KeyValues     []*SnapshotKeyValue    `protobuf:"bytes,4,rep,name=key_values,json=keyValues,proto3" json:"key_values,omitempty"`
+	Dedup         []*SnapshotDedupRecord `protobuf:"bytes,5,rep,name=dedup,proto3" json:"dedup,omitempty"`
+	Files         []*SnapshotFile        `protobuf:"bytes,6,rep,name=files,proto3" json:"files,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StateMachineSnapshot) Reset() {
+	*x = StateMachineSnapshot{}
+	mi := &file_proto_kv_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StateMachineSnapshot) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StateMachineSnapshot) ProtoMessage() {}
+
+func (x *StateMachineSnapshot) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_kv_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StateMachineSnapshot.ProtoReflect.Descriptor instead.
+func (*StateMachineSnapshot) Descriptor() ([]byte, []int) {
+	return file_proto_kv_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *StateMachineSnapshot) GetFormatVersion() uint32 {
+	if x != nil {
+		return x.FormatVersion
+	}
+	return 0
+}
+
+func (x *StateMachineSnapshot) GetEngine() SnapshotEngine {
+	if x != nil {
+		return x.Engine
+	}
+	return SnapshotEngine_SNAPSHOT_ENGINE_UNSPECIFIED
+}
+
+func (x *StateMachineSnapshot) GetMeta() *SnapshotMetadata {
+	if x != nil {
+		return x.Meta
+	}
+	return nil
+}
+
+func (x *StateMachineSnapshot) GetKeyValues() []*SnapshotKeyValue {
+	if x != nil {
+		return x.KeyValues
+	}
+	return nil
+}
+
+func (x *StateMachineSnapshot) GetDedup() []*SnapshotDedupRecord {
+	if x != nil {
+		return x.Dedup
+	}
+	return nil
+}
+
+func (x *StateMachineSnapshot) GetFiles() []*SnapshotFile {
+	if x != nil {
+		return x.Files
+	}
+	return nil
+}
+
+type SnapshotMetadata struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Index         uint64                 `protobuf:"varint,1,opt,name=index,proto3" json:"index,omitempty"`
+	Term          uint64                 `protobuf:"varint,2,opt,name=term,proto3" json:"term,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SnapshotMetadata) Reset() {
+	*x = SnapshotMetadata{}
+	mi := &file_proto_kv_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SnapshotMetadata) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SnapshotMetadata) ProtoMessage() {}
+
+func (x *SnapshotMetadata) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_kv_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SnapshotMetadata.ProtoReflect.Descriptor instead.
+func (*SnapshotMetadata) Descriptor() ([]byte, []int) {
+	return file_proto_kv_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *SnapshotMetadata) GetIndex() uint64 {
+	if x != nil {
+		return x.Index
+	}
+	return 0
+}
+
+func (x *SnapshotMetadata) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+type SnapshotKeyValue struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SnapshotKeyValue) Reset() {
+	*x = SnapshotKeyValue{}
+	mi := &file_proto_kv_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SnapshotKeyValue) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SnapshotKeyValue) ProtoMessage() {}
+
+func (x *SnapshotKeyValue) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_kv_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SnapshotKeyValue.ProtoReflect.Descriptor instead.
+func (*SnapshotKeyValue) Descriptor() ([]byte, []int) {
+	return file_proto_kv_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *SnapshotKeyValue) GetKey() []byte {
+	if x != nil {
+		return x.Key
+	}
+	return nil
+}
+
+func (x *SnapshotKeyValue) GetValue() []byte {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+type SnapshotDedupRecord struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ClientId      uint64                 `protobuf:"varint,1,opt,name=client_id,json=clientId,proto3" json:"client_id,omitempty"`
+	LastSeq       uint64                 `protobuf:"varint,2,opt,name=last_seq,json=lastSeq,proto3" json:"last_seq,omitempty"`
+	Value         []byte                 `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
+	Found         bool                   `protobuf:"varint,4,opt,name=found,proto3" json:"found,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SnapshotDedupRecord) Reset() {
+	*x = SnapshotDedupRecord{}
+	mi := &file_proto_kv_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SnapshotDedupRecord) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SnapshotDedupRecord) ProtoMessage() {}
+
+func (x *SnapshotDedupRecord) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_kv_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SnapshotDedupRecord.ProtoReflect.Descriptor instead.
+func (*SnapshotDedupRecord) Descriptor() ([]byte, []int) {
+	return file_proto_kv_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *SnapshotDedupRecord) GetClientId() uint64 {
+	if x != nil {
+		return x.ClientId
+	}
+	return 0
+}
+
+func (x *SnapshotDedupRecord) GetLastSeq() uint64 {
+	if x != nil {
+		return x.LastSeq
+	}
+	return 0
+}
+
+func (x *SnapshotDedupRecord) GetValue() []byte {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+func (x *SnapshotDedupRecord) GetFound() bool {
+	if x != nil {
+		return x.Found
+	}
+	return false
+}
+
+// SnapshotFile lists every LSM data file covered by META.pb. checksum_sha256
+// authenticates exact bytes before restore/adoption; META.pb itself is not
+// self-referential and therefore is not listed.
+type SnapshotFile struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Name           string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Size           uint64                 `protobuf:"varint,2,opt,name=size,proto3" json:"size,omitempty"`
+	ChecksumSha256 []byte                 `protobuf:"bytes,3,opt,name=checksum_sha256,json=checksumSha256,proto3" json:"checksum_sha256,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *SnapshotFile) Reset() {
+	*x = SnapshotFile{}
+	mi := &file_proto_kv_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SnapshotFile) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SnapshotFile) ProtoMessage() {}
+
+func (x *SnapshotFile) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_kv_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SnapshotFile.ProtoReflect.Descriptor instead.
+func (*SnapshotFile) Descriptor() ([]byte, []int) {
+	return file_proto_kv_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *SnapshotFile) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *SnapshotFile) GetSize() uint64 {
+	if x != nil {
+		return x.Size
+	}
+	return 0
+}
+
+func (x *SnapshotFile) GetChecksumSha256() []byte {
+	if x != nil {
+		return x.ChecksumSha256
+	}
+	return nil
+}
+
 var File_proto_kv_proto protoreflect.FileDescriptor
 
 const file_proto_kv_proto_rawDesc = "" +
@@ -336,13 +707,40 @@ const file_proto_kv_proto_rawDesc = "" +
 	"\tNotLeader\x12\x1b\n" +
 	"\tleader_id\x18\x01 \x01(\x04R\bleaderId\x12\x1f\n" +
 	"\vleader_addr\x18\x02 \x01(\tR\n" +
-	"leaderAddr*6\n" +
+	"leaderAddr\"\xc7\x02\n" +
+	"\x14StateMachineSnapshot\x12%\n" +
+	"\x0eformat_version\x18\x01 \x01(\rR\rformatVersion\x122\n" +
+	"\x06engine\x18\x02 \x01(\x0e2\x1a.miniquorum.SnapshotEngineR\x06engine\x120\n" +
+	"\x04meta\x18\x03 \x01(\v2\x1c.miniquorum.SnapshotMetadataR\x04meta\x12;\n" +
+	"\n" +
+	"key_values\x18\x04 \x03(\v2\x1c.miniquorum.SnapshotKeyValueR\tkeyValues\x125\n" +
+	"\x05dedup\x18\x05 \x03(\v2\x1f.miniquorum.SnapshotDedupRecordR\x05dedup\x12.\n" +
+	"\x05files\x18\x06 \x03(\v2\x18.miniquorum.SnapshotFileR\x05files\"<\n" +
+	"\x10SnapshotMetadata\x12\x14\n" +
+	"\x05index\x18\x01 \x01(\x04R\x05index\x12\x12\n" +
+	"\x04term\x18\x02 \x01(\x04R\x04term\":\n" +
+	"\x10SnapshotKeyValue\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\"y\n" +
+	"\x13SnapshotDedupRecord\x12\x1b\n" +
+	"\tclient_id\x18\x01 \x01(\x04R\bclientId\x12\x19\n" +
+	"\blast_seq\x18\x02 \x01(\x04R\alastSeq\x12\x14\n" +
+	"\x05value\x18\x03 \x01(\fR\x05value\x12\x14\n" +
+	"\x05found\x18\x04 \x01(\bR\x05found\"_\n" +
+	"\fSnapshotFile\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
+	"\x04size\x18\x02 \x01(\x04R\x04size\x12'\n" +
+	"\x0fchecksum_sha256\x18\x03 \x01(\fR\x0echecksumSha256*6\n" +
 	"\x02Op\x12\x12\n" +
 	"\x0eOP_UNSPECIFIED\x10\x00\x12\a\n" +
 	"\x03PUT\x10\x01\x12\n" +
 	"\n" +
 	"\x06DELETE\x10\x02\x12\a\n" +
-	"\x03GET\x10\x032H\n" +
+	"\x03GET\x10\x03*c\n" +
+	"\x0eSnapshotEngine\x12\x1f\n" +
+	"\x1bSNAPSHOT_ENGINE_UNSPECIFIED\x10\x00\x12\x17\n" +
+	"\x13SNAPSHOT_ENGINE_MAP\x10\x01\x12\x17\n" +
+	"\x13SNAPSHOT_ENGINE_LSM\x10\x022H\n" +
 	"\x02KV\x12B\n" +
 	"\aExecute\x12\x1a.miniquorum.ExecuteRequest\x1a\x1b.miniquorum.ExecuteResponseB\x19Z\x17miniquorum/proto;raftpbb\x06proto3"
 
@@ -358,26 +756,37 @@ func file_proto_kv_proto_rawDescGZIP() []byte {
 	return file_proto_kv_proto_rawDescData
 }
 
-var file_proto_kv_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_proto_kv_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
+var file_proto_kv_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_proto_kv_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_proto_kv_proto_goTypes = []any{
-	(Op)(0),                 // 0: miniquorum.Op
-	(*Command)(nil),         // 1: miniquorum.Command
-	(*ExecuteRequest)(nil),  // 2: miniquorum.ExecuteRequest
-	(*ExecuteResponse)(nil), // 3: miniquorum.ExecuteResponse
-	(*NotLeader)(nil),       // 4: miniquorum.NotLeader
+	(Op)(0),                      // 0: miniquorum.Op
+	(SnapshotEngine)(0),          // 1: miniquorum.SnapshotEngine
+	(*Command)(nil),              // 2: miniquorum.Command
+	(*ExecuteRequest)(nil),       // 3: miniquorum.ExecuteRequest
+	(*ExecuteResponse)(nil),      // 4: miniquorum.ExecuteResponse
+	(*NotLeader)(nil),            // 5: miniquorum.NotLeader
+	(*StateMachineSnapshot)(nil), // 6: miniquorum.StateMachineSnapshot
+	(*SnapshotMetadata)(nil),     // 7: miniquorum.SnapshotMetadata
+	(*SnapshotKeyValue)(nil),     // 8: miniquorum.SnapshotKeyValue
+	(*SnapshotDedupRecord)(nil),  // 9: miniquorum.SnapshotDedupRecord
+	(*SnapshotFile)(nil),         // 10: miniquorum.SnapshotFile
 }
 var file_proto_kv_proto_depIdxs = []int32{
-	0, // 0: miniquorum.Command.op:type_name -> miniquorum.Op
-	1, // 1: miniquorum.ExecuteRequest.cmd:type_name -> miniquorum.Command
-	4, // 2: miniquorum.ExecuteResponse.not_leader:type_name -> miniquorum.NotLeader
-	2, // 3: miniquorum.KV.Execute:input_type -> miniquorum.ExecuteRequest
-	3, // 4: miniquorum.KV.Execute:output_type -> miniquorum.ExecuteResponse
-	4, // [4:5] is the sub-list for method output_type
-	3, // [3:4] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	0,  // 0: miniquorum.Command.op:type_name -> miniquorum.Op
+	2,  // 1: miniquorum.ExecuteRequest.cmd:type_name -> miniquorum.Command
+	5,  // 2: miniquorum.ExecuteResponse.not_leader:type_name -> miniquorum.NotLeader
+	1,  // 3: miniquorum.StateMachineSnapshot.engine:type_name -> miniquorum.SnapshotEngine
+	7,  // 4: miniquorum.StateMachineSnapshot.meta:type_name -> miniquorum.SnapshotMetadata
+	8,  // 5: miniquorum.StateMachineSnapshot.key_values:type_name -> miniquorum.SnapshotKeyValue
+	9,  // 6: miniquorum.StateMachineSnapshot.dedup:type_name -> miniquorum.SnapshotDedupRecord
+	10, // 7: miniquorum.StateMachineSnapshot.files:type_name -> miniquorum.SnapshotFile
+	3,  // 8: miniquorum.KV.Execute:input_type -> miniquorum.ExecuteRequest
+	4,  // 9: miniquorum.KV.Execute:output_type -> miniquorum.ExecuteResponse
+	9,  // [9:10] is the sub-list for method output_type
+	8,  // [8:9] is the sub-list for method input_type
+	8,  // [8:8] is the sub-list for extension type_name
+	8,  // [8:8] is the sub-list for extension extendee
+	0,  // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_proto_kv_proto_init() }
@@ -390,8 +799,8 @@ func file_proto_kv_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_kv_proto_rawDesc), len(file_proto_kv_proto_rawDesc)),
-			NumEnums:      1,
-			NumMessages:   4,
+			NumEnums:      2,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
